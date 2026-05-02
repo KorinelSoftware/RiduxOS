@@ -97,12 +97,6 @@ VBoxManage startvm RiduxOS
 
 ---
 
-## License
-
-TBD
-
----
-
 ## Author
 
 Part of the Korinel project
