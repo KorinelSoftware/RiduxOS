@@ -1,76 +1,84 @@
 # RiduxOS
 
-RiduxOS es mi intento de hacer un sistema operativo propio, no una distro con skin. La idea es tener kernel, compositor, apps, runtime Linux-ish y escritorio todo en el mismo proyecto, entendible y hackeable sin tener que abrir diez repos distintos.
+![RiduxOS Header](./assets/RiduxOSheader.png)
 
-Todavia esta en obra. Hay cosas muy avanzadas para ser hobby OS y otras que siguen siendo medio Frankenstein. Lo importante es que cada cambio quede mas ordenado que antes y que no se vuelva imposible de tocar.
+RiduxOS is an attempt to build a full operating system from scratch — not just another Linux distro with a custom skin. The goal is to have the kernel, compositor, runtime, apps, and desktop environment all developed within a single cohesive project.
 
-## Que hay ahora
+Everything is meant to be understandable, hackable, and self-contained — without needing to jump across ten different repositories just to follow the system.
 
-- Kernel x86_64 con arranque Multiboot2.
-- Framebuffer propio con renderer Flush.
-- Ventanas, escritorio y apps nativas.
-- Apps Ring 3 para terminal, calculadora, ajustes, archivos, paint, etc.
-- Capa de compatibilidad Linux para intentar correr binarios reales.
-- Bridge grafico X11/Wayland en progreso para Firefox/Chromium.
-- Initrd con rootfs y overlay para meter apps nuevas sin regenerar todo.
-- Scripts para compilar y bootear en VirtualBox.
+The project is still in active development. Some parts are already quite advanced for a hobby OS, while others are still rough around the edges. The priority is to keep improving structure over time and avoid turning the codebase into something unmaintainable.
 
-## Estructura
+---
+
+## Current State
+
+![RiduxOS Desktop](./assets/ridux-desktop.png)
+
+- x86_64 kernel with Multiboot2 boot
+- Custom framebuffer + 2D renderer (Flush)
+- Windowing system, desktop, and native apps
+- Ring 3 applications (terminal, calculator, settings, file manager, paint, etc.)
+- Linux compatibility layer (work-in-progress)
+- X11 / Wayland bridge for running real apps like Firefox / Chromium
+- Initrd with rootfs + overlay system for incremental updates
+- Scripts for building and booting in VirtualBox
+
+---
+
+## Project Structure
 
 ```text
-src/kernel.c                  entrada del kernel
-src/kernel/                   kernel separado por tema, todo en .c
-src/compat/                   runtime/compat Linux, ordenado por responsabilidad
-src/flush.c                   renderer 2D del OS
-src/ridux_r3wm.h              protocolo de ventanas Ring 3
-tools/                        generadores, apps Ring 3 y empaquetado
-scripts/                      scripts de boot y diagnostico
-grub/                         config de arranque
-rootfs/                       filesystem que termina dentro del initrd
+src/kernel.c                  kernel entry point
+src/kernel/                   kernel modules (C, split by subsystem)
+src/compat/                   Linux-like runtime / compatibility layer
+src/flush.c                   2D renderer
+src/ridux_r3wm.h              Ring 3 window protocol
+tools/                        build tools, apps, packaging
+scripts/                      boot and debugging scripts
+grub/                         boot configuration
+rootfs/                       filesystem bundled into initrd
 ```
 
-El kernel se sigue compilando como una sola unidad desde `src/kernel.c`. No es lo mas lindo del mundo, pero evita romper medio sistema mientras se separan archivos. Al menos ya no esta todo en un solo archivo gigante ni hay archivos de inclusion raros en el codigo del kernel.
+The kernel is still compiled as a single unit from `src/kernel.c`. It's not ideal, but it prevents breaking the system while the codebase is being modularized.
 
-## Compat
+---
 
-La carpeta `src/compat/` reemplaza los viejos `compat.c`, `compat2.c`, etc. Los nombres nuevos son mas faciles de ubicar:
+## Compatibility Layer
 
-- `base.c`: syscalls base, drivers simples, sockets virtuales y glue viejo.
-- `memory_tasks.c`: paging, tareas, scheduler de usuario y Ring 3.
-- `linux_syscalls.c`: syscalls Linux-ish, ELF64, mmap, dynlink y VFS bridge.
-- `user_libc.c`: mini libc propia.
-- `bsd_libc.c`: helpers adaptados de FreeBSD y launcher de ELFs Ring 3.
-- `linux_abi.c`: syscalls modernas que suelen pedir apps grandes.
-- `display_wayland.c`: red, X11 y Wayland.
-- `browser_runtime.c`: cosas extra para navegadores reales.
+- base.c → core syscalls, basic drivers, legacy glue
+- memory_tasks.c → paging, tasking, scheduler, Ring 3 support
+- linux_syscalls.c → Linux-like syscalls, ELF64 loading, mmap, dynlink, VFS bridge
+- user_libc.c → minimal custom libc
+- bsd_libc.c → FreeBSD-derived helpers + ELF launcher
+- linux_abi.c → newer syscalls required by modern apps
+- display_wayland.c → networking, X11, Wayland
+- browser_runtime.c → extra workarounds for real browsers
 
-Los nombres de funciones tipo `compat5_*` siguen existiendo por ahora para no romper todo de golpe. Eso se puede limpiar despues, con calma y con tests.
+---
 
-## Build sin matar la PC
+## Build
 
-El build completo de ISO puede consumir bastante porque mete assets grandes y llama a `grub-mkrescue`/`xorriso`. Si solo estas tocando kernel o apps, no conviene regenerar todo cada vez.
-
-Para compilar solo kernel:
+Compile only the kernel:
 
 ```bash
 nice -n 19 ionice -c3 make BUILD_DIR=build_wsl_firefox kernel-only -j1
 ```
 
-Para compilar solo apps Ring 3 y overlay:
+Compile only apps:
 
 ```bash
 nice -n 19 ionice -c3 make BUILD_DIR=build_wsl_firefox initrd-overlay.img -j1
 ```
 
-Para regenerar ISO usando la initrd base que ya existe:
+Rebuild ISO:
 
 ```bash
 nice -n 19 ionice -c3 make BUILD_DIR=build_wsl_firefox iso-from-existing-initrd -j1
 ```
 
-Evitar `make all -j` si la PC esta justa de RAM. No vale la pena freir todo por una ISO.
+---
 
-## Boot en VirtualBox
+## VirtualBox
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\boot-virtualbox.ps1 `
@@ -82,16 +90,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\boot-virtualbox.ps1 `
   -BootSeconds 35
 ```
 
-El script intenta no dejar la VM corriendo si solo se queria probar el arranque. Si queres dejarla abierta, usar `-KeepRunning`.
+---
 
-## Estado real
+## Notes
 
-- La UI nativa ya corre bastante, pero todavia hay partes que estan migrando a Ring 3.
-- Firefox es el objetivo grande. El runtime tiene Wayland/X11 y syscalls modernas, pero no hay que mentirse: correr un navegador real como Linux requiere muchisima compatibilidad.
-- SMP y GPU real no son un checkbox. Hay deteccion/topologia y aceleraciones de framebuffer, pero AP startup completo y driver GPU real siguen siendo trabajo serio.
+- UI is functional but still evolving
+- Running real browsers is a long-term goal
+- SMP and GPU drivers are still in progress
 
-## Regla para tocar esto
+---
 
-Cambios chicos, probables y con logs. Si algo se puede probar con `kernel-only`, no generar ISO. Si una parte esta fea pero funciona, primero se la rodea con estructura y despues se refactoriza.
+## Philosophy
 
-Ese es el plan: que Ridux se vaya pareciendo cada vez mas a un OS real sin convertir el repo en una bomba.
+Small changes. Test often. Keep it maintainable.
