@@ -27,26 +27,6 @@ KERNEL_PARTS := $(wildcard src/kernel/*.c)
 ICON_ASSETS := $(wildcard RiduxIcons/*.png) $(wildcard RiduxIcons/Wallpaper/*.png)
 WALLPAPER_ASSETS := $(wildcard Wallpapers/*.png) $(wildcard Wallpapers/*.jpg) $(wildcard Wallpapers/*.jpeg)
 
-# FreeBSD Linuxulator import flags. Imported files in src/linuxulator/
-# are copied verbatim from third_party/upstream/freebsd-src/sys/compat/linux.
-#
-# Include path strategy:
-#   1. -Isrc/freebsd_compat        first  -> our minimal shim wins for the
-#                                            <sys/*> headers we override
-#                                            (param.h, systm.h, errno.h, ...)
-#   2. -Ithird_party/.../sys/amd64 next   -> resolves <machine/../linux/*>
-#                                            (which actually means amd64/linux/*)
-#   3. -Ithird_party/.../sys       last   -> resolves <compat/linux/*>,
-#                                            <netinet/*>, etc. that we have
-#                                            no opinion on yet.
-#
-# This lets us scale the import without copying hundreds of header files.
-# When the upstream tree's <sys/X.h> conflicts with our shim, we just add
-# a curated stub to src/freebsd_compat/sys/X.h.
-LINUXULATOR_CFLAGS := -Isrc/freebsd_compat \
-                      -Ithird_party/upstream/freebsd-src/sys/amd64 \
-                      -Ithird_party/upstream/freebsd-src/sys
-
 OBJS := \
 	$(BUILD_DIR)/boot64.o \
 	$(BUILD_DIR)/isr64.o \
