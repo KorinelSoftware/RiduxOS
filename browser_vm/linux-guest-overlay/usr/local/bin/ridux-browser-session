@@ -1,0 +1,53 @@
+#!/bin/sh
+set -eu
+
+engine="${RIDUX_BROWSER_ENGINE:-chromium}"
+url="${RIDUX_BROWSER_URL:-about:blank}"
+
+export HOME="${HOME:-/root}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/0}"
+export DISPLAY="${DISPLAY:-:0}"
+
+mkdir -p "$XDG_RUNTIME_DIR" /tmp/ridux-browser-profile
+chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+start_chromium() {
+  for bin in chromium chromium-browser google-chrome chrome; do
+    if command -v "$bin" >/dev/null 2>&1; then
+      exec "$bin" \
+        --no-first-run \
+        --no-default-browser-check \
+        --disable-background-networking \
+        --disable-gpu \
+        --disable-dev-shm-usage \
+        --no-sandbox \
+        --user-data-dir=/tmp/ridux-browser-profile/chromium \
+        "$url"
+    fi
+  done
+  echo "ridux-browser-session: chromium not found" >&2
+  exit 127
+}
+
+start_firefox() {
+  for bin in firefox firefox-esr; do
+    if command -v "$bin" >/dev/null 2>&1; then
+      exec "$bin" \
+        --no-remote \
+        --new-instance \
+        --profile /tmp/ridux-browser-profile/firefox \
+        "$url"
+    fi
+  done
+  echo "ridux-browser-session: firefox not found" >&2
+  exit 127
+}
+
+case "$engine" in
+  firefox) start_firefox ;;
+  chromium|chrome|google-chrome) start_chromium ;;
+  *)
+    echo "ridux-browser-session: unknown engine '$engine'" >&2
+    exit 2
+    ;;
+esac

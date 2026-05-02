@@ -1,0 +1,10 @@
+This file exists to make src/freebsd_compat/machine/ a real directory so
+that GCC can resolve includes of the form `<machine/../linux/foo.h>` used
+extensively in FreeBSD's Linuxulator. Without a real `machine/` directory,
+GCC's path lookup fails before it can traverse `..`.
+
+In FreeBSD's own build system this directory is a symlink to
+sys/amd64/include during kernel build. We don't need its contents for
+the Linuxulator import (the upstream `<machine/../linux/...>` paths
+walk OUT of `machine/` immediately), so an empty stub directory is
+sufficient.

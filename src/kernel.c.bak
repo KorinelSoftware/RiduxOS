@@ -1,0 +1,3067 @@
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "font8x16.h"
+#include "assets.h"
+
+#define MB2_BOOTLOADER_MAGIC 0x36d76289u
+#define MB2_TAG_END 0u
+#define MB2_TAG_MODULE 3u
+#define MB2_TAG_FRAMEBUFFER 8u
+
+#define FLUSH_MAX_COMMANDS 4096
+#define SHELL_MAX_LINES 28
+#define SHELL_LINE_LEN 120
+
+#define VFS_MAX_FILES 64
+#define VFS_MAX_PATH 64
+#define VFS_RW_MAX 384
+
+#define PROC_MAX 24
+
+#define WINDOW_MAX 8
+#define WINDOW_LINE_COUNT 24
+#define WINDOW_LINE_LEN 96
+
+#define APP_MAX 6
+
+#define FB_MAX_WIDTH 1920
+#define FB_MAX_HEIGHT 1080
+
+#define ELF_MAX_IMAGES 8
+#define ELF_IMAGE_MEM_MAX 131072u
+#define ELF_IDENT_NIDENT 16
+
+typedef struct {
+    uint8_t *address;
+    uint32_t pitch;
+    uint32_t width;
+    uint32_t height;
+    uint8_t bpp;
+    uint8_t red_pos;
+    uint8_t red_size;
+    uint8_t green_pos;
+    uint8_t green_size;
+    uint8_t blue_pos;
+    uint8_t blue_size;
+    bool ready;
+} framebuffer_t;
+
+typedef enum {
+    FLUSH_CMD_CLEAR = 0,
+    FLUSH_CMD_RECT = 1,
+    FLUSH_CMD_VGRADIENT = 2,
+    FLUSH_CMD_TEXT = 3,
+    FLUSH_CMD_CIRCLE = 4,
+    FLUSH_CMD_IMAGE = 5
+} flush_cmd_type_t;
+
+typedef struct {
+    flush_cmd_type_t type;
+    int x;
+    int y;
+    int w;
+    int h;
+    int radius;
+    uint32_t color_a;
+    uint32_t color_b;
+    uint8_t alpha;
+    const ridux_image_t *image;
+    char text[96];
+} flush_cmd_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+} mb2_tag_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint64_t framebuffer_addr;
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t framebuffer_bpp;
+    uint8_t framebuffer_type;
+    uint16_t reserved;
+    uint8_t red_field_position;
+    uint8_t red_mask_size;
+    uint8_t green_field_position;
+    uint8_t green_mask_size;
+    uint8_t blue_field_position;
+    uint8_t blue_mask_size;
+} __attribute__((packed)) mb2_tag_framebuffer_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint32_t mod_start;
+    uint32_t mod_end;
+    char string[1];
+} __attribute__((packed)) mb2_tag_module_t;
+
+typedef struct {
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char checksum[8];
+    char typeflag;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char padding[12];
+} __attribute__((packed)) tar_header_t;
+
+typedef struct {
+    bool used;
+    bool writable;
+    char path[VFS_MAX_PATH];
+    const uint8_t *ro_data;
+    uint32_t ro_size;
+    char rw_data[VFS_RW_MAX];
+    uint32_t rw_size;
+} vfs_file_t;
+
+typedef enum {
+    PROC_UNUSED = 0,
+    PROC_READY = 1,
+    PROC_RUNNING = 2,
+    PROC_SLEEP = 3
+} proc_state_t;
+
+typedef struct {
+    bool used;
+    int pid;
+    char name[24];
+    proc_state_t state;
+    uint32_t cpu_ticks;
+    uint32_t work_units;
+    bool is_user;
+    int elf_slot;
+    uint32_t user_pc;
+} process_t;
+
+typedef struct {
+    bool used;
+    int id;
+    int app_id;
+    int content_kind;
+    bool visible;
+    int x;
+    int y;
+    int w;
+    int h;
+    uint8_t alpha;
+    char title[32];
+    char lines[WINDOW_LINE_COUNT][WINDOW_LINE_LEN];
+} window_t;
+
+typedef struct {
+    int x;
+    int y;
+    int w;
+    int h;
+} ui_rect_t;
+
+typedef struct {
+    int margin;
+    int gap;
+    int radius;
+    int line_h;
+    int title_h;
+    int window_pad;
+    int topbar_h;
+    int taskbar_h;
+    int taskbar_icon;
+    int taskbar_gap;
+    ui_rect_t screen;
+    ui_rect_t topbar;
+    ui_rect_t desktop;
+    ui_rect_t taskbar;
+} ui_layout_t;
+
+typedef struct {
+    int app_id;
+    int window_id;
+    int icon_id;
+    const char *name;
+} app_entry_t;
+
+enum {
+    APP_MONITOR = 1,
+    APP_FILES = 2,
+    APP_TERMINAL = 3,
+    APP_FLUSH = 4,
+    APP_SETTINGS = 5,
+    APP_NOTES = 6
+};
+
+enum {
+    CONTENT_MONITOR = 1,
+    CONTENT_FILES = 2,
+    CONTENT_TERMINAL = 3,
+    CONTENT_FLUSH = 4,
+    CONTENT_SETTINGS = 5,
+    CONTENT_NOTES = 6
+};
+
+typedef struct {
+    unsigned char e_ident[ELF_IDENT_NIDENT];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} __attribute__((packed)) elf32_ehdr_t;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+} __attribute__((packed)) elf32_phdr_t;
+
+typedef struct {
+    bool used;
+    char path[VFS_MAX_PATH];
+    uint32_t base_vaddr;
+    uint32_t entry_vaddr;
+    uint32_t mem_size;
+    uint32_t loaded_segments;
+    uint8_t memory[ELF_IMAGE_MEM_MAX];
+} elf_image_t;
+
+static framebuffer_t g_fb;
+static flush_cmd_t g_flush_queue[FLUSH_MAX_COMMANDS];
+static size_t g_flush_count;
+
+static char g_shell_lines[SHELL_MAX_LINES][SHELL_LINE_LEN];
+static size_t g_shell_count;
+static char g_shell_input[SHELL_LINE_LEN];
+static size_t g_shell_input_len;
+static bool g_shift_down;
+static bool g_extended_scancode;
+static bool g_wm_drag_mode;
+static bool g_arrow_hint_shown;
+static uint32_t g_theme_index;
+static bool g_needs_redraw;
+
+static const uint8_t *g_initrd_start;
+static const uint8_t *g_initrd_end;
+
+static vfs_file_t g_vfs_files[VFS_MAX_FILES];
+static size_t g_vfs_count;
+
+static process_t g_processes[PROC_MAX];
+static int g_proc_current;
+static int g_next_pid;
+static uint32_t g_scheduler_div;
+
+static window_t g_windows[WINDOW_MAX];
+static int g_window_count;
+static int g_window_focus;
+static int g_next_window_id;
+static int g_win_monitor_id;
+static int g_win_files_id;
+static int g_win_flush_id;
+static int g_win_settings_id;
+static int g_win_notes_id;
+static int g_win_terminal_id;
+
+static ui_layout_t g_ui;
+static app_entry_t g_apps[APP_MAX];
+static int g_app_count;
+static ui_rect_t g_dock_slots[APP_MAX];
+
+static elf_image_t g_elf_images[ELF_MAX_IMAGES];
+
+static bool g_use_backbuffer;
+static uint32_t g_backbuffer[FB_MAX_WIDTH * FB_MAX_HEIGHT];
+
+static bool g_mouse_initialized;
+static int g_mouse_x;
+static int g_mouse_y;
+static uint8_t g_mouse_packet[3];
+static int g_mouse_packet_index;
+static bool g_mouse_left_down;
+static bool g_mouse_dragging;
+static int g_mouse_drag_window_id;
+static int g_mouse_drag_offset_x;
+static int g_mouse_drag_offset_y;
+
+static inline uint8_t inb(uint16_t port) {
+    uint8_t result;
+    __asm__ volatile("inb %1, %0" : "=a"(result) : "Nd"(port));
+    return result;
+}
+
+static inline void outb(uint16_t port, uint8_t value) {
+    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static void *k_memset(void *dst, int value, size_t size) {
+    uint8_t *ptr = (uint8_t *)dst;
+    size_t i;
+    for (i = 0; i < size; ++i) {
+        ptr[i] = (uint8_t)value;
+    }
+    return dst;
+}
+
+static void *k_memcpy(void *dst, const void *src, size_t size) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    size_t i;
+    for (i = 0; i < size; ++i) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+
+static size_t k_strlen(const char *s) {
+    size_t n = 0;
+    while (s[n] != '\0') {
+        ++n;
+    }
+    return n;
+}
+
+static int k_strcmp(const char *a, const char *b) {
+    while (*a != '\0' && *b != '\0' && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return (int)((unsigned char)*a - (unsigned char)*b);
+}
+
+static int k_strncmp(const char *a, const char *b, size_t n) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        unsigned char ac = (unsigned char)a[i];
+        unsigned char bc = (unsigned char)b[i];
+        if (ac != bc) {
+            return (int)ac - (int)bc;
+        }
+        if (ac == '\0') {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static void k_strlcpy(char *dst, const char *src, size_t dst_size) {
+    size_t i = 0;
+    if (dst_size == 0) {
+        return;
+    }
+    while (i + 1 < dst_size && src[i] != '\0') {
+        dst[i] = src[i];
+        ++i;
+    }
+    dst[i] = '\0';
+}
+
+static bool k_is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static bool k_starts_with(const char *text, const char *prefix) {
+    size_t n = k_strlen(prefix);
+    return k_strncmp(text, prefix, n) == 0;
+}
+
+static void k_append_str(char *dst, size_t *len, size_t dst_size, const char *src) {
+    while (*src != '\0' && *len + 1 < dst_size) {
+        dst[*len] = *src;
+        ++(*len);
+        ++src;
+    }
+    dst[*len] = '\0';
+}
+
+static void k_append_u32(char *dst, size_t *len, size_t dst_size, uint32_t value) {
+    char tmp[11];
+    size_t i = 0;
+    size_t j;
+    if (value == 0u) {
+        if (*len + 1 < dst_size) {
+            dst[*len] = '0';
+            ++(*len);
+            dst[*len] = '\0';
+        }
+        return;
+    }
+    while (value > 0u && i < sizeof(tmp)) {
+        tmp[i++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    }
+    for (j = i; j > 0; --j) {
+        if (*len + 1 >= dst_size) {
+            break;
+        }
+        dst[*len] = tmp[j - 1];
+        ++(*len);
+    }
+    dst[*len] = '\0';
+}
+
+static void k_append_i32(char *dst, size_t *len, size_t dst_size, int32_t value) {
+    if (value < 0) {
+        if (*len + 1 < dst_size) {
+            dst[*len] = '-';
+            ++(*len);
+            dst[*len] = '\0';
+        }
+        k_append_u32(dst, len, dst_size, (uint32_t)(-value));
+    } else {
+        k_append_u32(dst, len, dst_size, (uint32_t)value);
+    }
+}
+
+static int k_atoi(const char *s) {
+    int sign = 1;
+    int value = 0;
+    while (k_is_space(*s)) {
+        ++s;
+    }
+    if (*s == '-') {
+        sign = -1;
+        ++s;
+    } else if (*s == '+') {
+        ++s;
+    }
+    while (*s >= '0' && *s <= '9') {
+        value = value * 10 + (*s - '0');
+        ++s;
+    }
+    return value * sign;
+}
+
+static int k_max_i(int a, int b) {
+    return a > b ? a : b;
+}
+
+static int k_clamp_i(int value, int low, int high) {
+    if (value < low) {
+        return low;
+    }
+    if (value > high) {
+        return high;
+    }
+    return value;
+}
+
+static int k_split_tokens(char *buffer, char *argv[], int max_argv) {
+    int argc = 0;
+    char *p = buffer;
+    while (*p != '\0' && argc < max_argv) {
+        while (*p != '\0' && k_is_space(*p)) {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        argv[argc++] = p;
+        while (*p != '\0' && !k_is_space(*p)) {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        *p = '\0';
+        ++p;
+    }
+    return argc;
+}
+
+static uint32_t parse_octal(const char *buffer, size_t max_len) {
+    uint32_t value = 0;
+    size_t i;
+    for (i = 0; i < max_len; ++i) {
+        char c = buffer[i];
+        if (c == '\0' || c == ' ') {
+            break;
+        }
+        if (c < '0' || c > '7') {
+            break;
+        }
+        value = (value << 3) + (uint32_t)(c - '0');
+    }
+    return value;
+}
+
+static uint32_t channel_mask(uint8_t bits) {
+    if (bits == 0) {
+        return 0u;
+    }
+    if (bits >= 32) {
+        return 0xFFFFFFFFu;
+    }
+    return (1u << bits) - 1u;
+}
+
+static uint8_t unpack_channel(uint32_t pixel, uint8_t pos, uint8_t bits) {
+    uint32_t mask = channel_mask(bits);
+    uint32_t raw;
+    if (mask == 0u) {
+        return 0u;
+    }
+    raw = (pixel >> pos) & mask;
+    return (uint8_t)((raw * 255u) / mask);
+}
+
+static uint32_t pack_channel(uint8_t value, uint8_t pos, uint8_t bits) {
+    uint32_t mask = channel_mask(bits);
+    uint32_t scaled;
+    if (mask == 0u) {
+        return 0u;
+    }
+    scaled = ((uint32_t)value * mask + 127u) / 255u;
+    return (scaled & mask) << pos;
+}
+
+static uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return pack_channel(r, g_fb.red_pos, g_fb.red_size) |
+           pack_channel(g, g_fb.green_pos, g_fb.green_size) |
+           pack_channel(b, g_fb.blue_pos, g_fb.blue_size);
+}
+
+static uint32_t blend_color(uint32_t dst, uint32_t src, uint8_t alpha) {
+    uint8_t sr = unpack_channel(src, g_fb.red_pos, g_fb.red_size);
+    uint8_t sg = unpack_channel(src, g_fb.green_pos, g_fb.green_size);
+    uint8_t sb = unpack_channel(src, g_fb.blue_pos, g_fb.blue_size);
+    uint8_t dr = unpack_channel(dst, g_fb.red_pos, g_fb.red_size);
+    uint8_t dg = unpack_channel(dst, g_fb.green_pos, g_fb.green_size);
+    uint8_t db = unpack_channel(dst, g_fb.blue_pos, g_fb.blue_size);
+    uint8_t rr = (uint8_t)(((uint16_t)sr * alpha + (uint16_t)dr * (255u - alpha)) / 255u);
+    uint8_t rg = (uint8_t)(((uint16_t)sg * alpha + (uint16_t)dg * (255u - alpha)) / 255u);
+    uint8_t rb = (uint8_t)(((uint16_t)sb * alpha + (uint16_t)db * (255u - alpha)) / 255u);
+    return rgb(rr, rg, rb);
+}
+
+static uint32_t fb_get_pixel(int x, int y) {
+    size_t index;
+    uint8_t *ptr;
+    if (!g_fb.ready || x < 0 || y < 0 || (uint32_t)x >= g_fb.width || (uint32_t)y >= g_fb.height) {
+        return 0u;
+    }
+    if (g_use_backbuffer) {
+        index = (size_t)y * FB_MAX_WIDTH + (size_t)x;
+        return g_backbuffer[index];
+    }
+    ptr = g_fb.address + (size_t)y * g_fb.pitch + (size_t)x * 4u;
+    return *((uint32_t *)ptr);
+}
+
+static void fb_put_pixel(int x, int y, uint32_t color) {
+    size_t index;
+    uint8_t *ptr;
+    if (!g_fb.ready || x < 0 || y < 0 || (uint32_t)x >= g_fb.width || (uint32_t)y >= g_fb.height) {
+        return;
+    }
+    if (g_use_backbuffer) {
+        index = (size_t)y * FB_MAX_WIDTH + (size_t)x;
+        g_backbuffer[index] = color;
+        return;
+    }
+    ptr = g_fb.address + (size_t)y * g_fb.pitch + (size_t)x * 4u;
+    *((uint32_t *)ptr) = color;
+}
+
+static void fb_blend_pixel(int x, int y, uint32_t color, uint8_t alpha) {
+    uint32_t dst;
+    if (alpha == 255u) {
+        fb_put_pixel(x, y, color);
+        return;
+    }
+    if (alpha == 0u) {
+        return;
+    }
+    dst = fb_get_pixel(x, y);
+    fb_put_pixel(x, y, blend_color(dst, color, alpha));
+}
+
+static void fb_present(void) {
+    uint32_t y;
+    if (!g_fb.ready || !g_use_backbuffer) {
+        return;
+    }
+    for (y = 0; y < g_fb.height; ++y) {
+        uint8_t *dst = g_fb.address + (size_t)y * g_fb.pitch;
+        const uint8_t *src = (const uint8_t *)(g_backbuffer + (size_t)y * FB_MAX_WIDTH);
+        k_memcpy(dst, src, (size_t)g_fb.width * 4u);
+    }
+}
+
+static void draw_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha) {
+    int iy;
+    int ix;
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    for (iy = 0; iy < h; ++iy) {
+        for (ix = 0; ix < w; ++ix) {
+            fb_blend_pixel(x + ix, y + iy, color, alpha);
+        }
+    }
+}
+
+static void draw_vgradient_alpha(int x, int y, int w, int h, uint32_t top, uint32_t bottom, uint8_t alpha) {
+    int iy;
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    for (iy = 0; iy < h; ++iy) {
+        uint8_t tr = unpack_channel(top, g_fb.red_pos, g_fb.red_size);
+        uint8_t tg = unpack_channel(top, g_fb.green_pos, g_fb.green_size);
+        uint8_t tb = unpack_channel(top, g_fb.blue_pos, g_fb.blue_size);
+        uint8_t br = unpack_channel(bottom, g_fb.red_pos, g_fb.red_size);
+        uint8_t bg = unpack_channel(bottom, g_fb.green_pos, g_fb.green_size);
+        uint8_t bb = unpack_channel(bottom, g_fb.blue_pos, g_fb.blue_size);
+        uint8_t rr = (uint8_t)(tr + ((int)(br - tr) * iy) / (h == 1 ? 1 : (h - 1)));
+        uint8_t rg = (uint8_t)(tg + ((int)(bg - tg) * iy) / (h == 1 ? 1 : (h - 1)));
+        uint8_t rb = (uint8_t)(tb + ((int)(bb - tb) * iy) / (h == 1 ? 1 : (h - 1)));
+        uint32_t color = rgb(rr, rg, rb);
+        draw_rect_alpha(x, y + iy, w, 1, color, alpha);
+    }
+}
+
+static void draw_circle_alpha(int cx, int cy, int radius, uint32_t color, uint8_t alpha) {
+    int y;
+    if (radius <= 0) {
+        return;
+    }
+    for (y = -radius; y <= radius; ++y) {
+        int x;
+        for (x = -radius; x <= radius; ++x) {
+            if (x * x + y * y <= radius * radius) {
+                fb_blend_pixel(cx + x, cy + y, color, alpha);
+            }
+        }
+    }
+}
+
+static void draw_image_scaled_alpha(int x, int y, int w, int h, const ridux_image_t *image, uint8_t alpha) {
+    int dy;
+    if (w <= 0 || h <= 0 || image == NULL || image->pixels == NULL || image->width == 0 || image->height == 0) {
+        return;
+    }
+    for (dy = 0; dy < h; ++dy) {
+        int dx;
+        uint32_t sy = (uint32_t)((dy * (int)image->height) / h);
+        if (sy >= image->height) {
+            sy = image->height - 1u;
+        }
+        for (dx = 0; dx < w; ++dx) {
+            uint32_t sx = (uint32_t)((dx * (int)image->width) / w);
+            uint32_t src;
+            uint8_t sa;
+            uint8_t sr;
+            uint8_t sg;
+            uint8_t sb;
+            uint32_t packed;
+            if (sx >= image->width) {
+                sx = image->width - 1u;
+            }
+            packed = image->pixels[(size_t)sy * image->width + sx];
+            sa = (uint8_t)((packed >> 24) & 0xFFu);
+            if (sa == 0u) {
+                continue;
+            }
+            if (alpha != 255u) {
+                sa = (uint8_t)(((uint16_t)sa * alpha) / 255u);
+                if (sa == 0u) {
+                    continue;
+                }
+            }
+            sr = (uint8_t)((packed >> 16) & 0xFFu);
+            sg = (uint8_t)((packed >> 8) & 0xFFu);
+            sb = (uint8_t)(packed & 0xFFu);
+            src = rgb(sr, sg, sb);
+            fb_blend_pixel(x + dx, y + dy, src, sa);
+        }
+    }
+}
+
+static void draw_char(int x, int y, char c, uint32_t color) {
+    const uint8_t(*glyph)[8] = FONT8X16_AA[(uint8_t)c];
+    int row;
+    for (row = 0; row < 16; ++row) {
+        int col;
+        for (col = 0; col < 8; ++col) {
+            uint8_t coverage = glyph[row][col];
+            if (coverage > 0u) {
+                fb_blend_pixel(x + col, y + row, color, coverage);
+            }
+        }
+    }
+}
+
+static void draw_text(int x, int y, const char *text, uint32_t color) {
+    while (*text != '\0') {
+        draw_char(x, y, *text, color);
+        x += 8;
+        ++text;
+    }
+}
+
+static flush_cmd_t *flush_push(flush_cmd_type_t type) {
+    flush_cmd_t *cmd;
+    if (g_flush_count >= FLUSH_MAX_COMMANDS) {
+        return NULL;
+    }
+    cmd = &g_flush_queue[g_flush_count++];
+    k_memset(cmd, 0, sizeof(*cmd));
+    cmd->type = type;
+    cmd->alpha = 255;
+    return cmd;
+}
+
+static void flush_reset(void) {
+    g_flush_count = 0;
+}
+
+static void flush_cmd_clear(uint32_t color) {
+    flush_cmd_t *cmd = flush_push(FLUSH_CMD_CLEAR);
+    if (cmd != NULL) {
+        cmd->color_a = color;
+    }
+}
+
+static void flush_cmd_rect(int x, int y, int w, int h, uint32_t color, uint8_t alpha) {
+    flush_cmd_t *cmd = flush_push(FLUSH_CMD_RECT);
+    if (cmd == NULL) {
+        return;
+    }
+    cmd->x = x;
+    cmd->y = y;
+    cmd->w = w;
+    cmd->h = h;
+    cmd->color_a = color;
+    cmd->alpha = alpha;
+}
+
+static void flush_cmd_vgradient(int x, int y, int w, int h, uint32_t top, uint32_t bottom, uint8_t alpha) {
+    flush_cmd_t *cmd = flush_push(FLUSH_CMD_VGRADIENT);
+    if (cmd == NULL) {
+        return;
+    }
+    cmd->x = x;
+    cmd->y = y;
+    cmd->w = w;
+    cmd->h = h;
+    cmd->color_a = top;
+    cmd->color_b = bottom;
+    cmd->alpha = alpha;
+}
+
+static void flush_cmd_text(int x, int y, uint32_t color, const char *text) {
+    flush_cmd_t *cmd = flush_push(FLUSH_CMD_TEXT);
+    if (cmd == NULL) {
+        return;
+    }
+    cmd->x = x;
+    cmd->y = y;
+    cmd->color_a = color;
+    k_strlcpy(cmd->text, text, sizeof(cmd->text));
+}
+
+static void flush_cmd_circle(int cx, int cy, int radius, uint32_t color, uint8_t alpha) {
+    flush_cmd_t *cmd = flush_push(FLUSH_CMD_CIRCLE);
+    if (cmd == NULL) {
+        return;
+    }
+    cmd->x = cx;
+    cmd->y = cy;
+    cmd->radius = radius;
+    cmd->color_a = color;
+    cmd->alpha = alpha;
+}
+
+static void flush_cmd_image(int x, int y, int w, int h, const ridux_image_t *image, uint8_t alpha) {
+    flush_cmd_t *cmd = flush_push(FLUSH_CMD_IMAGE);
+    if (cmd == NULL) {
+        return;
+    }
+    cmd->x = x;
+    cmd->y = y;
+    cmd->w = w;
+    cmd->h = h;
+    cmd->image = image;
+    cmd->alpha = alpha;
+}
+
+static void flush_execute(void) {
+    size_t i;
+    for (i = 0; i < g_flush_count; ++i) {
+        const flush_cmd_t *cmd = &g_flush_queue[i];
+        switch (cmd->type) {
+            case FLUSH_CMD_CLEAR:
+                draw_rect_alpha(0, 0, (int)g_fb.width, (int)g_fb.height, cmd->color_a, 255);
+                break;
+            case FLUSH_CMD_RECT:
+                draw_rect_alpha(cmd->x, cmd->y, cmd->w, cmd->h, cmd->color_a, cmd->alpha);
+                break;
+            case FLUSH_CMD_VGRADIENT:
+                draw_vgradient_alpha(cmd->x, cmd->y, cmd->w, cmd->h, cmd->color_a, cmd->color_b, cmd->alpha);
+                break;
+            case FLUSH_CMD_TEXT:
+                draw_text(cmd->x, cmd->y, cmd->text, cmd->color_a);
+                break;
+            case FLUSH_CMD_CIRCLE:
+                draw_circle_alpha(cmd->x, cmd->y, cmd->radius, cmd->color_a, cmd->alpha);
+                break;
+            case FLUSH_CMD_IMAGE:
+                draw_image_scaled_alpha(cmd->x, cmd->y, cmd->w, cmd->h, cmd->image, cmd->alpha);
+                break;
+            default:
+                break;
+        }
+    }
+    fb_present();
+}
+
+static void shell_push_line(const char *line) {
+    if (g_shell_count < SHELL_MAX_LINES) {
+        k_strlcpy(g_shell_lines[g_shell_count], line, SHELL_LINE_LEN);
+        ++g_shell_count;
+        return;
+    }
+    {
+        size_t i;
+        for (i = 1; i < SHELL_MAX_LINES; ++i) {
+            k_memcpy(g_shell_lines[i - 1], g_shell_lines[i], SHELL_LINE_LEN);
+        }
+    }
+    k_strlcpy(g_shell_lines[SHELL_MAX_LINES - 1], line, SHELL_LINE_LEN);
+}
+
+static void shell_push_bytes(const uint8_t *data, uint32_t size) {
+    char line[SHELL_LINE_LEN];
+    size_t line_len = 0;
+    uint32_t i;
+    line[0] = '\0';
+    for (i = 0; i < size; ++i) {
+        char c = (char)data[i];
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            line[line_len] = '\0';
+            shell_push_line(line);
+            line_len = 0;
+            line[0] = '\0';
+            continue;
+        }
+        if ((unsigned char)c < 32u || (unsigned char)c > 126u) {
+            c = '.';
+        }
+        if (line_len + 2 >= SHELL_LINE_LEN) {
+            line[line_len] = '\0';
+            shell_push_line(line);
+            line_len = 0;
+            line[0] = '\0';
+        }
+        line[line_len++] = c;
+        line[line_len] = '\0';
+    }
+    if (line_len > 0) {
+        shell_push_line(line);
+    }
+}
+
+static void shell_reset_history(void) {
+    size_t i;
+    for (i = 0; i < SHELL_MAX_LINES; ++i) {
+        g_shell_lines[i][0] = '\0';
+    }
+    g_shell_count = 0;
+}
+
+static void vfs_init(void) {
+    k_memset(g_vfs_files, 0, sizeof(g_vfs_files));
+    g_vfs_count = 0;
+}
+
+static void vfs_normalize_path(const char *input, char *out, size_t out_size) {
+    size_t len = 0;
+    if (out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    while (*input != '\0' && k_is_space(*input)) {
+        ++input;
+    }
+    if (*input != '/') {
+        if (len + 1 < out_size) {
+            out[len++] = '/';
+            out[len] = '\0';
+        }
+    }
+    while (*input != '\0' && len + 1 < out_size) {
+        out[len++] = *input++;
+        out[len] = '\0';
+    }
+    if (len == 0) {
+        out[0] = '/';
+        out[1] = '\0';
+    }
+}
+
+static vfs_file_t *vfs_find(const char *path) {
+    char normalized[VFS_MAX_PATH];
+    size_t i;
+    vfs_normalize_path(path, normalized, sizeof(normalized));
+    for (i = 0; i < VFS_MAX_FILES; ++i) {
+        if (g_vfs_files[i].used && k_strcmp(g_vfs_files[i].path, normalized) == 0) {
+            return &g_vfs_files[i];
+        }
+    }
+    return NULL;
+}
+
+static vfs_file_t *vfs_alloc(const char *path) {
+    char normalized[VFS_MAX_PATH];
+    size_t i;
+    vfs_file_t *existing;
+    vfs_normalize_path(path, normalized, sizeof(normalized));
+    existing = vfs_find(normalized);
+    if (existing != NULL) {
+        return existing;
+    }
+    for (i = 0; i < VFS_MAX_FILES; ++i) {
+        if (!g_vfs_files[i].used) {
+            g_vfs_files[i].used = true;
+            g_vfs_files[i].writable = true;
+            g_vfs_files[i].ro_data = NULL;
+            g_vfs_files[i].ro_size = 0;
+            g_vfs_files[i].rw_size = 0;
+            g_vfs_files[i].rw_data[0] = '\0';
+            k_strlcpy(g_vfs_files[i].path, normalized, sizeof(g_vfs_files[i].path));
+            ++g_vfs_count;
+            return &g_vfs_files[i];
+        }
+    }
+    return NULL;
+}
+
+static bool vfs_promote_writable(vfs_file_t *file) {
+    if (file == NULL) {
+        return false;
+    }
+    if (file->writable) {
+        return true;
+    }
+    if (file->ro_size >= VFS_RW_MAX) {
+        return false;
+    }
+    if (file->ro_data != NULL && file->ro_size > 0u) {
+        k_memcpy(file->rw_data, file->ro_data, file->ro_size);
+    }
+    file->rw_size = file->ro_size;
+    if (file->rw_size < VFS_RW_MAX) {
+        file->rw_data[file->rw_size] = '\0';
+    }
+    file->writable = true;
+    return true;
+}
+
+static bool vfs_touch(const char *path) {
+    vfs_file_t *file = vfs_alloc(path);
+    if (file == NULL) {
+        return false;
+    }
+    if (!file->writable) {
+        return vfs_promote_writable(file);
+    }
+    return true;
+}
+
+static bool vfs_write(const char *path, const char *text) {
+    size_t len = k_strlen(text);
+    vfs_file_t *file = vfs_alloc(path);
+    if (file == NULL) {
+        return false;
+    }
+    if (!vfs_promote_writable(file)) {
+        return false;
+    }
+    if (len >= VFS_RW_MAX) {
+        len = VFS_RW_MAX - 1u;
+    }
+    k_memcpy(file->rw_data, text, len);
+    file->rw_data[len] = '\0';
+    file->rw_size = (uint32_t)len;
+    return true;
+}
+
+static bool vfs_remove(const char *path) {
+    vfs_file_t *file = vfs_find(path);
+    if (file == NULL) {
+        return false;
+    }
+    file->used = false;
+    file->writable = false;
+    file->path[0] = '\0';
+    file->ro_data = NULL;
+    file->ro_size = 0;
+    file->rw_size = 0;
+    file->rw_data[0] = '\0';
+    if (g_vfs_count > 0) {
+        --g_vfs_count;
+    }
+    return true;
+}
+
+static bool vfs_read(const char *path, const uint8_t **data, uint32_t *size) {
+    vfs_file_t *file = vfs_find(path);
+    if (file == NULL) {
+        return false;
+    }
+    if (file->writable) {
+        *data = (const uint8_t *)file->rw_data;
+        *size = file->rw_size;
+    } else {
+        *data = file->ro_data;
+        *size = file->ro_size;
+    }
+    return true;
+}
+
+static size_t vfs_count(void) {
+    return g_vfs_count;
+}
+
+static void vfs_mount_initrd(const uint8_t *start, const uint8_t *end) {
+    const uint8_t *ptr = start;
+    while (ptr + sizeof(tar_header_t) <= end) {
+        const tar_header_t *header = (const tar_header_t *)ptr;
+        bool empty = true;
+        uint32_t size;
+        const uint8_t *file_data;
+        uint32_t aligned_size;
+        size_t i;
+
+        for (i = 0; i < sizeof(tar_header_t); ++i) {
+            if (ptr[i] != 0u) {
+                empty = false;
+                break;
+            }
+        }
+        if (empty) {
+            break;
+        }
+
+        size = parse_octal(header->size, sizeof(header->size));
+        file_data = ptr + 512u;
+        aligned_size = (size + 511u) & ~511u;
+
+        if ((header->typeflag == '0' || header->typeflag == '\0') && header->name[0] != '\0') {
+            char path[VFS_MAX_PATH];
+            size_t len = 0;
+            const char *name = header->name;
+            vfs_file_t *file;
+
+            if (name[0] == '.' && name[1] == '/') {
+                name += 2;
+            }
+            path[0] = '/';
+            len = 1;
+            while (*name != '\0' && len + 1 < sizeof(path)) {
+                path[len++] = *name++;
+            }
+            path[len] = '\0';
+
+            file = vfs_alloc(path);
+            if (file != NULL) {
+                file->writable = false;
+                file->ro_data = file_data;
+                file->ro_size = size;
+                file->rw_size = 0;
+                file->rw_data[0] = '\0';
+            }
+        }
+
+        if (file_data + aligned_size < file_data || file_data + aligned_size > end) {
+            break;
+        }
+        ptr = file_data + aligned_size;
+    }
+}
+
+static void vfs_seed_defaults(void) {
+    vfs_write("/home/readme.txt", "RiduxOS Unix\nOwn kernel + own shell + own WM + own Flush API.\n");
+    vfs_write("/tmp/todo.txt", "1) build apps\n2) add ELF loader\n3) network stack\n");
+    vfs_write("/tmp/notes.txt", "Ridux Notes\n- write /tmp/notes.txt <texto>\n- open notes\n");
+}
+
+typedef enum {
+    ELF_LOAD_OK = 0,
+    ELF_LOAD_NOTFOUND = 1,
+    ELF_LOAD_BAD_FORMAT = 2,
+    ELF_LOAD_TOO_LARGE = 3,
+    ELF_LOAD_NO_SLOT = 4
+} elf_load_result_t;
+
+static void elf_init(void) {
+    k_memset(g_elf_images, 0, sizeof(g_elf_images));
+}
+
+static int elf_find_by_path(const char *path) {
+    int i;
+    char normalized[VFS_MAX_PATH];
+    vfs_normalize_path(path, normalized, sizeof(normalized));
+    for (i = 0; i < ELF_MAX_IMAGES; ++i) {
+        if (g_elf_images[i].used && k_strcmp(g_elf_images[i].path, normalized) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int elf_alloc_slot(const char *path) {
+    int i;
+    int existing = elf_find_by_path(path);
+    char normalized[VFS_MAX_PATH];
+    if (existing >= 0) {
+        return existing;
+    }
+    vfs_normalize_path(path, normalized, sizeof(normalized));
+    for (i = 0; i < ELF_MAX_IMAGES; ++i) {
+        if (!g_elf_images[i].used) {
+            g_elf_images[i].used = true;
+            k_strlcpy(g_elf_images[i].path, normalized, sizeof(g_elf_images[i].path));
+            g_elf_images[i].base_vaddr = 0u;
+            g_elf_images[i].entry_vaddr = 0u;
+            g_elf_images[i].mem_size = 0u;
+            g_elf_images[i].loaded_segments = 0u;
+            k_memset(g_elf_images[i].memory, 0, sizeof(g_elf_images[i].memory));
+            return i;
+        }
+    }
+    return -1;
+}
+
+static elf_load_result_t elf_load_from_vfs(const char *path, int *slot_out) {
+    const uint8_t *data;
+    uint32_t size;
+    const elf32_ehdr_t *ehdr;
+    uint32_t min_vaddr = 0xFFFFFFFFu;
+    uint32_t max_vaddr = 0u;
+    uint32_t i;
+    bool has_load = false;
+    uint32_t image_size;
+    int slot;
+
+    if (!vfs_read(path, &data, &size)) {
+        return ELF_LOAD_NOTFOUND;
+    }
+    if (size < sizeof(elf32_ehdr_t)) {
+        return ELF_LOAD_BAD_FORMAT;
+    }
+
+    ehdr = (const elf32_ehdr_t *)data;
+    if (!(ehdr->e_ident[0] == 0x7F && ehdr->e_ident[1] == 'E' && ehdr->e_ident[2] == 'L' && ehdr->e_ident[3] == 'F' &&
+          ehdr->e_ident[4] == 1 && ehdr->e_ident[5] == 1)) {
+        return ELF_LOAD_BAD_FORMAT;
+    }
+    if (ehdr->e_phentsize != sizeof(elf32_phdr_t) || ehdr->e_phnum == 0u) {
+        return ELF_LOAD_BAD_FORMAT;
+    }
+    if (ehdr->e_phoff + (uint32_t)ehdr->e_phnum * sizeof(elf32_phdr_t) > size) {
+        return ELF_LOAD_BAD_FORMAT;
+    }
+
+    for (i = 0; i < ehdr->e_phnum; ++i) {
+        const elf32_phdr_t *phdr =
+            (const elf32_phdr_t *)(data + ehdr->e_phoff + i * (uint32_t)sizeof(elf32_phdr_t));
+        if (phdr->p_type != 1u) {
+            continue;
+        }
+        if (phdr->p_filesz > phdr->p_memsz) {
+            return ELF_LOAD_BAD_FORMAT;
+        }
+        if (phdr->p_offset + phdr->p_filesz > size) {
+            return ELF_LOAD_BAD_FORMAT;
+        }
+        if (phdr->p_memsz == 0u) {
+            continue;
+        }
+        if (phdr->p_vaddr < min_vaddr) {
+            min_vaddr = phdr->p_vaddr;
+        }
+        if (phdr->p_vaddr + phdr->p_memsz > max_vaddr) {
+            max_vaddr = phdr->p_vaddr + phdr->p_memsz;
+        }
+        has_load = true;
+    }
+    if (!has_load || min_vaddr >= max_vaddr) {
+        return ELF_LOAD_BAD_FORMAT;
+    }
+
+    image_size = max_vaddr - min_vaddr;
+    if (image_size == 0u || image_size > ELF_IMAGE_MEM_MAX) {
+        return ELF_LOAD_TOO_LARGE;
+    }
+    if (ehdr->e_entry < min_vaddr || ehdr->e_entry >= max_vaddr) {
+        return ELF_LOAD_BAD_FORMAT;
+    }
+
+    slot = elf_alloc_slot(path);
+    if (slot < 0) {
+        return ELF_LOAD_NO_SLOT;
+    }
+
+    g_elf_images[slot].base_vaddr = min_vaddr;
+    g_elf_images[slot].entry_vaddr = ehdr->e_entry;
+    g_elf_images[slot].mem_size = image_size;
+    g_elf_images[slot].loaded_segments = 0u;
+    k_memset(g_elf_images[slot].memory, 0, sizeof(g_elf_images[slot].memory));
+
+    for (i = 0; i < ehdr->e_phnum; ++i) {
+        const elf32_phdr_t *phdr =
+            (const elf32_phdr_t *)(data + ehdr->e_phoff + i * (uint32_t)sizeof(elf32_phdr_t));
+        if (phdr->p_type == 1u && phdr->p_memsz > 0u) {
+            uint32_t offset = phdr->p_vaddr - min_vaddr;
+            k_memcpy(g_elf_images[slot].memory + offset, data + phdr->p_offset, phdr->p_filesz);
+            g_elf_images[slot].loaded_segments += 1u;
+        }
+    }
+
+    *slot_out = slot;
+    return ELF_LOAD_OK;
+}
+
+static const char *proc_state_name(proc_state_t state) {
+    switch (state) {
+        case PROC_READY:
+            return "READY";
+        case PROC_RUNNING:
+            return "RUN";
+        case PROC_SLEEP:
+            return "SLEEP";
+        default:
+            return "UNUSED";
+    }
+}
+
+static int proc_count(void) {
+    int total = 0;
+    int i;
+    for (i = 0; i < PROC_MAX; ++i) {
+        if (g_processes[i].used) {
+            ++total;
+        }
+    }
+    return total;
+}
+
+static int elf_loaded_count(void) {
+    int i;
+    int total = 0;
+    for (i = 0; i < ELF_MAX_IMAGES; ++i) {
+        if (g_elf_images[i].used) {
+            ++total;
+        }
+    }
+    return total;
+}
+
+static int proc_running_pid(void) {
+    if (g_proc_current >= 0 && g_proc_current < PROC_MAX && g_processes[g_proc_current].used) {
+        return g_processes[g_proc_current].pid;
+    }
+    return -1;
+}
+
+static int proc_alloc(const char *name, bool is_user, int elf_slot, uint32_t initial_pc) {
+    int i;
+    for (i = 0; i < PROC_MAX; ++i) {
+        if (!g_processes[i].used) {
+            g_processes[i].used = true;
+            g_processes[i].pid = g_next_pid++;
+            g_processes[i].state = PROC_READY;
+            g_processes[i].cpu_ticks = 0;
+            g_processes[i].work_units = 0;
+            g_processes[i].is_user = is_user;
+            g_processes[i].elf_slot = elf_slot;
+            g_processes[i].user_pc = initial_pc;
+            k_strlcpy(g_processes[i].name, name, sizeof(g_processes[i].name));
+            return g_processes[i].pid;
+        }
+    }
+    return -1;
+}
+
+static int proc_spawn(const char *name) {
+    return proc_alloc(name, false, -1, 0u);
+}
+
+static int proc_spawn_elf(const char *path, int elf_slot) {
+    char name[24];
+    size_t len = 0;
+    size_t i;
+    name[0] = '\0';
+    k_append_str(name, &len, sizeof(name), "elf:");
+    for (i = 0; path[i] != '\0' && len + 1 < sizeof(name); ++i) {
+        char c = path[i];
+        if (c == '/') {
+            c = '.';
+        }
+        name[len++] = c;
+        name[len] = '\0';
+    }
+    if (len == 4) {
+        k_append_str(name, &len, sizeof(name), "bin");
+    }
+    if (elf_slot < 0 || elf_slot >= ELF_MAX_IMAGES || !g_elf_images[elf_slot].used) {
+        return -1;
+    }
+    return proc_alloc(name, true, elf_slot, g_elf_images[elf_slot].entry_vaddr - g_elf_images[elf_slot].base_vaddr);
+}
+
+static bool proc_kill(int pid) {
+    int i;
+    for (i = 0; i < PROC_MAX; ++i) {
+        if (g_processes[i].used && g_processes[i].pid == pid) {
+            g_processes[i].used = false;
+            g_processes[i].state = PROC_UNUSED;
+            g_processes[i].is_user = false;
+            g_processes[i].elf_slot = -1;
+            g_processes[i].user_pc = 0u;
+            if (g_proc_current == i) {
+                g_proc_current = -1;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void proc_bootstrap(void) {
+    k_memset(g_processes, 0, sizeof(g_processes));
+    g_proc_current = -1;
+    g_next_pid = 1;
+    proc_spawn("compositor");
+    proc_spawn("ridux-shell");
+    proc_spawn("flushd");
+    proc_spawn("ridux-fsd");
+}
+
+static void scheduler_tick(void) {
+    int base;
+    int i;
+    if (g_proc_current >= 0 && g_proc_current < PROC_MAX && g_processes[g_proc_current].used &&
+        g_processes[g_proc_current].state == PROC_RUNNING) {
+        g_processes[g_proc_current].state = PROC_READY;
+    }
+
+    base = (g_proc_current < 0) ? 0 : g_proc_current;
+    for (i = 0; i < PROC_MAX; ++i) {
+        int index = (base + 1 + i) % PROC_MAX;
+        if (g_processes[index].used && g_processes[index].state == PROC_READY) {
+            process_t *proc = &g_processes[index];
+            g_proc_current = index;
+            proc->state = PROC_RUNNING;
+            proc->cpu_ticks += 1u;
+            if (proc->is_user && proc->elf_slot >= 0 && proc->elf_slot < ELF_MAX_IMAGES &&
+                g_elf_images[proc->elf_slot].used && g_elf_images[proc->elf_slot].mem_size > 0u) {
+                elf_image_t *image = &g_elf_images[proc->elf_slot];
+                uint32_t pc = proc->user_pc % image->mem_size;
+                uint8_t opcode = image->memory[pc];
+                proc->user_pc = (pc + 1u) % image->mem_size;
+                proc->work_units += (uint32_t)(opcode & 0x0Fu) + 1u;
+            } else {
+                proc->work_units += (uint32_t)(index + 3);
+            }
+            return;
+        }
+    }
+    g_proc_current = -1;
+}
+
+static window_t *wm_get_by_id(int id) {
+    int i;
+    for (i = 0; i < g_window_count; ++i) {
+        if (g_windows[i].used && g_windows[i].id == id) {
+            return &g_windows[i];
+        }
+    }
+    return NULL;
+}
+
+static int wm_index_by_id(int id) {
+    int i;
+    for (i = 0; i < g_window_count; ++i) {
+        if (g_windows[i].used && g_windows[i].id == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int app_index_by_id(int app_id) {
+    int i;
+    for (i = 0; i < g_app_count; ++i) {
+        if (g_apps[i].app_id == app_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool wm_is_visible_by_id(int id) {
+    window_t *win = wm_get_by_id(id);
+    return win != NULL && win->visible;
+}
+
+static void ui_build_layout(void) {
+    int width = (int)g_fb.width;
+    int height = (int)g_fb.height;
+    int taskbar_inner_w;
+    int icon_space;
+
+    g_ui.screen.x = 0;
+    g_ui.screen.y = 0;
+    g_ui.screen.w = width;
+    g_ui.screen.h = height;
+
+    g_ui.margin = k_clamp_i(width / 52, 12, 28);
+    g_ui.gap = k_clamp_i(width / 96, 10, 18);
+    g_ui.radius = 12;
+    g_ui.line_h = 20;
+    g_ui.title_h = 36;
+    g_ui.window_pad = 14;
+    g_ui.topbar_h = k_clamp_i(height / 10, 44, 58);
+    g_ui.taskbar_h = k_clamp_i(height / 9, 52, 72);
+    g_ui.taskbar_icon = k_clamp_i(width / 22, 28, 42);
+    g_ui.taskbar_gap = k_clamp_i(width / 120, 8, 14);
+
+    g_ui.topbar.x = 0;
+    g_ui.topbar.y = 0;
+    g_ui.topbar.w = width;
+    g_ui.topbar.h = g_ui.topbar_h;
+
+    icon_space = g_app_count * g_ui.taskbar_icon + k_max_i(0, g_app_count - 1) * g_ui.taskbar_gap;
+    taskbar_inner_w = icon_space + g_ui.margin * 2;
+    taskbar_inner_w = k_clamp_i(taskbar_inner_w, width / 3, width - g_ui.margin * 2);
+
+    g_ui.taskbar.w = taskbar_inner_w;
+    g_ui.taskbar.h = g_ui.taskbar_h;
+    g_ui.taskbar.x = (width - g_ui.taskbar.w) / 2;
+    g_ui.taskbar.y = height - g_ui.margin - g_ui.taskbar.h;
+
+    g_ui.desktop.x = g_ui.margin;
+    g_ui.desktop.y = g_ui.topbar.h + g_ui.gap;
+    g_ui.desktop.w = width - g_ui.margin * 2;
+    g_ui.desktop.h = g_ui.taskbar.y - g_ui.desktop.y - g_ui.gap;
+    if (g_ui.desktop.h < 120) {
+        g_ui.desktop.h = 120;
+    }
+}
+
+static void ui_update_dock_slots(void) {
+    int i;
+    int total;
+    int start_x;
+    int y;
+    if (g_app_count <= 0) {
+        return;
+    }
+    total = g_app_count * g_ui.taskbar_icon + (g_app_count - 1) * g_ui.taskbar_gap;
+    start_x = g_ui.taskbar.x + (g_ui.taskbar.w - total) / 2;
+    y = g_ui.taskbar.y + (g_ui.taskbar.h - g_ui.taskbar_icon) / 2;
+    for (i = 0; i < g_app_count; ++i) {
+        g_dock_slots[i].x = start_x + i * (g_ui.taskbar_icon + g_ui.taskbar_gap);
+        g_dock_slots[i].y = y;
+        g_dock_slots[i].w = g_ui.taskbar_icon;
+        g_dock_slots[i].h = g_ui.taskbar_icon;
+    }
+}
+
+static void wm_clamp(window_t *w) {
+    int min_x = g_ui.desktop.x;
+    int min_y = g_ui.desktop.y;
+    int max_x = g_ui.desktop.x + g_ui.desktop.w - w->w;
+    int max_y = g_ui.desktop.y + g_ui.desktop.h - w->h;
+    if (max_x < min_x) {
+        max_x = min_x;
+    }
+    if (max_y < min_y) {
+        max_y = min_y;
+    }
+    w->x = k_clamp_i(w->x, min_x, max_x);
+    w->y = k_clamp_i(w->y, min_y, max_y);
+}
+
+static void wm_raise_to_top(int index) {
+    window_t temp;
+    int i;
+    if (index < 0 || index >= g_window_count || index == g_window_count - 1) {
+        if (index >= 0 && index < g_window_count && g_windows[index].visible) {
+            g_window_focus = index;
+        }
+        return;
+    }
+    temp = g_windows[index];
+    for (i = index; i < g_window_count - 1; ++i) {
+        g_windows[i] = g_windows[i + 1];
+    }
+    g_windows[g_window_count - 1] = temp;
+    if (g_windows[g_window_count - 1].visible) {
+        g_window_focus = g_window_count - 1;
+    }
+}
+
+static void wm_focus_last_visible(void) {
+    int i;
+    for (i = g_window_count - 1; i >= 0; --i) {
+        if (g_windows[i].used && g_windows[i].visible) {
+            g_window_focus = i;
+            return;
+        }
+    }
+    g_window_focus = -1;
+}
+
+static int wm_add_window(const char *title, int app_id, int content_kind, bool visible, int x, int y, int w, int h,
+                         uint8_t alpha) {
+    window_t *win;
+    int i;
+    if (g_window_count >= WINDOW_MAX) {
+        return -1;
+    }
+    i = g_window_count++;
+    win = &g_windows[i];
+    k_memset(win, 0, sizeof(*win));
+    win->used = true;
+    win->id = g_next_window_id++;
+    win->app_id = app_id;
+    win->content_kind = content_kind;
+    win->visible = visible;
+    win->x = x;
+    win->y = y;
+    win->w = w;
+    win->h = h;
+    win->alpha = alpha;
+    k_strlcpy(win->title, title, sizeof(win->title));
+    wm_clamp(win);
+    return win->id;
+}
+
+static bool wm_set_visible_by_id(int id, bool visible) {
+    window_t *win = wm_get_by_id(id);
+    if (win == NULL) {
+        return false;
+    }
+    win->visible = visible;
+    if (!visible && g_window_focus >= 0 && g_window_focus < g_window_count && g_windows[g_window_focus].id == id) {
+        wm_focus_last_visible();
+    }
+    return true;
+}
+
+static bool wm_focus_by_id(int id) {
+    int index = wm_index_by_id(id);
+    if (index < 0) {
+        return false;
+    }
+    g_windows[index].visible = true;
+    wm_raise_to_top(index);
+    return true;
+}
+
+static void wm_focus_next(void) {
+    int i;
+    if (g_window_count <= 0) {
+        return;
+    }
+    if (g_window_focus < 0 || g_window_focus >= g_window_count) {
+        wm_focus_last_visible();
+        return;
+    }
+    for (i = 1; i <= g_window_count; ++i) {
+        int index = (g_window_focus + i) % g_window_count;
+        if (g_windows[index].used && g_windows[index].visible) {
+            wm_raise_to_top(index);
+            return;
+        }
+    }
+}
+
+static bool wm_move_focused(int dx, int dy) {
+    window_t *win;
+    if (g_window_focus < 0 || g_window_focus >= g_window_count) {
+        return false;
+    }
+    win = &g_windows[g_window_focus];
+    if (!win->visible) {
+        return false;
+    }
+    win->x += dx;
+    win->y += dy;
+    wm_clamp(win);
+    return true;
+}
+
+static int wm_find_window_at(int x, int y, bool title_only) {
+    int i;
+    for (i = g_window_count - 1; i >= 0; --i) {
+        const window_t *win = &g_windows[i];
+        if (!win->used || !win->visible) {
+            continue;
+        }
+        if (x >= win->x && x < win->x + win->w && y >= win->y && y < win->y + win->h) {
+            if (!title_only || y < win->y + g_ui.title_h) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+static void wm_set_line(window_t *window, int line_index, const char *text) {
+    if (window == NULL || line_index < 0 || line_index >= WINDOW_LINE_COUNT) {
+        return;
+    }
+    k_strlcpy(window->lines[line_index], text, WINDOW_LINE_LEN);
+}
+
+static void wm_clear_lines(window_t *window) {
+    int i;
+    if (window == NULL) {
+        return;
+    }
+    for (i = 0; i < WINDOW_LINE_COUNT; ++i) {
+        window->lines[i][0] = '\0';
+    }
+}
+
+static void app_add(int app_id, int window_id, int icon_id, const char *name) {
+    if (g_app_count >= APP_MAX) {
+        return;
+    }
+    g_apps[g_app_count].app_id = app_id;
+    g_apps[g_app_count].window_id = window_id;
+    g_apps[g_app_count].icon_id = icon_id;
+    g_apps[g_app_count].name = name;
+    ++g_app_count;
+}
+
+static int app_hit_test(int x, int y) {
+    int i;
+    for (i = 0; i < g_app_count; ++i) {
+        ui_rect_t slot = g_dock_slots[i];
+        if (x >= slot.x && x < slot.x + slot.w && y >= slot.y && y < slot.y + slot.h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool app_is_running(int app_id) {
+    int index = app_index_by_id(app_id);
+    if (index < 0) {
+        return false;
+    }
+    if (g_apps[index].window_id <= 0) {
+        return false;
+    }
+    return wm_is_visible_by_id(g_apps[index].window_id);
+}
+
+static void app_activate_index(int app_index) {
+    int id;
+    if (app_index < 0 || app_index >= g_app_count) {
+        return;
+    }
+    id = g_apps[app_index].window_id;
+    if (id <= 0) {
+        shell_push_line("App not implemented yet.");
+        return;
+    }
+    if (wm_is_visible_by_id(id) && g_window_focus >= 0 && g_window_focus < g_window_count &&
+        g_windows[g_window_focus].id == id) {
+        wm_set_visible_by_id(id, false);
+    } else {
+        wm_set_visible_by_id(id, true);
+        wm_focus_by_id(id);
+    }
+}
+
+static void wm_bootstrap(void) {
+    ui_rect_t d;
+    int top_h;
+    int mid_h;
+    int bot_h;
+    int left_w;
+    int right_w;
+    int mid_y;
+    int bot_y;
+    int popup_w;
+    int popup_h;
+    int popup_x;
+    int popup_y;
+
+    k_memset(g_windows, 0, sizeof(g_windows));
+    g_window_count = 0;
+    g_window_focus = -1;
+    g_next_window_id = 1;
+
+    ui_build_layout();
+    d = g_ui.desktop;
+
+    top_h = d.h * 28 / 100;
+    mid_h = d.h * 30 / 100;
+    bot_h = d.h - top_h - mid_h - g_ui.gap * 2;
+    if (top_h < 96) {
+        top_h = 96;
+    }
+    if (mid_h < 112) {
+        mid_h = 112;
+    }
+    if (bot_h < 120) {
+        bot_h = 120;
+    }
+    if (top_h + mid_h + bot_h + g_ui.gap * 2 > d.h) {
+        bot_h = d.h - top_h - mid_h - g_ui.gap * 2;
+        if (bot_h < 92) {
+            bot_h = 92;
+        }
+    }
+
+    left_w = (d.w - g_ui.gap) / 2;
+    right_w = d.w - left_w - g_ui.gap;
+    mid_y = d.y + top_h + g_ui.gap;
+    bot_y = mid_y + mid_h + g_ui.gap;
+
+    popup_w = d.w * 46 / 100;
+    popup_h = d.h * 52 / 100;
+    if (popup_w < 360) {
+        popup_w = 360;
+    }
+    if (popup_h < 240) {
+        popup_h = 240;
+    }
+    if (popup_w > d.w - g_ui.gap * 2) {
+        popup_w = d.w - g_ui.gap * 2;
+    }
+    if (popup_h > d.h - g_ui.gap * 2) {
+        popup_h = d.h - g_ui.gap * 2;
+    }
+    popup_x = d.x + (d.w - popup_w) / 2;
+    popup_y = d.y + (d.h - popup_h) / 2;
+
+    g_win_monitor_id = wm_add_window("System Monitor", APP_MONITOR, CONTENT_MONITOR, true, d.x, d.y, d.w, top_h, 214);
+    g_win_files_id = wm_add_window("Ridux Files", APP_FILES, CONTENT_FILES, true, d.x, mid_y, left_w,
+                                   mid_h, 206);
+    g_win_notes_id = wm_add_window("Notes", APP_NOTES, CONTENT_NOTES, true, d.x + left_w + g_ui.gap, mid_y, right_w, mid_h, 206);
+    g_win_flush_id = wm_add_window("Flush Inspector", APP_FLUSH, CONTENT_FLUSH, false, popup_x, popup_y, popup_w, popup_h, 214);
+    g_win_settings_id = wm_add_window("Settings", APP_SETTINGS, CONTENT_SETTINGS, false, popup_x + 26, popup_y + 18, popup_w,
+                                      popup_h, 214);
+    g_win_terminal_id =
+        wm_add_window("Terminal", APP_TERMINAL, CONTENT_TERMINAL, true, d.x, bot_y, d.w, bot_h, 212);
+
+    g_app_count = 0;
+    app_add(APP_MONITOR, g_win_monitor_id, RIDUX_ICON_MONITOR, "Monitor");
+    app_add(APP_FILES, g_win_files_id, RIDUX_ICON_FILES, "Files");
+    app_add(APP_TERMINAL, g_win_terminal_id, RIDUX_ICON_TERMINAL, "Terminal");
+    app_add(APP_NOTES, g_win_notes_id, RIDUX_ICON_NOTES, "Notes");
+    app_add(APP_FLUSH, g_win_flush_id, RIDUX_ICON_FLUSH, "Flush");
+    app_add(APP_SETTINGS, g_win_settings_id, RIDUX_ICON_SETTINGS, "Settings");
+
+    ui_build_layout();
+    ui_update_dock_slots();
+    wm_focus_by_id(g_win_terminal_id);
+}
+
+static void wm_update_dynamic_content(void) {
+    window_t *monitor = wm_get_by_id(g_win_monitor_id);
+    window_t *files = wm_get_by_id(g_win_files_id);
+    window_t *notes = wm_get_by_id(g_win_notes_id);
+    window_t *flush = wm_get_by_id(g_win_flush_id);
+    window_t *settings = wm_get_by_id(g_win_settings_id);
+    window_t *terminal = wm_get_by_id(g_win_terminal_id);
+    char line[WINDOW_LINE_LEN];
+    size_t len;
+    size_t i;
+
+    if (monitor != NULL) {
+        wm_clear_lines(monitor);
+        len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), "Processes: ");
+        k_append_u32(line, &len, sizeof(line), (uint32_t)proc_count());
+        k_append_str(line, &len, sizeof(line), "  Running PID: ");
+        if (proc_running_pid() < 0) {
+            k_append_str(line, &len, sizeof(line), "-");
+        } else {
+            k_append_u32(line, &len, sizeof(line), (uint32_t)proc_running_pid());
+        }
+        wm_set_line(monitor, 0, line);
+
+        len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), "RiduxFS: ");
+        k_append_u32(line, &len, sizeof(line), (uint32_t)vfs_count());
+        k_append_str(line, &len, sizeof(line), " files  |  ELF: ");
+        k_append_u32(line, &len, sizeof(line), (uint32_t)elf_loaded_count());
+        wm_set_line(monitor, 1, line);
+
+        wm_set_line(monitor, 2, "Taskbar apps: click to open/minimize.");
+        wm_set_line(monitor, 3, "Window drag: title bar + mouse.");
+        wm_set_line(monitor, 4, g_wm_drag_mode ? "Keyboard drag: ON" : "Keyboard drag: OFF");
+        wm_set_line(monitor, 5, "Unix ABI core: ELF32 + VFS + scheduler.");
+    }
+
+    if (files != NULL) {
+        int row = 0;
+        wm_clear_lines(files);
+        wm_set_line(files, row++, "/ (initrd + rw overlay)");
+        for (i = 0; i < VFS_MAX_FILES && row < WINDOW_LINE_COUNT; ++i) {
+            if (g_vfs_files[i].used) {
+                wm_set_line(files, row++, g_vfs_files[i].path);
+            }
+        }
+    }
+
+    if (notes != NULL) {
+        const uint8_t *note_data = NULL;
+        uint32_t note_size = 0;
+        int row = 0;
+        wm_clear_lines(notes);
+        wm_set_line(notes, row++, "/tmp/notes.txt");
+        if (vfs_read("/tmp/notes.txt", &note_data, &note_size) && note_data != NULL && note_size > 0u) {
+            size_t j;
+            char note_line[WINDOW_LINE_LEN];
+            size_t note_len = 0;
+            note_line[0] = '\0';
+            for (j = 0; j < note_size && row < WINDOW_LINE_COUNT; ++j) {
+                char c = (char)note_data[j];
+                if (c == '\r') {
+                    continue;
+                }
+                if (c == '\n') {
+                    note_line[note_len] = '\0';
+                    wm_set_line(notes, row++, note_line);
+                    note_len = 0;
+                    note_line[0] = '\0';
+                    continue;
+                }
+                if ((unsigned char)c < 32u || (unsigned char)c > 126u) {
+                    c = '.';
+                }
+                if (note_len + 1u < sizeof(note_line)) {
+                    note_line[note_len++] = c;
+                    note_line[note_len] = '\0';
+                }
+            }
+            if (note_len > 0 && row < WINDOW_LINE_COUNT) {
+                note_line[note_len] = '\0';
+                wm_set_line(notes, row++, note_line);
+            }
+            if (row == 1) {
+                wm_set_line(notes, row++, "(empty)");
+            }
+        } else {
+            wm_set_line(notes, row++, "No notes yet.");
+        }
+        if (row < WINDOW_LINE_COUNT) {
+            wm_set_line(notes, row, "Use: write /tmp/notes.txt <texto>");
+        }
+    }
+
+    if (flush != NULL) {
+        wm_clear_lines(flush);
+        len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), "Queue cap: ");
+        k_append_u32(line, &len, sizeof(line), FLUSH_MAX_COMMANDS);
+        wm_set_line(flush, 0, line);
+
+        len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), "Last frame cmds: ");
+        k_append_u32(line, &len, sizeof(line), (uint32_t)g_flush_count);
+        wm_set_line(flush, 1, line);
+
+        wm_set_line(flush, 2, "Depth layers: shadow + glass + tint.");
+        wm_set_line(flush, 3, "Bitmap font grid centered.");
+        wm_set_line(flush, 4, "Assets: PNG icons + JPG/PNG wallpaper.");
+        wm_set_line(flush, 5, "Shell: apps/open/close/elf/ps/wm");
+    }
+
+    if (settings != NULL) {
+        wm_clear_lines(settings);
+        len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), "Theme index: ");
+        k_append_u32(line, &len, sizeof(line), g_theme_index);
+        wm_set_line(settings, 0, line);
+
+        wm_set_line(settings, 1, "Wallpaper source: local RiduxIcons/Wallpapers.");
+        wm_set_line(settings, 2, "Dock: Monitor Files Terminal Notes Flush Settings");
+        wm_set_line(settings, 3, "Unix compatibility scope:");
+        wm_set_line(settings, 4, "ELF32 userspace + scheduler + FS overlay.");
+        wm_set_line(settings, 5, "Chromium/drivers full stack: pending.");
+    }
+
+    if (terminal != NULL) {
+        int row = 0;
+        int start;
+        wm_clear_lines(terminal);
+        if (g_shell_count > WINDOW_LINE_COUNT - 1) {
+            start = (int)g_shell_count - (WINDOW_LINE_COUNT - 1);
+        } else {
+            start = 0;
+        }
+        for (i = (size_t)start; i < g_shell_count && row < WINDOW_LINE_COUNT - 1; ++i) {
+            wm_set_line(terminal, row++, g_shell_lines[i]);
+        }
+        len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), "ridux$ ");
+        k_append_str(line, &len, sizeof(line), g_shell_input);
+        k_append_str(line, &len, sizeof(line), "_");
+        wm_set_line(terminal, row < WINDOW_LINE_COUNT ? row : WINDOW_LINE_COUNT - 1, line);
+    }
+}
+
+static void render_window(const window_t *window, bool focused, uint32_t glass, uint32_t stroke, uint32_t text,
+                          uint32_t accent, uint32_t muted) {
+    int i;
+    int max_lines;
+    int line_y;
+    uint32_t body = rgb(13, 24, 41);
+    uint32_t title_bar = focused ? accent : rgb(73, 118, 158);
+    uint8_t title_alpha = focused ? 220 : 182;
+    int title_h = g_ui.title_h;
+    int pad = g_ui.window_pad;
+    int line_h = g_ui.line_h;
+    if (!window->used || !window->visible) {
+        return;
+    }
+
+    /* Soft depth shadow */
+    for (i = 0; i < 5; ++i) {
+        int spread = i + 1;
+        uint8_t alpha = (uint8_t)(42 - i * 6);
+        flush_cmd_rect(window->x - spread, window->y - spread / 2, window->w + spread * 2, window->h + spread * 2,
+                       rgb(5, 11, 22), alpha);
+    }
+
+    flush_cmd_vgradient(window->x, window->y, window->w, window->h, body, rgb(8, 17, 30), window->alpha);
+    flush_cmd_rect(window->x + 2, window->y + 2, window->w - 4, window->h - 4, glass, 28);
+    flush_cmd_rect(window->x, window->y, window->w, title_h, title_bar, title_alpha);
+    flush_cmd_vgradient(window->x + 1, window->y + 1, window->w - 2, 6, rgb(255, 255, 255), rgb(255, 255, 255), 42);
+    flush_cmd_rect(window->x, window->y + title_h - 1, window->w, 1, stroke, focused ? 214 : 136);
+    flush_cmd_rect(window->x, window->y, window->w, 1, stroke, focused ? 226 : 150);
+    flush_cmd_rect(window->x, window->y + window->h - 1, window->w, 1, stroke, focused ? 226 : 150);
+    flush_cmd_rect(window->x, window->y, 1, window->h, stroke, focused ? 226 : 150);
+    flush_cmd_rect(window->x + window->w - 1, window->y, 1, window->h, stroke, focused ? 226 : 150);
+    flush_cmd_text(window->x + pad, window->y + (title_h - 16) / 2, text, window->title);
+
+    max_lines = (window->h - title_h - pad * 2) / line_h;
+    if (max_lines < 0) {
+        max_lines = 0;
+    }
+    if (max_lines > WINDOW_LINE_COUNT) {
+        max_lines = WINDOW_LINE_COUNT;
+    }
+    line_y = window->y + title_h + pad;
+    for (i = 0; i < max_lines; ++i) {
+        if (window->lines[i][0] != '\0') {
+            flush_cmd_text(window->x + pad, line_y + i * line_h, muted, window->lines[i]);
+        }
+    }
+}
+
+static void render_cursor(void) {
+    int x = g_mouse_x;
+    int y = g_mouse_y;
+    uint32_t white = rgb(245, 250, 255);
+    uint32_t dark = rgb(10, 20, 34);
+    int i;
+
+    for (i = 0; i < 12; ++i) {
+        flush_cmd_rect(x + i, y + i, 1, 1, white, 255);
+        flush_cmd_rect(x + i + 1, y + i, 1, 1, dark, 255);
+    }
+    flush_cmd_rect(x, y, 2, 15, white, 255);
+    flush_cmd_rect(x, y, 11, 2, white, 255);
+    flush_cmd_rect(x + 1, y + 2, 1, 12, dark, 255);
+    flush_cmd_rect(x + 2, y + 1, 8, 1, dark, 255);
+}
+
+static void render_scene(void) {
+    int i;
+    uint32_t wallpaper_tint_a;
+    uint32_t wallpaper_tint_b;
+    uint32_t glass_white;
+    uint32_t stroke;
+    uint32_t text;
+    uint32_t accent;
+    uint32_t muted;
+    uint32_t topbar_bg;
+    uint32_t taskbar_bg;
+    const ridux_image_t *wallpaper;
+    char status[96];
+    size_t len;
+
+    ui_build_layout();
+    ui_update_dock_slots();
+
+    wallpaper = &RIDUX_WALLPAPERS[g_theme_index % RIDUX_WALLPAPER_COUNT];
+
+    if (g_theme_index == 0u) {
+        wallpaper_tint_a = rgb(13, 33, 72);
+        wallpaper_tint_b = rgb(6, 64, 112);
+        accent = rgb(112, 214, 255);
+    } else if (g_theme_index == 1u) {
+        wallpaper_tint_a = rgb(30, 37, 66);
+        wallpaper_tint_b = rgb(17, 92, 92);
+        accent = rgb(255, 198, 124);
+    } else {
+        wallpaper_tint_a = rgb(41, 30, 82);
+        wallpaper_tint_b = rgb(35, 66, 126);
+        accent = rgb(214, 160, 255);
+    }
+    glass_white = rgb(227, 242, 255);
+    stroke = rgb(202, 228, 250);
+    text = rgb(245, 250, 255);
+    muted = rgb(214, 231, 246);
+    topbar_bg = rgb(8, 19, 38);
+    taskbar_bg = rgb(7, 17, 33);
+
+    wm_update_dynamic_content();
+
+    flush_reset();
+
+    flush_cmd_clear(wallpaper_tint_a);
+    flush_cmd_image(0, 0, (int)g_fb.width, (int)g_fb.height, wallpaper, 255);
+    flush_cmd_vgradient(0, 0, (int)g_fb.width, (int)g_fb.height, wallpaper_tint_a, wallpaper_tint_b, 88);
+    flush_cmd_circle((int)g_fb.width - 92, 96, 72, rgb(255, 255, 255), 16);
+    flush_cmd_circle(90, 86, 54, rgb(255, 255, 255), 14);
+    flush_cmd_circle((int)g_fb.width / 2, (int)g_fb.height / 2, 136, rgb(255, 255, 255), 10);
+
+    flush_cmd_rect(0, 0, (int)g_fb.width, g_ui.topbar.h, topbar_bg, 198);
+    flush_cmd_vgradient(0, 0, (int)g_fb.width, g_ui.topbar.h / 2, rgb(255, 255, 255), rgb(255, 255, 255), 18);
+    flush_cmd_rect(0, g_ui.topbar.h - 1, (int)g_fb.width, 1, stroke, 120);
+    flush_cmd_image(12, (g_ui.topbar.h - 24) / 2, 24, 24, &RIDUX_ICONS[RIDUX_ICON_MONITOR], 228);
+    flush_cmd_text(44, (g_ui.topbar.h - 16) / 2, text, "RiduxOS Unix");
+
+    len = 0;
+    status[0] = '\0';
+    k_append_str(status, &len, sizeof(status), "PID ");
+    if (proc_running_pid() < 0) {
+        k_append_str(status, &len, sizeof(status), "-");
+    } else {
+        k_append_u32(status, &len, sizeof(status), (uint32_t)proc_running_pid());
+    }
+    k_append_str(status, &len, sizeof(status), " | Files ");
+    k_append_u32(status, &len, sizeof(status), (uint32_t)vfs_count());
+    flush_cmd_text((int)g_fb.width - 310, (g_ui.topbar.h - 16) / 2, muted, status);
+
+    for (i = 0; i < g_window_count; ++i) {
+        render_window(&g_windows[i], i == g_window_focus, glass_white, stroke, text, accent, muted);
+    }
+
+    /* Windows11-like centered taskbar */
+    for (i = 0; i < 4; ++i) {
+        int spread = i + 1;
+        flush_cmd_rect(g_ui.taskbar.x - spread, g_ui.taskbar.y - spread / 2, g_ui.taskbar.w + spread * 2,
+                       g_ui.taskbar.h + spread * 2, rgb(4, 10, 20), (uint8_t)(44 - i * 8));
+    }
+    flush_cmd_rect(g_ui.taskbar.x, g_ui.taskbar.y, g_ui.taskbar.w, g_ui.taskbar.h, taskbar_bg, 214);
+    flush_cmd_rect(g_ui.taskbar.x + 2, g_ui.taskbar.y + 2, g_ui.taskbar.w - 4, g_ui.taskbar.h - 4, glass_white, 32);
+    flush_cmd_rect(g_ui.taskbar.x, g_ui.taskbar.y, g_ui.taskbar.w, 1, stroke, 170);
+    flush_cmd_rect(g_ui.taskbar.x, g_ui.taskbar.y + g_ui.taskbar.h - 1, g_ui.taskbar.w, 1, stroke, 140);
+
+    for (i = 0; i < g_app_count; ++i) {
+        ui_rect_t slot = g_dock_slots[i];
+        const ridux_image_t *icon = NULL;
+        int icon_size;
+        bool running = app_is_running(g_apps[i].app_id);
+        bool focused = false;
+        if (g_window_focus >= 0 && g_window_focus < g_window_count && g_windows[g_window_focus].visible) {
+            focused = g_windows[g_window_focus].app_id == g_apps[i].app_id;
+        }
+        flush_cmd_rect(slot.x, slot.y, slot.w, slot.h, rgb(17, 37, 62), running ? 208 : 152);
+        flush_cmd_rect(slot.x + 1, slot.y + 1, slot.w - 2, slot.h - 2, glass_white, focused ? 44 : 24);
+        if (focused) {
+            flush_cmd_rect(slot.x, slot.y, slot.w, 1, accent, 210);
+            flush_cmd_rect(slot.x, slot.y + slot.h - 1, slot.w, 1, accent, 210);
+            flush_cmd_rect(slot.x, slot.y, 1, slot.h, accent, 210);
+            flush_cmd_rect(slot.x + slot.w - 1, slot.y, 1, slot.h, accent, 210);
+        } else {
+            flush_cmd_rect(slot.x, slot.y, slot.w, 1, stroke, 120);
+            flush_cmd_rect(slot.x, slot.y + slot.h - 1, slot.w, 1, stroke, 100);
+        }
+        if (g_apps[i].icon_id >= 0 && g_apps[i].icon_id < RIDUX_ICON_COUNT) {
+            icon = &RIDUX_ICONS[g_apps[i].icon_id];
+        }
+        icon_size = slot.w - 10;
+        if (icon_size < 16) {
+            icon_size = 16;
+        }
+        if (icon != NULL) {
+            flush_cmd_image(slot.x + (slot.w - icon_size) / 2, slot.y + (slot.h - icon_size) / 2, icon_size, icon_size,
+                            icon, focused ? 255 : (running ? 242 : 220));
+        } else {
+            char fallback[2];
+            fallback[0] = g_apps[i].name[0];
+            fallback[1] = '\0';
+            flush_cmd_text(slot.x + (slot.w - 8) / 2, slot.y + (slot.h - 16) / 2, text, fallback);
+        }
+        if (running) {
+            flush_cmd_rect(slot.x + slot.w / 2 - 5, slot.y + slot.h - 3, 10, 2, accent, focused ? 230 : 170);
+        }
+    }
+
+    flush_cmd_text(g_ui.taskbar.x + 14, g_ui.taskbar.y - 20, muted, "Apps");
+    render_cursor();
+    flush_execute();
+    g_needs_redraw = false;
+}
+
+static void shell_boot_message(void) {
+    char line[96];
+    size_t len = 0;
+    shell_push_line("RiduxOS Unix booted.");
+    shell_push_line("Own kernel + own shell + own Flush + own window manager.");
+    shell_push_line("UI: glass layers + icon dock + wallpaper assets.");
+    shell_push_line("Type `help` for commands.");
+    shell_push_line("Taskbar apps: click icons to open/minimize.");
+    shell_push_line("Mouse PS/2: drag windows from title bar.");
+
+    line[0] = '\0';
+    k_append_str(line, &len, sizeof(line), "FrameBuffer ");
+    k_append_u32(line, &len, sizeof(line), g_fb.width);
+    k_append_str(line, &len, sizeof(line), "x");
+    k_append_u32(line, &len, sizeof(line), g_fb.height);
+    k_append_str(line, &len, sizeof(line), "x");
+    k_append_u32(line, &len, sizeof(line), g_fb.bpp);
+    shell_push_line(line);
+
+    len = 0;
+    line[0] = '\0';
+    k_append_str(line, &len, sizeof(line), "Initrd files: ");
+    k_append_u32(line, &len, sizeof(line), (uint32_t)vfs_count());
+    shell_push_line(line);
+}
+
+static void shell_cmd_help(void) {
+    shell_push_line("help clear about uname flush theme reboot halt");
+    shell_push_line("ls [path] cat <path> touch <path> write <path> <txt> rm <path>");
+    shell_push_line("ps spawn <name> kill <pid>");
+    shell_push_line("wm list | wm focus <id> | wm move <dx> <dy> | wm drag | wm next");
+    shell_push_line("elf load <path> | elf run <path> | elf list");
+    shell_push_line("apps | open <app> | close <app>  (monitor/files/terminal/notes/flush/settings)");
+}
+
+static void shell_cmd_ls(const char *prefix) {
+    char normalized[VFS_MAX_PATH];
+    char line[SHELL_LINE_LEN];
+    size_t i;
+    size_t matched = 0;
+    vfs_normalize_path(prefix, normalized, sizeof(normalized));
+    for (i = 0; i < VFS_MAX_FILES; ++i) {
+        if (g_vfs_files[i].used && (k_strcmp(normalized, "/") == 0 ||
+                                    k_starts_with(g_vfs_files[i].path, normalized))) {
+            size_t len = 0;
+            line[0] = '\0';
+            k_append_str(line, &len, sizeof(line), g_vfs_files[i].writable ? "rw " : "ro ");
+            k_append_str(line, &len, sizeof(line), g_vfs_files[i].path);
+            k_append_str(line, &len, sizeof(line), " (");
+            if (g_vfs_files[i].writable) {
+                k_append_u32(line, &len, sizeof(line), g_vfs_files[i].rw_size);
+            } else {
+                k_append_u32(line, &len, sizeof(line), g_vfs_files[i].ro_size);
+            }
+            k_append_str(line, &len, sizeof(line), "B)");
+            shell_push_line(line);
+            ++matched;
+        }
+    }
+    if (matched == 0) {
+        shell_push_line("No files matched.");
+    }
+}
+
+static void shell_cmd_cat(const char *path) {
+    const uint8_t *data;
+    uint32_t size;
+    if (!vfs_read(path, &data, &size)) {
+        shell_push_line("cat: file not found");
+        return;
+    }
+    if (size == 0u) {
+        shell_push_line("(empty file)");
+        return;
+    }
+    shell_push_bytes(data, size);
+}
+
+static void shell_cmd_touch(const char *path) {
+    if (vfs_touch(path)) {
+        shell_push_line("touch: ok");
+    } else {
+        shell_push_line("touch: failed");
+    }
+}
+
+static void shell_cmd_write_raw(const char *full_command) {
+    char path[VFS_MAX_PATH];
+    size_t path_len = 0;
+    const char *p = full_command;
+    while (*p != '\0' && !k_is_space(*p)) {
+        ++p;
+    }
+    while (*p != '\0' && k_is_space(*p)) {
+        ++p;
+    }
+    if (*p == '\0') {
+        shell_push_line("write: missing path");
+        return;
+    }
+    while (*p != '\0' && !k_is_space(*p) && path_len + 1 < sizeof(path)) {
+        path[path_len++] = *p++;
+    }
+    path[path_len] = '\0';
+    while (*p != '\0' && k_is_space(*p)) {
+        ++p;
+    }
+    if (*p == '\0') {
+        shell_push_line("write: missing content");
+        return;
+    }
+    if (vfs_write(path, p)) {
+        shell_push_line("write: ok");
+    } else {
+        shell_push_line("write: failed");
+    }
+}
+
+static void shell_cmd_rm(const char *path) {
+    if (vfs_remove(path)) {
+        shell_push_line("rm: removed");
+    } else {
+        shell_push_line("rm: not found");
+    }
+}
+
+static void shell_cmd_ps(void) {
+    int i;
+    for (i = 0; i < PROC_MAX; ++i) {
+        if (g_processes[i].used) {
+            char line[SHELL_LINE_LEN];
+            size_t len = 0;
+            line[0] = '\0';
+            k_append_u32(line, &len, sizeof(line), (uint32_t)g_processes[i].pid);
+            k_append_str(line, &len, sizeof(line), "  ");
+            k_append_str(line, &len, sizeof(line), proc_state_name(g_processes[i].state));
+            k_append_str(line, &len, sizeof(line), "  ");
+            k_append_u32(line, &len, sizeof(line), g_processes[i].cpu_ticks);
+            k_append_str(line, &len, sizeof(line), "t  ");
+            k_append_str(line, &len, sizeof(line), g_processes[i].is_user ? "USR " : "KRN ");
+            k_append_str(line, &len, sizeof(line), g_processes[i].name);
+            if (g_processes[i].is_user) {
+                k_append_str(line, &len, sizeof(line), " pc:");
+                k_append_u32(line, &len, sizeof(line), g_processes[i].user_pc);
+            }
+            shell_push_line(line);
+        }
+    }
+}
+
+static void shell_cmd_spawn(const char *name) {
+    int pid = proc_spawn(name);
+    char line[64];
+    size_t len = 0;
+    if (pid < 0) {
+        shell_push_line("spawn: no slots");
+        return;
+    }
+    line[0] = '\0';
+    k_append_str(line, &len, sizeof(line), "spawned pid ");
+    k_append_u32(line, &len, sizeof(line), (uint32_t)pid);
+    shell_push_line(line);
+}
+
+static void shell_cmd_kill(const char *pid_text) {
+    int pid = k_atoi(pid_text);
+    if (pid <= 0) {
+        shell_push_line("kill: invalid pid");
+        return;
+    }
+    if (proc_kill(pid)) {
+        shell_push_line("kill: done");
+    } else {
+        shell_push_line("kill: pid not found");
+    }
+}
+
+static void shell_cmd_elf_list(void) {
+    int i;
+    size_t listed = 0;
+    for (i = 0; i < ELF_MAX_IMAGES; ++i) {
+        if (g_elf_images[i].used) {
+            char line[SHELL_LINE_LEN];
+            size_t len = 0;
+            line[0] = '\0';
+            k_append_str(line, &len, sizeof(line), "[");
+            k_append_u32(line, &len, sizeof(line), (uint32_t)i);
+            k_append_str(line, &len, sizeof(line), "] ");
+            k_append_str(line, &len, sizeof(line), g_elf_images[i].path);
+            k_append_str(line, &len, sizeof(line), " sz:");
+            k_append_u32(line, &len, sizeof(line), g_elf_images[i].mem_size);
+            k_append_str(line, &len, sizeof(line), " entry:");
+            k_append_u32(line, &len, sizeof(line), g_elf_images[i].entry_vaddr);
+            shell_push_line(line);
+            ++listed;
+        }
+    }
+    if (listed == 0) {
+        shell_push_line("elf: no images loaded");
+    }
+}
+
+static void shell_cmd_elf_load(const char *path) {
+    int slot = -1;
+    elf_load_result_t res = elf_load_from_vfs(path, &slot);
+    char line[SHELL_LINE_LEN];
+    size_t len = 0;
+    if (res == ELF_LOAD_OK) {
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), "elf: loaded slot ");
+        k_append_u32(line, &len, sizeof(line), (uint32_t)slot);
+        k_append_str(line, &len, sizeof(line), " entry ");
+        k_append_u32(line, &len, sizeof(line), g_elf_images[slot].entry_vaddr);
+        shell_push_line(line);
+        return;
+    }
+    if (res == ELF_LOAD_NOTFOUND) {
+        shell_push_line("elf: file not found");
+    } else if (res == ELF_LOAD_BAD_FORMAT) {
+        shell_push_line("elf: invalid ELF32 format");
+    } else if (res == ELF_LOAD_TOO_LARGE) {
+        shell_push_line("elf: image too large for loader");
+    } else {
+        shell_push_line("elf: no loader slot available");
+    }
+}
+
+static void shell_cmd_elf_run(const char *path) {
+    int slot = -1;
+    int pid;
+    elf_load_result_t res = elf_load_from_vfs(path, &slot);
+    char line[SHELL_LINE_LEN];
+    size_t len = 0;
+    if (res != ELF_LOAD_OK) {
+        shell_cmd_elf_load(path);
+        return;
+    }
+    pid = proc_spawn_elf(path, slot);
+    if (pid < 0) {
+        shell_push_line("elf: process table full");
+        return;
+    }
+    line[0] = '\0';
+    k_append_str(line, &len, sizeof(line), "elf: running pid ");
+    k_append_u32(line, &len, sizeof(line), (uint32_t)pid);
+    k_append_str(line, &len, sizeof(line), " slot ");
+    k_append_u32(line, &len, sizeof(line), (uint32_t)slot);
+    shell_push_line(line);
+}
+
+static void shell_cmd_elf(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_push_line("elf load <path> | elf run <path> | elf list");
+        return;
+    }
+    if (k_strcmp(argv[1], "list") == 0) {
+        shell_cmd_elf_list();
+        return;
+    }
+    if (argc < 3) {
+        shell_push_line("elf load <path> | elf run <path>");
+        return;
+    }
+    if (k_strcmp(argv[1], "load") == 0) {
+        shell_cmd_elf_load(argv[2]);
+        return;
+    }
+    if (k_strcmp(argv[1], "run") == 0) {
+        shell_cmd_elf_run(argv[2]);
+        return;
+    }
+    shell_push_line("elf: unknown subcommand");
+}
+
+static void shell_cmd_wm_list(void) {
+    int i;
+    for (i = 0; i < g_window_count; ++i) {
+        char line[SHELL_LINE_LEN];
+        size_t len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), i == g_window_focus ? "* " : "  ");
+        k_append_u32(line, &len, sizeof(line), (uint32_t)g_windows[i].id);
+        k_append_str(line, &len, sizeof(line), g_windows[i].visible ? " [on] " : " [off] ");
+        k_append_str(line, &len, sizeof(line), g_windows[i].title);
+        k_append_str(line, &len, sizeof(line), " @");
+        k_append_i32(line, &len, sizeof(line), g_windows[i].x);
+        k_append_str(line, &len, sizeof(line), ",");
+        k_append_i32(line, &len, sizeof(line), g_windows[i].y);
+        shell_push_line(line);
+    }
+}
+
+static void shell_cmd_wm(int argc, char *argv[]) {
+    if (argc < 2) {
+        shell_push_line("wm: list|focus|move|drag|next");
+        return;
+    }
+    if (k_strcmp(argv[1], "list") == 0) {
+        shell_cmd_wm_list();
+        return;
+    }
+    if (k_strcmp(argv[1], "focus") == 0) {
+        if (argc < 3) {
+            shell_push_line("wm focus <id>");
+            return;
+        }
+        if (wm_focus_by_id(k_atoi(argv[2]))) {
+            shell_push_line("wm: focus changed");
+        } else {
+            shell_push_line("wm: id not found");
+        }
+        return;
+    }
+    if (k_strcmp(argv[1], "next") == 0) {
+        wm_focus_next();
+        shell_push_line("wm: focus next");
+        return;
+    }
+    if (k_strcmp(argv[1], "drag") == 0) {
+        g_wm_drag_mode = !g_wm_drag_mode;
+        shell_push_line(g_wm_drag_mode ? "wm: drag ON" : "wm: drag OFF");
+        return;
+    }
+    if (k_strcmp(argv[1], "move") == 0) {
+        if (argc < 4) {
+            shell_push_line("wm move <dx> <dy>");
+            return;
+        }
+        if (wm_move_focused(k_atoi(argv[2]), k_atoi(argv[3]))) {
+            shell_push_line("wm: moved");
+        } else {
+            shell_push_line("wm: no focused window");
+        }
+        return;
+    }
+    shell_push_line("wm: unknown subcommand");
+}
+
+static int app_index_by_name(const char *name) {
+    if (k_strcmp(name, "monitor") == 0) {
+        return app_index_by_id(APP_MONITOR);
+    }
+    if (k_strcmp(name, "files") == 0) {
+        return app_index_by_id(APP_FILES);
+    }
+    if (k_strcmp(name, "terminal") == 0 || k_strcmp(name, "shell") == 0) {
+        return app_index_by_id(APP_TERMINAL);
+    }
+    if (k_strcmp(name, "flush") == 0) {
+        return app_index_by_id(APP_FLUSH);
+    }
+    if (k_strcmp(name, "settings") == 0) {
+        return app_index_by_id(APP_SETTINGS);
+    }
+    if (k_strcmp(name, "notes") == 0) {
+        return app_index_by_id(APP_NOTES);
+    }
+    return -1;
+}
+
+static void shell_cmd_apps(void) {
+    int i;
+    for (i = 0; i < g_app_count; ++i) {
+        char line[SHELL_LINE_LEN];
+        size_t len = 0;
+        line[0] = '\0';
+        k_append_str(line, &len, sizeof(line), app_is_running(g_apps[i].app_id) ? "[on] " : "[off] ");
+        k_append_str(line, &len, sizeof(line), g_apps[i].name);
+        shell_push_line(line);
+    }
+}
+
+static void shell_cmd_app_set_visible(const char *name, bool visible) {
+    int app_idx = app_index_by_name(name);
+    int id;
+    if (app_idx < 0) {
+        shell_push_line("app: unknown name");
+        return;
+    }
+    id = g_apps[app_idx].window_id;
+    if (id <= 0) {
+        shell_push_line("app: not implemented");
+        return;
+    }
+    wm_set_visible_by_id(id, visible);
+    if (visible) {
+        wm_focus_by_id(id);
+    }
+    shell_push_line(visible ? "app: opened" : "app: closed");
+}
+
+static void shell_cycle_theme(void) {
+    g_theme_index = (g_theme_index + 1u) % RIDUX_WALLPAPER_COUNT;
+    shell_push_line("theme: switched");
+}
+
+static void shell_execute_command(const char *command) {
+    char prompt_line[SHELL_LINE_LEN + 8];
+    char copy[SHELL_LINE_LEN];
+    char *argv[8];
+    int argc;
+    size_t len = 0;
+
+    prompt_line[0] = '\0';
+    k_append_str(prompt_line, &len, sizeof(prompt_line), "ridux$ ");
+    k_append_str(prompt_line, &len, sizeof(prompt_line), command);
+    shell_push_line(prompt_line);
+
+    if (k_starts_with(command, "write ")) {
+        shell_cmd_write_raw(command);
+        return;
+    }
+
+    k_strlcpy(copy, command, sizeof(copy));
+    argc = k_split_tokens(copy, argv, 8);
+    if (argc <= 0) {
+        return;
+    }
+
+    if (k_strcmp(argv[0], "help") == 0) {
+        shell_cmd_help();
+    } else if (k_strcmp(argv[0], "clear") == 0) {
+        shell_reset_history();
+    } else if (k_strcmp(argv[0], "about") == 0) {
+        shell_push_line("RiduxOS Unix: own kernel + shell + Flush + dock/taskbar + WM.");
+    } else if (k_strcmp(argv[0], "uname") == 0) {
+        shell_push_line("RiduxOS Unix 0.3 (custom hobby kernel)");
+    } else if (k_strcmp(argv[0], "flush") == 0) {
+        shell_push_line("Flush queue renderer: active.");
+    } else if (k_strcmp(argv[0], "theme") == 0) {
+        shell_cycle_theme();
+    } else if (k_strcmp(argv[0], "apps") == 0) {
+        shell_cmd_apps();
+    } else if (k_strcmp(argv[0], "open") == 0) {
+        if (argc < 2) {
+            shell_push_line("open <monitor|files|terminal|flush>");
+        } else {
+            shell_cmd_app_set_visible(argv[1], true);
+        }
+    } else if (k_strcmp(argv[0], "close") == 0) {
+        if (argc < 2) {
+            shell_push_line("close <monitor|files|terminal|flush>");
+        } else {
+            shell_cmd_app_set_visible(argv[1], false);
+        }
+    } else if (k_strcmp(argv[0], "ls") == 0) {
+        shell_cmd_ls(argc >= 2 ? argv[1] : "/");
+    } else if (k_strcmp(argv[0], "cat") == 0) {
+        if (argc < 2) {
+            shell_push_line("cat <path>");
+        } else {
+            shell_cmd_cat(argv[1]);
+        }
+    } else if (k_strcmp(argv[0], "touch") == 0) {
+        if (argc < 2) {
+            shell_push_line("touch <path>");
+        } else {
+            shell_cmd_touch(argv[1]);
+        }
+    } else if (k_strcmp(argv[0], "rm") == 0) {
+        if (argc < 2) {
+            shell_push_line("rm <path>");
+        } else {
+            shell_cmd_rm(argv[1]);
+        }
+    } else if (k_strcmp(argv[0], "ps") == 0) {
+        shell_cmd_ps();
+    } else if (k_strcmp(argv[0], "spawn") == 0) {
+        if (argc < 2) {
+            shell_push_line("spawn <name>");
+        } else {
+            shell_cmd_spawn(argv[1]);
+        }
+    } else if (k_strcmp(argv[0], "kill") == 0) {
+        if (argc < 2) {
+            shell_push_line("kill <pid>");
+        } else {
+            shell_cmd_kill(argv[1]);
+        }
+    } else if (k_strcmp(argv[0], "wm") == 0) {
+        shell_cmd_wm(argc, argv);
+    } else if (k_strcmp(argv[0], "elf") == 0) {
+        shell_cmd_elf(argc, argv);
+    } else if (k_strcmp(argv[0], "reboot") == 0) {
+        shell_push_line("rebooting...");
+        outb(0x64, 0xFE);
+    } else if (k_strcmp(argv[0], "halt") == 0) {
+        shell_push_line("cpu halted.");
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    } else {
+        shell_push_line("Unknown command.");
+    }
+}
+
+static void shell_submit(void) {
+    if (g_shell_input_len == 0) {
+        return;
+    }
+    g_shell_input[g_shell_input_len] = '\0';
+    shell_execute_command(g_shell_input);
+    g_shell_input_len = 0;
+    g_shell_input[0] = '\0';
+}
+
+static const char keymap_unshift[128] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0,  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
+    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,  '*', 0,  ' ',
+};
+
+static const char keymap_shift[128] = {
+    0,  27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0,  'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
+    '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,  '*', 0,  ' ',
+};
+
+static int ps2_wait_read_ready(void) {
+    int spins;
+    for (spins = 0; spins < 100000; ++spins) {
+        if ((inb(0x64) & 1u) != 0u) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps2_wait_write_ready(void) {
+    int spins;
+    for (spins = 0; spins < 100000; ++spins) {
+        if ((inb(0x64) & 2u) == 0u) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint8_t mouse_write_cmd(uint8_t value) {
+    if (!ps2_wait_write_ready()) {
+        return 0u;
+    }
+    outb(0x64, 0xD4);
+    if (!ps2_wait_write_ready()) {
+        return 0u;
+    }
+    outb(0x60, value);
+    if (!ps2_wait_read_ready()) {
+        return 0u;
+    }
+    return inb(0x60);
+}
+
+static void mouse_init(void) {
+    uint8_t config;
+    if (!ps2_wait_write_ready()) {
+        return;
+    }
+    outb(0x64, 0xA8);
+
+    if (!ps2_wait_write_ready()) {
+        return;
+    }
+    outb(0x64, 0x20);
+    if (!ps2_wait_read_ready()) {
+        return;
+    }
+    config = inb(0x60);
+    config |= 0x02u;
+    config &= (uint8_t)~0x20u;
+
+    if (!ps2_wait_write_ready()) {
+        return;
+    }
+    outb(0x64, 0x60);
+    if (!ps2_wait_write_ready()) {
+        return;
+    }
+    outb(0x60, config);
+
+    mouse_write_cmd(0xF6);
+    mouse_write_cmd(0xF4);
+
+    g_mouse_packet_index = 0;
+    g_mouse_left_down = false;
+    g_mouse_dragging = false;
+    g_mouse_drag_window_id = -1;
+    g_mouse_initialized = true;
+}
+
+static void mouse_update_drag(int dx, int dy) {
+    window_t *win;
+    int index;
+    g_mouse_x += dx;
+    g_mouse_y -= dy;
+
+    if (g_mouse_x < 0) {
+        g_mouse_x = 0;
+    } else if ((uint32_t)g_mouse_x >= g_fb.width) {
+        g_mouse_x = (int)g_fb.width - 1;
+    }
+    if (g_mouse_y < 0) {
+        g_mouse_y = 0;
+    } else if ((uint32_t)g_mouse_y >= g_fb.height) {
+        g_mouse_y = (int)g_fb.height - 1;
+    }
+
+    if (!g_mouse_left_down) {
+        return;
+    }
+    if (!g_mouse_dragging) {
+        return;
+    }
+    index = wm_index_by_id(g_mouse_drag_window_id);
+    if (index < 0) {
+        g_mouse_dragging = false;
+        g_mouse_drag_window_id = -1;
+        return;
+    }
+    win = &g_windows[index];
+    if (!win->visible) {
+        g_mouse_dragging = false;
+        g_mouse_drag_window_id = -1;
+        return;
+    }
+    win->x = g_mouse_x - g_mouse_drag_offset_x;
+    win->y = g_mouse_y - g_mouse_drag_offset_y;
+    wm_clamp(win);
+}
+
+static void mouse_handle_byte(uint8_t data) {
+    uint8_t left;
+    int dx;
+    int dy;
+
+    if (!g_mouse_initialized) {
+        return;
+    }
+
+    if (g_mouse_packet_index == 0 && (data & 0x08u) == 0u) {
+        return;
+    }
+
+    g_mouse_packet[g_mouse_packet_index++] = data;
+    if (g_mouse_packet_index < 3) {
+        return;
+    }
+    g_mouse_packet_index = 0;
+
+    dx = (int)((int8_t)g_mouse_packet[1]);
+    dy = (int)((int8_t)g_mouse_packet[2]);
+    left = g_mouse_packet[0] & 0x01u;
+
+    if (left && !g_mouse_left_down) {
+        int app_idx = app_hit_test(g_mouse_x, g_mouse_y);
+        if (app_idx >= 0) {
+            app_activate_index(app_idx);
+            g_mouse_dragging = false;
+            g_mouse_drag_window_id = -1;
+            g_needs_redraw = true;
+            g_mouse_left_down = true;
+            return;
+        }
+        int title_idx = wm_find_window_at(g_mouse_x, g_mouse_y, true);
+        int any_idx = wm_find_window_at(g_mouse_x, g_mouse_y, false);
+        int focus_idx = title_idx >= 0 ? title_idx : any_idx;
+        if (focus_idx >= 0) {
+            window_t *win;
+            wm_raise_to_top(focus_idx);
+            win = &g_windows[g_window_focus];
+            if (title_idx >= 0) {
+                g_mouse_dragging = true;
+                g_mouse_drag_window_id = win->id;
+                g_mouse_drag_offset_x = g_mouse_x - win->x;
+                g_mouse_drag_offset_y = g_mouse_y - win->y;
+            }
+            g_needs_redraw = true;
+        }
+    } else if (!left && g_mouse_left_down) {
+        g_mouse_dragging = false;
+        g_mouse_drag_window_id = -1;
+    }
+    g_mouse_left_down = left != 0u;
+
+    if (dx != 0 || dy != 0) {
+        mouse_update_drag(dx, dy);
+        g_needs_redraw = true;
+    }
+}
+
+static void keyboard_handle_extended(uint8_t scancode) {
+    if (scancode & 0x80u) {
+        return;
+    }
+    if (scancode == 0x48 || scancode == 0x50 || scancode == 0x4B || scancode == 0x4D) {
+        if (!g_wm_drag_mode) {
+            if (!g_arrow_hint_shown) {
+                shell_push_line("Tip: use `wm drag` and arrow keys to move focused window.");
+                g_arrow_hint_shown = true;
+            }
+            g_needs_redraw = true;
+            return;
+        }
+        if (scancode == 0x48) {
+            wm_move_focused(0, -14);
+        } else if (scancode == 0x50) {
+            wm_move_focused(0, 14);
+        } else if (scancode == 0x4B) {
+            wm_move_focused(-14, 0);
+        } else if (scancode == 0x4D) {
+            wm_move_focused(14, 0);
+        }
+        g_needs_redraw = true;
+    }
+}
+
+static void keyboard_handle_scancode(uint8_t scancode) {
+    char ch = 0;
+
+    if (scancode == 0xE0) {
+        g_extended_scancode = true;
+        return;
+    }
+    if (g_extended_scancode) {
+        g_extended_scancode = false;
+        keyboard_handle_extended(scancode);
+        return;
+    }
+
+    if (scancode == 0x2A || scancode == 0x36) {
+        g_shift_down = true;
+        return;
+    }
+    if (scancode == 0xAA || scancode == 0xB6) {
+        g_shift_down = false;
+        return;
+    }
+    if (scancode & 0x80u) {
+        return;
+    }
+
+    if (scancode == 0x0F) {
+        wm_focus_next();
+        g_needs_redraw = true;
+        return;
+    }
+    if (scancode == 0x1C) {
+        shell_submit();
+        g_needs_redraw = true;
+        return;
+    }
+    if (scancode == 0x0E) {
+        if (g_shell_input_len > 0) {
+            --g_shell_input_len;
+            g_shell_input[g_shell_input_len] = '\0';
+        }
+        g_needs_redraw = true;
+        return;
+    }
+
+    ch = g_shift_down ? keymap_shift[scancode] : keymap_unshift[scancode];
+    if (ch == 0 || ch == '\t' || ch == '\n' || ch == 27) {
+        return;
+    }
+    if (g_shell_input_len + 1 < SHELL_LINE_LEN) {
+        g_shell_input[g_shell_input_len++] = ch;
+        g_shell_input[g_shell_input_len] = '\0';
+    }
+    g_needs_redraw = true;
+}
+
+static bool input_poll_once(void) {
+    uint8_t status;
+    uint8_t value;
+    status = inb(0x64);
+    if ((status & 1u) == 0u) {
+        return false;
+    }
+    value = inb(0x60);
+    if ((status & 0x20u) != 0u) {
+        mouse_handle_byte(value);
+    } else {
+        keyboard_handle_scancode(value);
+    }
+    return true;
+}
+
+static bool input_pump(int max_events) {
+    int i;
+    bool had = false;
+    for (i = 0; i < max_events; ++i) {
+        if (!input_poll_once()) {
+            break;
+        }
+        had = true;
+    }
+    return had;
+}
+
+static void parse_multiboot_info(uint32_t mbi_addr) {
+    uint8_t *ptr;
+    uint32_t total_size;
+
+    g_fb.ready = false;
+    g_initrd_start = NULL;
+    g_initrd_end = NULL;
+
+    total_size = *((uint32_t *)(uintptr_t)mbi_addr);
+    ptr = (uint8_t *)(uintptr_t)(mbi_addr + 8u);
+
+    while (ptr < (uint8_t *)(uintptr_t)(mbi_addr + total_size)) {
+        mb2_tag_t *tag = (mb2_tag_t *)ptr;
+        if (tag->type == MB2_TAG_END) {
+            break;
+        }
+        if (tag->type == MB2_TAG_FRAMEBUFFER) {
+            const mb2_tag_framebuffer_t *fb_tag = (const mb2_tag_framebuffer_t *)tag;
+            if (fb_tag->framebuffer_type == 1 && fb_tag->framebuffer_bpp >= 24) {
+                g_fb.address = (uint8_t *)(uintptr_t)fb_tag->framebuffer_addr;
+                g_fb.pitch = fb_tag->framebuffer_pitch;
+                g_fb.width = fb_tag->framebuffer_width;
+                g_fb.height = fb_tag->framebuffer_height;
+                g_fb.bpp = fb_tag->framebuffer_bpp;
+                g_fb.red_pos = fb_tag->red_field_position;
+                g_fb.red_size = fb_tag->red_mask_size;
+                g_fb.green_pos = fb_tag->green_field_position;
+                g_fb.green_size = fb_tag->green_mask_size;
+                g_fb.blue_pos = fb_tag->blue_field_position;
+                g_fb.blue_size = fb_tag->blue_mask_size;
+                g_fb.ready = true;
+            }
+        } else if (tag->type == MB2_TAG_MODULE && g_initrd_start == NULL) {
+            const mb2_tag_module_t *module = (const mb2_tag_module_t *)tag;
+            g_initrd_start = (const uint8_t *)(uintptr_t)module->mod_start;
+            g_initrd_end = (const uint8_t *)(uintptr_t)module->mod_end;
+        }
+
+        if (tag->size < 8u) {
+            break;
+        }
+        ptr += (tag->size + 7u) & ~7u;
+    }
+}
+
+void kernel_main(uint32_t magic, uint32_t mbi_addr) {
+    if (magic != MB2_BOOTLOADER_MAGIC) {
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
+
+    parse_multiboot_info(mbi_addr);
+    if (!g_fb.ready || g_fb.bpp < 24) {
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
+
+    shell_reset_history();
+    g_shell_input[0] = '\0';
+    g_shell_input_len = 0;
+    g_shift_down = false;
+    g_extended_scancode = false;
+    g_wm_drag_mode = false;
+    g_arrow_hint_shown = false;
+    g_theme_index = 0;
+    g_needs_redraw = true;
+
+    g_use_backbuffer = g_fb.width <= FB_MAX_WIDTH && g_fb.height <= FB_MAX_HEIGHT;
+    if (g_use_backbuffer) {
+        k_memset(g_backbuffer, 0, sizeof(g_backbuffer));
+    }
+
+    g_mouse_initialized = false;
+    g_mouse_x = (int)g_fb.width / 2;
+    g_mouse_y = (int)g_fb.height / 2;
+    g_mouse_packet_index = 0;
+    g_mouse_left_down = false;
+    g_mouse_dragging = false;
+    g_mouse_drag_window_id = -1;
+
+    vfs_init();
+    if (g_initrd_start != NULL && g_initrd_end != NULL && g_initrd_end > g_initrd_start) {
+        vfs_mount_initrd(g_initrd_start, g_initrd_end);
+    }
+    vfs_seed_defaults();
+    elf_init();
+
+    proc_bootstrap();
+    scheduler_tick();
+
+    wm_bootstrap();
+
+    shell_boot_message();
+    mouse_init();
+    render_scene();
+
+    g_scheduler_div = 0;
+    for (;;) {
+        bool had_input = input_pump(24);
+
+        ++g_scheduler_div;
+        if (g_scheduler_div >= 140000u) {
+            g_scheduler_div = 0;
+            scheduler_tick();
+            g_needs_redraw = true;
+        }
+
+        if (g_needs_redraw) {
+            render_scene();
+        }
+
+        if (!had_input) {
+            __asm__ volatile("pause");
+        }
+    }
+}

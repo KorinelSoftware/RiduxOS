@@ -1,0 +1,2 @@
+Welcome to RiduxOS Unix.
+This filesystem is loaded from initrd (USTAR) at boot.

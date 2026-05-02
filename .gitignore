@@ -1,0 +1,5 @@
+build/
+build_wsl*/
+freebsd/ridux-runtime/compat_snapshot/
+rootfs/etc/ssl/certs/
+third_party/

@@ -1,0 +1,21 @@
+Base {
+    global:
+        g_strerror;
+};
+
+GLIBC_2.2.5 {
+    global:
+        abort;
+} Base;
+
+GLIBC_2.4 {
+    global:
+        __stack_chk_fail;
+        __stack_chk_fail_local;
+    local: *;
+} GLIBC_2.2.5;
+
+GLIBC_PRIVATE {
+    global:
+        __fortify_fail;
+} GLIBC_2.4;

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -eu
+
+# Minimal GNU `time` replacement for WSL build hosts where only the
+# shell keyword exists. The FreeBSD cross-build only needs an
+# executable named "time" in PATH.
+if [ "$#" -eq 0 ]; then
+    exit 0
+fi
+
+if [ "$1" = "-p" ] || [ "$1" = "-l" ]; then
+    shift
+fi
+
+if [ "$#" -eq 0 ]; then
+    exit 0
+fi
+
+exec "$@"
