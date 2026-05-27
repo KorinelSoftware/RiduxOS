@@ -1,9 +1,5 @@
 /*
  * Entrada principal del kernel.
- *
- * Estos archivos siguen entrando en una sola unidad de compilacion porque
- * todavia hay mucho estado compartido, pero ya no estan tirados en un unico
- * kernel.c gigante ni usan archivos de inclusion raros.
  */
 
 #include "kernel/prelude.c"
