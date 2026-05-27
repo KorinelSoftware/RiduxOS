@@ -55,6 +55,28 @@ insert_after_pattern() {
   mv "$file.new" "$file"
 }
 
+set_newvers_var() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+
+  if ! grep -Eq "^${key}=" "$file"; then
+    echo "[freebsd-prepare] missing ${key}= in $file" >&2
+    exit 4
+  fi
+
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done = 0 }
+    $0 ~ "^" key "=" && !done {
+      print key "=\"" value "\""
+      done = 1
+      next
+    }
+    { print }
+  ' "$file" > "$file.new"
+  mv "$file.new" "$file"
+}
+
 if [[ ! -d "$FREEBSD_SRC" ]]; then
   echo "[freebsd-prepare] FreeBSD source dir not found: $FREEBSD_SRC" >&2
   echo "[freebsd-prepare] run: make freebsd-bootstrap" >&2
@@ -77,6 +99,7 @@ need_file "$PATCH_SRC/usr.sbin/riduxd/Makefile"
 need_file "$PATCH_SRC/lib/libflush/flush.c"
 need_file "$PATCH_SRC/lib/libflush/flush.h"
 need_file "$PATCH_SRC/lib/libflush/Makefile"
+need_file "$FREEBSD_SRC/sys/conf/newvers.sh"
 
 echo "[freebsd-prepare] installing Ridux source-level integration into $FREEBSD_SRC"
 
@@ -95,6 +118,9 @@ copy_file "$TEMPLATE_DIR/ridux_kmod.c" "$FREEBSD_SRC/sys/dev/ridux/ridux_kmod.c"
 copy_file "$TEMPLATE_DIR/Makefile.module" "$FREEBSD_SRC/sys/modules/ridux/Makefile"
 copy_file "$TEMPLATE_DIR/ridux.h" "$FREEBSD_SRC/sys/sys/ridux.h"
 copy_file "$TEMPLATE_DIR/RIDUX.kernconf" "$FREEBSD_SRC/sys/amd64/conf/RIDUX"
+
+set_newvers_var "$FREEBSD_SRC/sys/conf/newvers.sh" "TYPE" "RiduxBSD"
+set_newvers_var "$FREEBSD_SRC/sys/conf/newvers.sh" "BRANCH" "RIDUX"
 
 copy_file "$PATCH_SRC/usr.bin/ridux-browser/ridux-browser.c" "$FREEBSD_SRC/usr.bin/ridux-browser/ridux-browser.c"
 copy_file "$PATCH_SRC/usr.bin/ridux-browser/Makefile" "$FREEBSD_SRC/usr.bin/ridux-browser/Makefile"

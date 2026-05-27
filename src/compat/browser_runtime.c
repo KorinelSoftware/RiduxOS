@@ -1729,6 +1729,9 @@ typedef struct {
     uint32_t flags;
 } c8_rseq_user_t;
 
+#define C8_RSEQ_FLAG_UNREGISTER 1u
+#define C8_RSEQ_UNREGISTERED_CPU 0xFFFFFFFFu
+
 static c8_rseq_state_t g_c8_rseq_state[TASK_MAX];
 
 static int c8_current_task_index(void){
@@ -1770,25 +1773,43 @@ static void c8_rseq_mark_unregistered(int tidx){
     if(st->registered && st->user_ptr &&
        st->user_len >= sizeof(uint32_t) * 2){
         usr = (c8_rseq_user_t*)(uintptr_t)st->user_ptr;
-        usr->cpu_id_start = 0xFFFFFFFFu;
-        usr->cpu_id = 0xFFFFFFFFu;
+        usr->cpu_id_start = C8_RSEQ_UNREGISTERED_CPU;
+        usr->cpu_id = C8_RSEQ_UNREGISTERED_CPU;
     }
     c8_rseq_forget(tidx);
 }
 
 int64_t c8_sys_rseq(void *rseq, uint32_t rseq_len, int flags, uint32_t sig){
-    (void)rseq;
-    (void)rseq_len;
-    (void)flags;
-    (void)sig;
-    /*
-     * Do not advertise rseq until the scheduler implements the real Linux
-     * contract: aborting an active user rseq critical section on preemption,
-     * signal delivery, and CPU migration before returning to ring 3. Returning
-     * success here is worse than ENOSYS because glibc/mozjemalloc may then use
-     * rseq fast paths whose atomicity Ridux cannot yet guarantee.
-     */
-    return -ENOSYS;
+    task_t *cur=task_current();
+    int tidx=c8_current_task_index();
+    c8_rseq_state_t *st;
+    c8_rseq_user_t *usr=(c8_rseq_user_t*)rseq;
+    if(!cur||tidx<0)return -ESRCH;
+    if(!usr)return -EFAULT;
+    if(rseq_len<sizeof(c8_rseq_user_t))return -EINVAL;
+    if(flags!=0&&flags!=(int)C8_RSEQ_FLAG_UNREGISTER)return -EINVAL;
+    c8_rseq_reset_if_stale(tidx,cur);
+    st=&g_c8_rseq_state[tidx];
+    if(flags&(int)C8_RSEQ_FLAG_UNREGISTER){
+        if(!st->registered)return -EINVAL;
+        if(st->user_ptr!=(uint64_t)(uintptr_t)usr)return -EINVAL;
+        c8_rseq_mark_unregistered(tidx);
+        return 0;
+    }
+    if(st->registered){
+        if(st->user_ptr==(uint64_t)(uintptr_t)usr)return 0;
+        return -EBUSY;
+    }
+    st->registered=true;
+    st->owner_pid=cur->pid;
+    st->user_ptr=(uint64_t)(uintptr_t)usr;
+    st->user_len=rseq_len;
+    st->signature=sig;
+    usr->cpu_id_start=0;
+    usr->cpu_id=0;
+    usr->rseq_cs=0;
+    usr->flags=0;
+    return 0;
 }
 
 int64_t c8_sys_getcpu(uint32_t *cpu, uint32_t *node, void *tcache){
@@ -1858,7 +1879,7 @@ static void c8_register_syscalls(void){
         {119, c8_w_setresgid, false},
         {326, c8_w_copy_file_range, false},
         {324, c8_w_membarrier, true},         /* keep compat6 by default */
-        {334, c8_w_rseq, false},              /* rseq disabled until scheduler abort support exists */
+        {334, c8_w_rseq, false},              /* lightweight single-CPU rseq shim for modern libc */
         {309, c8_w_getcpu, true},             /* keep compat6 by default */
         {281, c8_w_epoll_pwait, false},       /* fix wrong legacy wiring */
     };

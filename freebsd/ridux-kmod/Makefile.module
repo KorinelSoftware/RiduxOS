@@ -1,0 +1,6 @@
+# Ridux kernel bridge module for the FreeBSD build tree.
+
+KMOD=	ridux
+SRCS=	ridux_kmod.c
+
+.include <bsd.kmod.mk>

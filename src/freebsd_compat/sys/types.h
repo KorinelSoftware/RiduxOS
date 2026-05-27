@@ -24,7 +24,9 @@ typedef int64_t  blkcnt_t;
 typedef int32_t  blksize_t;
 typedef int64_t  fsblkcnt_t;
 typedef int64_t  fsfilcnt_t;
+#if !defined(_TIME_T_DEFINED) && !defined(_TIME_T_DECLARED) && !defined(__time_t_defined)
 typedef long     time_t;
+#endif
 typedef long     suseconds_t;
 typedef int      key_t;
 typedef int32_t  id_t;

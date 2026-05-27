@@ -1,0 +1,12 @@
+LIBUDEV_183 {
+    global:
+        udev_monitor_*;
+    local: *;
+};
+
+LIBINPUT_0.12.0 {
+    global:
+        libinput_udev_assign_seat;
+        libinput_get_fd;
+        libinput_dispatch;
+} LIBUDEV_183;

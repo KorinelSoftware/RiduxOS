@@ -10,11 +10,15 @@
 #include "base.h"
 
 /* Physical memory manager (bitmap) */
-#define PMM_MAX_PAGES  (1024*1024) /* up to 4 GB */
+#define PMM_MAX_PAGES  (2*1024*1024) /* up to 8 GB */
 
 void    pmm_set_alloc_base(uint64_t phys_base);
+void    pmm_set_memory_limit(uint64_t mem_bytes);
+void    pmm_clear_usable_ranges(void);
+void    pmm_add_usable_range(uint64_t phys_base, uint64_t bytes);
 void    pmm_init(uint64_t mem_bytes);
 uint64_t pmm_alloc_frame(void);
+uint64_t pmm_alloc_contiguous_frames(uint32_t pages);
 void    pmm_free_frame(uint64_t phys);
 uint32_t pmm_free_count(void);
 uint32_t pmm_total_count(void);
@@ -28,6 +32,13 @@ uint32_t pmm_total_count(void);
 #define DMAP_BASE         0xFFFF800000000000ULL
 #define PHYS_TO_DMAP(pa)  ((void*)((uint64_t)(pa) + DMAP_BASE))
 #define DMAP_TO_PHYS(va)  ((uint64_t)(va) - DMAP_BASE)
+/*
+ * User mappings start above the low kernel identity region.  The kernel still
+ * executes with process CR3s, so allowing user PTEs below this line can shadow
+ * kernel globals in that address space.
+ */
+#define RIDUX_USER_LOW_SAFE 0x0000000040000000ULL
+#define RIDUX_USER_LOW_MAP_MIN 0x0000000000400000ULL
 
 typedef struct {
     uint64_t entries[512];
@@ -192,6 +203,11 @@ struct task;
 #define FDKIND_SIGNALFD 15
 #define FDKIND_DIR     16
 #define FDKIND_INOTIFY 17
+#define FDKIND_DEVINPUT 18
+#define FDKIND_DEVSND  19
+#define FDKIND_SYMLINK 20
+#define FDKIND_DEVFUSE 21
+#define FDKIND_PIDFD   22
 
 typedef struct {
     uint8_t  kind;
@@ -284,7 +300,7 @@ typedef struct task {
     int            ppid;
     int            pgid;
     int            sid;
-    int            uid, gid, euid, egid;
+    int            uid, gid, euid, egid, suid, sgid;
     char           name[TASK_NAME_LEN];
     int            fdt_group;  /* Linux CLONE_FILES descriptor-table group */
     task_state_t   state;
@@ -364,12 +380,16 @@ extern volatile uint32_t g_kernel_preempt_disable;
 void   task_init(void);
 int    task_create(const char *name, uint64_t entry, bool is_user);
 int    task_create_user_shell(const char *name, uint64_t entry);
+int    task_create_user_thread(const char *name, uint64_t entry,
+                               address_space_t *shared_as);
 int    task_fork(int parent_pid);
 void   task_exit(int pid, int code);
 int    task_waitpid(int pid, int *status, int options);
 void   task_schedule(void);
+bool   task_make_runnable(int task_index);
 task_t *task_current(void);
 uint64_t *task_syscall_user_frame(const task_t *t);
+int64_t sig_restore_context(task_t *t);
 
 /* First-time entry to ring 3 for a freshly-staged user task.
  * Commits the task as current, wires CR3 / FS / GS / TSS / RFLAGS,

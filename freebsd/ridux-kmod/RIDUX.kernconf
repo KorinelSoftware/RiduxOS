@@ -1,0 +1,13 @@
+#
+# RIDUX -- Ridux kernel config for FreeBSD/amd64.
+# Keep this close to GENERIC for stability while exposing a distinct
+# Ridux kernel identity and Linux ABI support.
+#
+
+include GENERIC
+
+ident           RIDUX
+
+# Keep Linuxulator support explicitly enabled for modern desktop apps.
+options         COMPAT_LINUX
+options         COMPAT_LINUX32

@@ -13,6 +13,7 @@ RUNTIME_APP="${RUNTIME_DIR}/ridux-app.sh"
 RUNTIME_COMPAT="${RUNTIME_DIR}/ridux-compat.sh"
 RUNTIME_SHELL="${RUNTIME_DIR}/ridux-shell.sh"
 RUNTIME_DESKTOP="${RUNTIME_DIR}/ridux-desktop.sh"
+RUNTIME_WAYFIRE="${RUNTIME_DIR}/ridux-wayfire-session.sh"
 FLUSH_RUNTIME_DIR="${RIDUX_ROOT}/linux/ridux-runtime"
 RUNTIME_UI="${FLUSH_RUNTIME_DIR}/ridux-ui.c"
 RUNTIME_FLUSH_C="${FLUSH_RUNTIME_DIR}/ridux-flush.c"
@@ -34,6 +35,8 @@ RIDUX_EXTRA_APPS="${RIDUX_EXTRA_APPS:-}"
 RIDUX_FAST_START="${RIDUX_FAST_START:-no}"
 RIDUX_KERNEL_PATH="${RIDUX_KERNEL_PATH:-auto}"
 RIDUX_MINIMAL_BOOT="${RIDUX_MINIMAL_BOOT:-yes}"
+RIDUX_DESKTOP_MODE="${RIDUX_DESKTOP_MODE:-wayfire}"
+RIDUX_WAYFIRE_PACKAGES="${RIDUX_WAYFIRE_PACKAGES:-wayfire wf-shell waybar wcm foot thunar xwayland dbus seatd drm-kmod mesa-libs mesa-dri libglvnd qt6-base qt6-wayland adwaita-icon-theme dejavu noto-basic}"
 
 usage() {
   cat <<'EOF'
@@ -51,6 +54,10 @@ Options:
   --full-start                   Full provisioning during first boot (default)
   --minimal-boot                 Skip pkg provisioning; start RiduxShell quickly
   --full-provision               Run full pkg provisioning at first boot
+  --desktop <wayfire|x11|text>   Desktop mode to prefer (default: wayfire)
+  --wayfire                      Shortcut for --desktop wayfire
+  --x11-desktop                  Shortcut for --desktop x11
+  --text-desktop                 Shortcut for --desktop text
   --with-linux-chrome            Install linux-chrome in live bootstrap
   --without-linux-chrome         Skip linux-chrome installation
   --extra-apps <csv>             Extra apps via ridux-app (default: none)
@@ -59,7 +66,8 @@ Options:
 
 Environment overrides:
   FREEBSD_RELEASE, INSTALL_LINUX_CHROME, RIDUX_EXTRA_APPS, RIDUX_FAST_START,
-  RIDUX_KERNEL_PATH, RIDUX_MINIMAL_BOOT
+  RIDUX_KERNEL_PATH, RIDUX_MINIMAL_BOOT, RIDUX_DESKTOP_MODE,
+  RIDUX_WAYFIRE_PACKAGES
 EOF
 }
 
@@ -91,6 +99,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --full-provision)
       RIDUX_MINIMAL_BOOT="no"
+      shift
+      ;;
+    --desktop)
+      RIDUX_DESKTOP_MODE="$2"
+      shift 2
+      ;;
+    --wayfire)
+      RIDUX_DESKTOP_MODE="wayfire"
+      shift
+      ;;
+    --x11-desktop)
+      RIDUX_DESKTOP_MODE="x11"
+      shift
+      ;;
+    --text-desktop)
+      RIDUX_DESKTOP_MODE="text"
       shift
       ;;
     --with-linux-chrome)
@@ -151,10 +175,14 @@ need_file "$RUNTIME_APP"
 need_file "$RUNTIME_COMPAT"
 need_file "$RUNTIME_SHELL"
 need_file "$RUNTIME_DESKTOP"
+need_file "$RUNTIME_WAYFIRE"
 need_file "$RUNTIME_UI"
 need_file "$RUNTIME_FLUSH_C"
 need_file "$RUNTIME_FLUSH_H"
 need_file "$RUNTIME_ASSETS_H"
+
+chmod 0755 "$RUNTIME_BROWSER" "$RUNTIME_APP" "$RUNTIME_COMPAT" \
+  "$RUNTIME_SHELL" "$RUNTIME_DESKTOP" "$RUNTIME_WAYFIRE" 2>/dev/null || true
 
 case "$INSTALL_LINUX_CHROME" in
   yes|YES|true|TRUE|1)
@@ -195,12 +223,27 @@ case "$RIDUX_MINIMAL_BOOT" in
     ;;
 esac
 
+case "$RIDUX_DESKTOP_MODE" in
+  wayfire|x11|text)
+    ;;
+  *)
+    echo "[freebsd-live-iso] RIDUX_DESKTOP_MODE must be wayfire, x11, or text" >&2
+    exit 4
+    ;;
+esac
+
 if [[ -n "$RIDUX_EXTRA_APPS" && ! "$RIDUX_EXTRA_APPS" =~ ^[A-Za-z0-9._,-]+$ ]]; then
   echo "[freebsd-live-iso] invalid --extra-apps list: $RIDUX_EXTRA_APPS" >&2
   exit 4
 fi
 
+if [[ -n "$RIDUX_WAYFIRE_PACKAGES" && ! "$RIDUX_WAYFIRE_PACKAGES" =~ ^[A-Za-z0-9._,[:space:]-]+$ ]]; then
+  echo "[freebsd-live-iso] invalid RIDUX_WAYFIRE_PACKAGES list: $RIDUX_WAYFIRE_PACKAGES" >&2
+  exit 4
+fi
+
 RIDUX_EXTRA_APPS_WORDS="$(printf '%s' "$RIDUX_EXTRA_APPS" | tr ',' ' ' | awk '{$1=$1; print}')"
+RIDUX_WAYFIRE_PACKAGES_WORDS="$(printf '%s' "$RIDUX_WAYFIRE_PACKAGES" | tr ',' ' ' | awk '{$1=$1; print}')"
 
 resolve_ridux_kernel() {
   case "$RIDUX_KERNEL_PATH" in
@@ -293,6 +336,20 @@ resolve_release() {
     fi
   done
 
+  local cached cached_base cached_rel cached_major_minor cached_url
+  cached="$(ls -1 "$CACHE_DIR"/FreeBSD-*-amd64-disc1.iso "$CACHE_DIR"/FreeBSD-*-amd64-disc1.iso.xz 2>/dev/null | sort -Vr | head -1 || true)"
+  if [[ -n "$cached" ]]; then
+    cached_base="$(basename "$cached")"
+    cached_base="${cached_base%.xz}"
+    cached_rel="${cached_base#FreeBSD-}"
+    cached_rel="${cached_rel%-amd64-disc1.iso}"
+    cached_major_minor="${cached_rel%%-RELEASE}"
+    cached_url="${ISO_PREFIX}/${cached_major_minor}/FreeBSD-${cached_rel}-amd64-disc1.iso.xz"
+    echo "[freebsd-live-iso] auto-detect failed; using cached release: $cached_rel" >&2
+    printf '%s|%s' "$cached_rel" "$cached_url"
+    return 0
+  fi
+
   echo "[freebsd-live-iso] unable to auto-detect a downloadable release" >&2
   return 1
 }
@@ -311,6 +368,8 @@ echo "[freebsd-live-iso] source:  $ISO_URL"
 echo "[freebsd-live-iso] output:  $OUT_ISO"
 echo "[freebsd-live-iso] orbit-fast-start: $RIDUX_FAST_START"
 echo "[freebsd-live-iso] minimal-boot: $RIDUX_MINIMAL_BOOT"
+echo "[freebsd-live-iso] desktop-mode: $RIDUX_DESKTOP_MODE"
+echo "[freebsd-live-iso] wayfire-pkgs: ${RIDUX_WAYFIRE_PACKAGES_WORDS:-<none>}"
 echo "[freebsd-live-iso] extra-apps: ${RIDUX_EXTRA_APPS_WORDS:-<none>}"
 if [[ -n "$RIDUX_KERNEL_RESOLVED" ]]; then
   echo "[freebsd-live-iso] custom kernel: $RIDUX_KERNEL_RESOLVED"
@@ -431,7 +490,7 @@ print_boot_status() {
             echo "Preparando log inicial..."
         fi
         echo ""
-        echo "Atajos: Ctrl+Alt+F2 (rescate), Ctrl+Alt+F9 (X11)"
+        echo "Atajos: Ctrl+Alt+F2 (rescate), Ctrl+Alt+F9 (grafico si hay X11)"
     } >"$TTY_DEV" 2>/dev/null || true
 }
 
@@ -462,7 +521,20 @@ fi
 
 while :; do
     launched="NO"
-    if [ -x /usr/local/bin/startx ] && [ -x /usr/local/bin/ridux-live-session ]; then
+    if pgrep -f "wayfire" >/dev/null 2>&1; then
+        echo "[ridux-tty] wayfire already running; keeping tty launcher alive" >>"$TTY_LOG"
+        sleep 5
+        launched="YES"
+    fi
+
+    if [ "$launched" != "YES" ] && [ -x /usr/local/bin/ridux-wayfire-session ]; then
+        echo "[ridux-tty] launching ridux-wayfire-session..." >>"$TTY_LOG"
+        env HOME=/tmp/ridux-root USER=root SHELL=/bin/sh TERM=xterm \
+            /usr/local/bin/ridux-wayfire-session || true
+        launched="YES"
+    fi
+
+    if [ "$launched" != "YES" ] && [ -x /usr/local/bin/startx ] && [ -x /usr/local/bin/ridux-live-session ]; then
         echo "[ridux-tty] launching ridux-live-session..." >>"$TTY_LOG"
         env HOME=/tmp/ridux-root USER=root SHELL=/bin/sh TERM=xterm \
             /usr/local/bin/startx /usr/local/bin/ridux-live-session -- :0 vt9 -nolisten tcp \
@@ -507,6 +579,7 @@ hostname="ridux"
 bsdinstall_enable="NO"
 linux_enable="YES"
 dbus_enable="YES"
+seatd_enable="YES"
 moused_enable="YES"
 ifconfig_DEFAULT="DHCP"
 vboxguest_enable="YES"
@@ -593,6 +666,8 @@ SEED="/var/db/ridux/live-seed"
 ETC_SEED="/var/db/ridux/etc-seed"
 
 export ASSUME_ALWAYS_YES=yes
+RIDUX_PKG_ABI_RUNTIME="__RIDUX_PKG_ABI__"
+RIDUX_PKG_REPO_RUNTIME="__RIDUX_PKG_REPO_BRANCH__"
 
 ridux_write_offline_pkg_repo() {
   mkdir -p /usr/local/etc/pkg/repos /etc/pkg
@@ -612,6 +687,20 @@ FreeBSD: {
 FREEBSD_REPO_EOF
 }
 
+ridux_write_online_pkg_repo() {
+  mkdir -p /usr/local/etc/pkg/repos /etc/pkg
+  cat > /usr/local/etc/pkg/repos/FreeBSD.conf <<ONLINE_REPO_EOF
+FreeBSD: {
+    url: "pkg+http://pkg.FreeBSD.org/${RIDUX_PKG_ABI_RUNTIME}/${RIDUX_PKG_REPO_RUNTIME}",
+    mirror_type: "srv",
+    signature_type: "fingerprints",
+    fingerprints: "/usr/share/keys/pkg",
+    enabled: yes,
+}
+ONLINE_REPO_EOF
+  cp /usr/local/etc/pkg/repos/FreeBSD.conf /etc/pkg/FreeBSD.conf 2>/dev/null || true
+}
+
 ridux_prepare_xinit() {
   mkdir -p /tmp/ridux-root
   cat > /tmp/ridux-root/.xinitrc <<'XINIT_EOF'
@@ -621,7 +710,29 @@ XINIT_EOF
   chmod 0755 /tmp/ridux-root/.xinitrc || true
 }
 
+ridux_start_wayfire_once() {
+  if [ "__RIDUX_DESKTOP_MODE__" != "wayfire" ]; then
+    return 1
+  fi
+  if [ ! -x /usr/local/bin/ridux-wayfire-session ] || [ ! -x /usr/local/bin/wayfire ]; then
+    return 1
+  fi
+  if pgrep -f "wayfire" >/dev/null 2>&1; then
+    return 0
+  fi
+  env RIDUX_WAYFIRE_BACKGROUND=1 HOME=/tmp/ridux-root USER=root SHELL=/bin/sh TERM=xterm \
+    /usr/local/bin/ridux-wayfire-session >/var/log/ridux-wayfire-autostart.log 2>&1 &
+  sleep 2
+  return 0
+}
+
 ridux_start_ui_once() {
+  if ridux_start_wayfire_once; then
+    return 0
+  fi
+  if [ "__RIDUX_DESKTOP_MODE__" = "text" ]; then
+    return 0
+  fi
   if [ -x /usr/local/bin/startx ] && [ -x /usr/local/bin/ridux-live-session ] && ! pgrep -f "Xorg.*:0" >/dev/null 2>&1; then
     ridux_prepare_xinit
     env HOME=/tmp/ridux-root USER=root SHELL=/bin/sh TERM=xterm /usr/local/bin/startx /usr/local/bin/ridux-live-session -- :0 vt9 -nolisten tcp >/var/log/ridux-startx.log 2>&1 &
@@ -636,7 +747,17 @@ ridux_start_ui_retry_bg() {
 set -eu
 i=0
 while [ "$i" -lt 180 ]; do
-  if pgrep -f "Xorg.*:0" >/dev/null 2>&1; then
+  if pgrep -f "wayfire" >/dev/null 2>&1 || pgrep -f "Xorg.*:0" >/dev/null 2>&1; then
+    exit 0
+  fi
+  if [ "__RIDUX_DESKTOP_MODE__" = "wayfire" ] && [ -x /usr/local/bin/ridux-wayfire-session ] && [ -x /usr/local/bin/wayfire ]; then
+    env RIDUX_WAYFIRE_BACKGROUND=1 HOME=/tmp/ridux-root USER=root SHELL=/bin/sh TERM=xterm /usr/local/bin/ridux-wayfire-session >/var/log/ridux-wayfire-autostart.log 2>&1 &
+    sleep 4
+    if pgrep -f "wayfire" >/dev/null 2>&1; then
+      exit 0
+    fi
+  fi
+  if [ "__RIDUX_DESKTOP_MODE__" = "text" ]; then
     exit 0
   fi
   if [ -x /usr/local/bin/startx ] && [ -x /usr/local/bin/ridux-live-session ]; then
@@ -688,6 +809,25 @@ XINIT_EOF
 }
 
 while :; do
+  if pgrep -f "wayfire" >/dev/null 2>&1; then
+    sleep 2
+    continue
+  fi
+  if [ "__RIDUX_DESKTOP_MODE__" = "wayfire" ] && [ -x /usr/local/bin/ridux-wayfire-session ]; then
+    env HOME=/tmp/ridux-root USER=root SHELL=/bin/sh TERM=xterm /usr/local/bin/ridux-wayfire-session || true
+    sleep 2
+    continue
+  fi
+  if [ "__RIDUX_DESKTOP_MODE__" = "text" ]; then
+    if [ -x /usr/local/bin/ridux-desktop ]; then
+      env TERM=xterm /usr/local/bin/ridux-desktop || true
+      continue
+    fi
+    if [ -x /usr/local/bin/ridux-shell ]; then
+      env TERM=xterm /usr/local/bin/ridux-shell || true
+      continue
+    fi
+  fi
   if pgrep -f "Xorg.*:0" >/dev/null 2>&1; then
     sleep 2
     continue
@@ -772,6 +912,7 @@ if [ ! -d "$SEED" ]; then
   cp /usr/local/bin/ridux-compat "$SEED/bin/" || true
   cp /usr/local/bin/ridux-shell "$SEED/bin/" || true
   cp /usr/local/bin/ridux-desktop "$SEED/bin/" || true
+  cp /usr/local/bin/ridux-wayfire-session "$SEED/bin/" || true
   cp /usr/local/bin/ridux-live-init "$SEED/bin/" || true
   cp /usr/local/share/ridux/ridux-ui.c "$SEED/share/" || true
   cp /usr/local/share/ridux/ridux-flush.c "$SEED/share/" || true
@@ -791,6 +932,7 @@ cp "$SEED/share/"* /usr/local/share/ridux/ 2>/dev/null || true
 chmod 0755 /usr/local/bin/ridux-browser /usr/local/bin/ridux-app /usr/local/bin/ridux-compat /usr/local/bin/ridux-live-init 2>/dev/null || true
 chmod 0755 /usr/local/bin/ridux-shell 2>/dev/null || true
 chmod 0755 /usr/local/bin/ridux-desktop 2>/dev/null || true
+chmod 0755 /usr/local/bin/ridux-wayfire-session 2>/dev/null || true
 
 if [ "__RIDUX_MINIMAL_BOOT__" = "YES" ]; then
   echo "[ridux-live] minimal boot mode: skipping pkg provisioning."
@@ -822,6 +964,27 @@ retry_cmd() {
     sleep 5
   done
   return 0
+}
+
+RIDUX_WAYFIRE_PACKAGE_SET="__RIDUX_WAYFIRE_PACKAGES__"
+
+install_packages_best_effort() {
+  for pkg_name in "$@"; do
+    [ -n "$pkg_name" ] || continue
+    echo "[ridux-live] installing package: $pkg_name"
+    "$PKG_BIN" install -y "$pkg_name" >/dev/null 2>&1 || pkg install -y "$pkg_name" >/dev/null 2>&1 || true
+  done
+}
+
+install_wayfire_stack() {
+  if [ "__RIDUX_DESKTOP_MODE__" != "wayfire" ]; then
+    return 0
+  fi
+  echo "[ridux-live] installing Wayfire desktop stack..."
+  # Try the full transaction first so pkg can solve the graph in one pass.
+  "$PKG_BIN" install -y $RIDUX_WAYFIRE_PACKAGE_SET >/dev/null 2>&1 \
+    || pkg install -y $RIDUX_WAYFIRE_PACKAGE_SET >/dev/null 2>&1 \
+    || install_packages_best_effort $RIDUX_WAYFIRE_PACKAGE_SET
 }
 
 # Top-level path on purpose: /usr/local gets a tmpfs overlay below,
@@ -897,7 +1060,7 @@ if [ "$RIDUX_PKG_OFFLINE" = "YES" ]; then
             [ -f "$f" ] || continue
             base="${f##*/}"
             case "$base" in
-                firefox-*|chromium-*|llvm*|python*|py311-*|perl5-*|boost-libs-*|openblas-*|gtk3-*|ffmpeg-*)
+                firefox-*|chromium-*)
                     continue
                     ;;
             esac
@@ -934,6 +1097,15 @@ if [ "$RIDUX_PKG_OFFLINE" = "YES" ]; then
 
     if [ "$RIDUX_RUNTIME_UNPACKED" != "YES" ]; then
         echo "[ridux-live] direct package unpack was unavailable; falling back to selected pkg add."
+        install_pkg_glob "$PKG_DIR/wayfire-*.pkg"
+        install_pkg_glob "$PKG_DIR/wf-shell-*.pkg"
+        install_pkg_glob "$PKG_DIR/waybar-*.pkg"
+        install_pkg_glob "$PKG_DIR/foot-*.pkg"
+        install_pkg_glob "$PKG_DIR/thunar-*.pkg"
+        install_pkg_glob "$PKG_DIR/seatd-*.pkg"
+        install_pkg_glob "$PKG_DIR/xwayland-*.pkg"
+        install_pkg_glob "$PKG_DIR/mesa-libs-*.pkg"
+        install_pkg_glob "$PKG_DIR/mesa-dri-*.pkg"
         install_pkg_glob "$PKG_DIR/xorg-minimal-*.pkg"
         install_pkg_glob "$PKG_DIR/xinit-*.pkg"
         install_pkg_glob "$PKG_DIR/xauth-*.pkg"
@@ -944,11 +1116,14 @@ if [ "$RIDUX_PKG_OFFLINE" = "YES" ]; then
         install_pkg_glob "$PKG_DIR/xf86-video-vesa-*.pkg"
         install_pkg_glob "$PKG_DIR/xf86-input-libinput-*.pkg"
     fi
+    install_wayfire_stack
 else
     echo "[ridux-live] no offline cache found, falling back to online pkg..."
+    ridux_write_online_pkg_repo
     pkg bootstrap -f -y || true
     retry_cmd 4 pkg update -f || true
 
+    install_wayfire_stack
     pkg install -y xorg-minimal xinit xauth dbus ffmpeg libX11 pkgconf \
       || pkg install -y xorg xinit xauth dbus ffmpeg libX11 pkgconf \
       || true
@@ -1162,6 +1337,10 @@ sed -i \
   -e "s/__INSTALL_LINUX_CHROME__/${INSTALL_LINUX_CHROME}/g" \
   -e "s/__RIDUX_FAST_START__/${RIDUX_FAST_START}/g" \
   -e "s/__RIDUX_MINIMAL_BOOT__/${RIDUX_MINIMAL_BOOT}/g" \
+  -e "s/__RIDUX_DESKTOP_MODE__/${RIDUX_DESKTOP_MODE}/g" \
+  -e "s/__RIDUX_WAYFIRE_PACKAGES__/${RIDUX_WAYFIRE_PACKAGES_WORDS}/g" \
+  -e "s/__RIDUX_PKG_ABI__/${RIDUX_PKG_ABI}/g" \
+  -e "s/__RIDUX_PKG_REPO_BRANCH__/${RIDUX_PKG_REPO_BRANCH}/g" \
   -e "s/__RIDUX_EXTRA_APPS__/${RIDUX_EXTRA_APPS_WORDS}/g" \
   "$live_init"
 chmod 0755 "$live_init"
@@ -1174,20 +1353,20 @@ Ridux Live ISO (no disk installation required)
 - Optional custom kernel injection: pass --ridux-kernel <path> when
   generating the ISO to replace /boot/kernel/kernel.
 - ttyv0 autologin runs /usr/local/bin/ridux-live-init-tty which:
-    * on first boot, provisions Xorg + DBus + Firefox + Chromium and
-      builds the Ridux UI (Flush/X11 shell)
+    * on first boot, provisions Wayfire + wf-shell/Waybar + DBus +
+      Firefox/Chromium and keeps X11 as a fallback
       (unless built with --minimal-boot, which jumps directly to Ridux Desktop)
     * prints boot progress live on ttyv0 so startup is visible
-    * then hands off to /usr/local/bin/ridux-live-session which runs
-      the Ridux UI on display :0 / vt9
-    * if X11 is unavailable, falls back to /usr/local/bin/ridux-desktop
-      and then /usr/local/bin/ridux-shell as rescue shell
+    * then hands off to /usr/local/bin/ridux-wayfire-session
+    * if Wayfire/X11 is unavailable, falls back to /usr/local/bin/ridux-desktop
+      and then /usr/local/bin/ridux-shell as rescue shell with logs
 - bsdinstall is disabled at runtime via /etc/rc.conf.local and via a
   noop replacement of /usr/sbin/bsdinstall.
 
 Diagnostics if the GUI does not auto-open:
   Ctrl+Alt+F2          switch to a tty
   tail /var/log/ridux-live-init.log
+  tail /var/log/ridux-wayfire-session.log
   tail /var/log/ridux-startx.log
   /usr/local/bin/ridux-app doctor
 EOF
@@ -1235,6 +1414,7 @@ xorriso \
   -map "$RUNTIME_COMPAT" /usr/local/bin/ridux-compat \
   -map "$RUNTIME_SHELL" /usr/local/bin/ridux-shell \
   -map "$RUNTIME_DESKTOP" /usr/local/bin/ridux-desktop \
+  -map "$RUNTIME_WAYFIRE" /usr/local/bin/ridux-wayfire-session \
   -map "$RUNTIME_UI" /usr/local/share/ridux/ridux-ui.c \
   -map "$RUNTIME_FLUSH_C" /usr/local/share/ridux/ridux-flush.c \
   -map "$RUNTIME_FLUSH_H" /usr/local/share/ridux/ridux-flush.h \
@@ -1256,4 +1436,6 @@ else
   echo "  ridux-kernel: <none>"
 fi
 echo "  linux-chrome: $INSTALL_LINUX_CHROME"
+echo "  desktop-mode: $RIDUX_DESKTOP_MODE"
+echo "  wayfire-pkgs: ${RIDUX_WAYFIRE_PACKAGES_WORDS:-<none>}"
 echo "  extra-apps: ${RIDUX_EXTRA_APPS_WORDS:-<none>}"

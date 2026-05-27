@@ -9,6 +9,11 @@
 #include <stdint.h>
 #include "base.h"
 #include "memory_tasks.h"
+#include "linux_syscalls.h"
+#include "display_wayland.h"
+
+extern bool kvfs_exists(const char *path);
+static bool compat_wayfire_debug_trace_enabled(void);
 
 /* Local IO helpers */
 #define SOCK_VIRT_REQ_SNAPSHOT_SIZE 4096u
@@ -32,6 +37,18 @@ static inline void c_outl(uint16_t port, uint32_t v) {
     __asm__ volatile("outl %0, %1" : : "a"(v), "Nd"(port));
 }
 static inline void c_io_wait(void) { c_outb(0x80, 0); }
+
+static bool compat_task_name_contains(const task_t *t,const char *needle){
+    size_t i,j,nl;
+    if(!t||!needle)return false;
+    for(nl=0;needle[nl];++nl){}
+    if(!nl)return true;
+    for(i=0;t->name[i];++i){
+        for(j=0;j<nl&&t->name[i+j]&&t->name[i+j]==needle[j];++j){}
+        if(j==nl)return true;
+    }
+    return false;
+}
 
 /* Local string/mem helpers */
 static void *c_memset(void *d, int v, size_t n) {
@@ -96,6 +113,10 @@ static void c_append_u32(char *d, size_t *l, size_t c, uint32_t v) {
     char t[12]; int i=0;
     if(!v){c_append_ch(d,l,c,'0');return;}
     while(v){t[i++]='0'+(char)(v%10);v/=10;} while(--i>=0)c_append_ch(d,l,c,t[i]);
+}
+static void c_append_i32(char *d, size_t *l, size_t c, int32_t v) {
+    if(v<0){c_append_ch(d,l,c,'-');c_append_u32(d,l,c,(uint32_t)(-v));return;}
+    c_append_u32(d,l,c,(uint32_t)v);
 }
 static void c_append_u64(char *d, size_t *l, size_t c, uint64_t v) {
     char t[24]; int i=0;
@@ -366,6 +387,24 @@ void net_iface_down(int i){if(i>=0&&i<g_net_iface_count)g_net_ifaces[i].up=false
 
 /* E1000 real DMA ring TX/RX */
 
+#define E1000_CTRL   0x0000u
+#define E1000_ICR    0x00C0u
+#define E1000_IMS    0x00D0u
+#define E1000_RCTL   0x0100u
+#define E1000_TCTL   0x0400u
+#define E1000_TIPG   0x0410u
+#define E1000_ITR    0x0C54u
+#define E1000_RDBAL  0x2800u
+#define E1000_RDBAH  0x2804u
+#define E1000_RDLEN  0x2808u
+#define E1000_RDH    0x2810u
+#define E1000_RDT    0x2818u
+#define E1000_TDBAL  0x3800u
+#define E1000_TDBAH  0x3804u
+#define E1000_TDLEN  0x3808u
+#define E1000_TDH    0x3810u
+#define E1000_TDT    0x3818u
+
 /* E1000 Legacy TX descriptor (16 bytes) */
 typedef struct {
     uint64_t addr;       /* buffer address */
@@ -390,17 +429,25 @@ typedef struct {
 /* Statically allocated DMA-safe buffers (must be 16-byte aligned) */
 static e1000_tx_desc_t g_e1000_tx_ring[NET_TX_RING] __attribute__((aligned(16)));
 static e1000_rx_desc_t g_e1000_rx_ring[NET_RX_RING] __attribute__((aligned(16)));
-static uint8_t g_e1000_tx_bufs[NET_TX_RING][NET_MTU+4] __attribute__((aligned(16)));
+static uint8_t g_e1000_tx_bufs[NET_TX_RING][2048] __attribute__((aligned(16)));
 static uint8_t g_e1000_rx_bufs[NET_RX_RING][2048] __attribute__((aligned(16)));
+
+static net_iface_t *e1000_iface(void){
+    int i;
+    for(i=0;i<g_net_iface_count;++i){
+        if(g_net_ifaces[i].present&&c_strcmp(g_net_ifaces[i].driver,"e1000")==0)return &g_net_ifaces[i];
+    }
+    return 0;
+}
 
 static void e1000_setup_rings(int iface_idx){
     net_iface_t *ni=&g_net_ifaces[iface_idx];
     volatile uint32_t *mmio=g_e1000_mmio;
     int i;
 
-    /* Disable TX & RX while setting up */
-    mmio[0x0000/4] &= ~(1u<<1);  /* TCTL: disable TX */
-    mmio[0x0100/4] &= ~(1u<<1);  /* RCTL: disable RX */
+    /* Apago RX/TX un momento para tocar los rings sin carreras raras. */
+    mmio[E1000_TCTL/4] &= ~(1u<<1);
+    mmio[E1000_RCTL/4] &= ~(1u<<1);
 
     /* TX ring */
     c_memset(g_e1000_tx_ring, 0, sizeof(g_e1000_tx_ring));
@@ -413,17 +460,15 @@ static void e1000_setup_rings(int iface_idx){
     ni->tx_head = 0;
     ni->tx_tail = 0;
 
-    /* Program TX descriptor base & ring length */
-    mmio[0x3800/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_tx_ring & 0xFFFFFFFF);
-    mmio[0x3804/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_tx_ring >> 32);
-    mmio[0x3808/4] = 0;             /* TX head = 0 */
-    mmio[0x3810/4] = 0;             /* TX tail = 0 */
-    mmio[0x380C/4] = (NET_TX_RING * sizeof(e1000_tx_desc_t)) << 16; /* TDHLEN */
+    /* Base, largo, head y tail segun el datasheet del e1000. */
+    mmio[E1000_TDBAL/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_tx_ring & 0xFFFFFFFF);
+    mmio[E1000_TDBAH/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_tx_ring >> 32);
+    mmio[E1000_TDLEN/4] = NET_TX_RING * sizeof(e1000_tx_desc_t);
+    mmio[E1000_TDH/4] = 0;
+    mmio[E1000_TDT/4] = 0;
 
-    /* Enable TX: TCTL = Enable + Pad Short + CRC + Collision */
-    mmio[0x0400/4] = (1u<<1)|(1u<<3)|(0x40u<<12)|(1u<<0);
-    /* TX IPG: 10,10,10 for standard Ethernet */
-    mmio[0x0380/4] = (10<<20)|(10<<10)|10;
+    mmio[E1000_TCTL/4] = (1u<<1)|(1u<<3)|(0x10u<<4)|(0x40u<<12);
+    mmio[E1000_TIPG/4] = 10u | (8u<<10) | (6u<<20);
 
     /* RX ring */
     c_memset(g_e1000_rx_ring, 0, sizeof(g_e1000_rx_ring));
@@ -434,25 +479,21 @@ static void e1000_setup_rings(int iface_idx){
     }
     ni->rx_descs = g_e1000_rx_ring;
     ni->rx_head = 0;
-    ni->rx_tail = 0;
+    ni->rx_tail = NET_RX_RING - 1;
     ni->rx_pending = false;
 
-    /* Program RX descriptor base & ring length */
-    mmio[0x2800/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_rx_ring & 0xFFFFFFFF);
-    mmio[0x2804/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_rx_ring >> 32);
-    mmio[0x2818/4] = 0;             /* RX head = 0 */
-    mmio[0x2800+0x1C/4] = (NET_RX_RING - 1); /* RX tail = last valid desc */
-    mmio[0x2800+0x18/4] = (NET_RX_RING * sizeof(e1000_rx_desc_t)) << 16;
+    mmio[E1000_RDBAL/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_rx_ring & 0xFFFFFFFF);
+    mmio[E1000_RDBAH/4] = (uint32_t)((uint64_t)(uintptr_t)g_e1000_rx_ring >> 32);
+    mmio[E1000_RDLEN/4] = NET_RX_RING * sizeof(e1000_rx_desc_t);
+    mmio[E1000_RDH/4] = 0;
+    mmio[E1000_RDT/4] = NET_RX_RING - 1;
 
-    /* Enable RX: RCTL = Enable + Broadcast + Multicast + 2048buf + Strip CRC */
-    mmio[0x0100/4] = (1u<<1)|(1u<<15)|(1u<<25)|(1u<<2)|(1u<<26)|(1u<<3)|(1u<<4)|(1u<<5);
+    mmio[E1000_RCTL/4] = (1u<<1)|(1u<<15)|(1u<<26)|(1u<<3)|(1u<<4);
 
-    /* Set Interrupt Throttling to 0 (no throttling) */
-    mmio[0x0C54/4] = 0;
+    mmio[E1000_ITR/4] = 0;
 
-    /* Clear interrupt cause and enable RX/TX interrupts */
-    mmio[0x00C0/4] = 0xFFFFFFFF; /* ICR: clear all */
-    mmio[0x00D0/4] = (1u<<0)|(1u<<1)|(1u<<2)|(1u<<7); /* IMS: RXO,RXT,TXDW,RXDMT */
+    mmio[E1000_ICR/4] = 0xFFFFFFFF;
+    mmio[E1000_IMS/4] = (1u<<0)|(1u<<1)|(1u<<2)|(1u<<7);
 
     ni->up = true;
 }
@@ -461,11 +502,12 @@ static void e1000_setup_rings(int iface_idx){
 int e1000_send(const uint8_t *frame, size_t len){
     volatile uint32_t *mmio = g_e1000_mmio;
     e1000_tx_desc_t *ring = g_e1000_tx_ring;
+    net_iface_t *ni = e1000_iface();
     uint32_t tail;
 
-    if(!g_e1000_found || !mmio || len == 0 || len > NET_MTU) return -1;
+    if(!g_e1000_found || !mmio || !ni || len == 0 || len > sizeof(g_e1000_tx_bufs[0])) return -1;
 
-    tail = mmio[0x3810/4]; /* read current TDT (tail) */
+    tail = ni->tx_tail % NET_TX_RING;
 
     /* Check if the descriptor is free (DD bit set) */
     if(!(ring[tail].status & 0x01)){
@@ -484,12 +526,16 @@ int e1000_send(const uint8_t *frame, size_t len){
 
     /* Advance tail */
     uint32_t new_tail = (tail + 1) % NET_TX_RING;
-    mmio[0x3810/4] = new_tail;
+    ni->tx_tail = new_tail;
+    mmio[E1000_TDT/4] = new_tail;
 
     /* Wait for completion (with timeout) */
     {int w; for(w=0; w<1000000; ++w){
         if(ring[tail].status & 0x01) break;
     }}
+
+    ni->tx_packets++;
+    ni->tx_bytes += (uint64_t)len;
 
     return (int)len;
 }
@@ -498,16 +544,12 @@ int e1000_send(const uint8_t *frame, size_t len){
 int e1000_recv(uint8_t *buf, size_t buf_size){
     volatile uint32_t *mmio = g_e1000_mmio;
     e1000_rx_desc_t *ring = g_e1000_rx_ring;
-    uint32_t head;
+    net_iface_t *ni = e1000_iface();
+    uint32_t next;
 
-    if(!g_e1000_found || !mmio || !buf || buf_size == 0) return 0;
+    if(!g_e1000_found || !mmio || !ni || !buf || buf_size == 0) return 0;
 
-    head = mmio[0x2818/4]; /* RDH (head) */
-    uint32_t tail = mmio[0x281C/4]; /* RDT (tail) */
-    uint32_t next = (tail + 1) % NET_RX_RING;
-
-    /* If next == head, ring is empty (no new descriptors) */
-    if(next == head) return 0;
+    next = (ni->rx_tail + 1) % NET_RX_RING;
 
     /* Check if the next descriptor has DD+EOP set (packet ready) */
     if(!(ring[next].status & 0x01) || !(ring[next].status & 0x02)){
@@ -523,8 +565,8 @@ int e1000_recv(uint8_t *buf, size_t buf_size){
     ring[next].status = 0;
     ring[next].addr = (uint64_t)(uintptr_t)g_e1000_rx_bufs[next];
 
-    /* Advance tail */
-    mmio[0x281C/4] = next;
+    ni->rx_tail = next;
+    mmio[E1000_RDT/4] = next;
 
     return (int)pkt_len;
 }
@@ -550,6 +592,125 @@ void e1000_poll_rx(void){
     }
 }
 
+/* Real network frame helpers — build full Eth+IP+TCP/UDP and e1000_send() */
+bool net_is_real_external(uint32_t ip){
+    if(!ip)return false;
+    if((ip&0xFF000000u)==0x7F000000u)return false; /* 127.x.x.x */
+    return true;
+}
+
+static bool net_get_src_mac(uint8_t *mac){
+    int i;
+    for(i=0;i<g_net_iface_count;++i){
+        if(g_net_ifaces[i].present&&g_net_ifaces[i].up&&c_strcmp(g_net_ifaces[i].driver,"loopback")!=0){
+            c_memcpy(mac,g_net_ifaces[i].mac,6);
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t net_get_gateway_ip(uint32_t dst_ip){
+    if(g_dhcp_lease.obtained&&g_dhcp_lease.ip&&g_dhcp_lease.netmask){
+        if((dst_ip&g_dhcp_lease.netmask)==(g_dhcp_lease.ip&g_dhcp_lease.netmask))return dst_ip;
+    }
+    if(g_dhcp_lease.obtained&&g_dhcp_lease.gateway)return g_dhcp_lease.gateway;
+    /* VirtualBox NAT default gateway */
+    return c_make_ip4(10,0,2,2);
+}
+
+static uint32_t net_get_src_ip(void){
+    if(g_dhcp_lease.obtained&&g_dhcp_lease.ip)return g_dhcp_lease.ip;
+    return c_make_ip4(10,0,2,15);
+}
+
+static int net_send_arp_request(uint32_t target_ip){
+    uint8_t frame[64];
+    uint8_t src_mac[6];
+    uint8_t bcast[6];
+    int eth_len, arp_len;
+    c_memset(bcast,0xFF,sizeof(bcast));
+    if(!net_get_src_mac(src_mac))return -1;
+    eth_len=net_build_eth(frame,bcast,src_mac,0x0806);
+    arp_len=net_build_arp_request(frame+eth_len,src_mac,net_get_src_ip(),target_ip);
+    return e1000_send(frame,(size_t)(eth_len+arp_len));
+}
+
+static uint16_t net_transport_checksum(uint32_t src_ip,uint32_t dst_ip,uint8_t proto,
+                                       const uint8_t *seg,size_t seg_len){
+    uint8_t tmp[1536];
+    size_t total;
+    if(!seg||seg_len+12u>sizeof(tmp))return 0;
+    tmp[0]=(uint8_t)(src_ip>>24);tmp[1]=(uint8_t)(src_ip>>16);tmp[2]=(uint8_t)(src_ip>>8);tmp[3]=(uint8_t)src_ip;
+    tmp[4]=(uint8_t)(dst_ip>>24);tmp[5]=(uint8_t)(dst_ip>>16);tmp[6]=(uint8_t)(dst_ip>>8);tmp[7]=(uint8_t)dst_ip;
+    tmp[8]=0;tmp[9]=proto;tmp[10]=(uint8_t)(seg_len>>8);tmp[11]=(uint8_t)seg_len;
+    c_memcpy(tmp+12,seg,seg_len);
+    total=12u+seg_len;
+    return net_checksum(tmp,total);
+}
+
+int net_send_tcp_frame(int sock_fd, const uint8_t *tcp_seg, size_t seg_len){
+    uint8_t frame[1600];
+    uint8_t src_mac[6], dst_mac[6];
+    socket_t *s;
+    uint32_t gw_ip, src_ip, dst_ip;
+    int eth_len, ip_len;
+
+    if(sock_fd<0||sock_fd>=SOCK_MAX||!g_sockets[sock_fd].used)return -1;
+    s=&g_sockets[sock_fd];
+    if(!seg_len||seg_len>1480)return -1;
+    if(!net_get_src_mac(src_mac))return -1;
+
+    src_ip=s->local_ip?s->local_ip:net_get_src_ip();
+    dst_ip=s->remote_ip;
+    gw_ip=net_get_gateway_ip(s->remote_ip);
+    if(!arp_resolve(gw_ip,dst_mac)){
+        (void)net_send_arp_request(gw_ip);
+        return -1;
+    }
+
+    eth_len=net_build_eth(frame,dst_mac,src_mac,0x0800);
+    ip_len=net_build_ip(frame+eth_len,src_ip,dst_ip,IP_PROTO_TCP,(uint16_t)seg_len);
+    c_memcpy(frame+eth_len+ip_len,tcp_seg,seg_len);
+    if(seg_len>=20){
+        uint8_t *tcp=frame+eth_len+ip_len;
+        uint16_t ck;
+        tcp[16]=0;tcp[17]=0;
+        ck=net_transport_checksum(src_ip,dst_ip,IP_PROTO_TCP,tcp,seg_len);
+        tcp[16]=(uint8_t)(ck>>8);tcp[17]=(uint8_t)ck;
+    }
+
+    return e1000_send(frame,(size_t)(eth_len+ip_len)+(size_t)seg_len);
+}
+
+int net_send_udp_frame(int sock_fd, const uint8_t *payload, size_t len){
+    uint8_t frame[1600];
+    uint8_t src_mac[6], dst_mac[6];
+    socket_t *s;
+    uint32_t gw_ip;
+    int eth_len, ip_len, udp_len;
+
+    if(sock_fd<0||sock_fd>=SOCK_MAX||!g_sockets[sock_fd].used)return -1;
+    s=&g_sockets[sock_fd];
+    if(!len||len>1400)return -1;
+    if(!net_get_src_mac(src_mac))return -1;
+
+    gw_ip=net_get_gateway_ip(s->remote_ip);
+    if(!arp_resolve(gw_ip,dst_mac)){
+        (void)net_send_arp_request(gw_ip);
+        return -1;
+    }
+
+    eth_len=net_build_eth(frame,dst_mac,src_mac,0x0800);
+    udp_len=8+(int)len; /* UDP header + payload */
+    ip_len=net_build_ip(frame+eth_len,s->local_ip?s->local_ip:net_get_src_ip(),
+                        s->remote_ip,IP_PROTO_UDP,(uint16_t)udp_len);
+    net_build_udp(frame+eth_len+ip_len,s->local_port,s->remote_port,(uint16_t)len);
+    c_memcpy(frame+eth_len+ip_len+8,payload,len);
+
+    return e1000_send(frame,(size_t)(eth_len+ip_len+udp_len));
+}
+
 /* TCP/IP stack + sockets + ARP + DHCP + DNS */
 socket_t g_sockets[SOCK_MAX];
 compat_arp_entry_t g_arp_cache[ARP_CACHE_SIZE];
@@ -561,9 +722,23 @@ void arp_init(void){c_memset(g_arp_cache,0,sizeof(g_arp_cache));}
 bool arp_resolve(uint32_t ip,uint8_t *mac){int i;
     for(i=0;i<ARP_CACHE_SIZE;++i)if(g_arp_cache[i].valid&&g_arp_cache[i].ip==ip){c_memcpy(mac,g_arp_cache[i].mac,6);return true;}
     c_memset(mac,0xFF,6);return false;}
-void arp_process(const uint8_t *f,size_t len){int i;uint32_t sip;if(len<28)return;
-    sip=((uint32_t)f[14]<<24)|((uint32_t)f[15]<<16)|((uint32_t)f[16]<<8)|f[17];
-    for(i=0;i<ARP_CACHE_SIZE;++i)if(!g_arp_cache[i].valid){g_arp_cache[i].ip=sip;c_memcpy(g_arp_cache[i].mac,&f[8],6);g_arp_cache[i].valid=true;break;}}
+void arp_process(const uint8_t *f,size_t len){int i,slot=-1;uint32_t sip;const uint8_t *arp;
+    if(!f)return;
+    if(len>=42&&f[12]==0x08&&f[13]==0x06)arp=f+14;
+    else if(len>=28)arp=f;
+    else return;
+    if(arp[0]!=0||arp[1]!=1||arp[2]!=0x08||arp[3]!=0x00||arp[4]!=6||arp[5]!=4)return;
+    sip=((uint32_t)arp[14]<<24)|((uint32_t)arp[15]<<16)|((uint32_t)arp[16]<<8)|arp[17];
+    if(!sip)return;
+    for(i=0;i<ARP_CACHE_SIZE;++i){
+        if(g_arp_cache[i].valid&&g_arp_cache[i].ip==sip){slot=i;break;}
+        if(slot<0&&!g_arp_cache[i].valid)slot=i;
+    }
+    if(slot<0)slot=0;
+    g_arp_cache[slot].ip=sip;
+    c_memcpy(g_arp_cache[slot].mac,arp+8,6);
+    g_arp_cache[slot].valid=true;
+}
 
 void tcp_ip_init(void){c_memset(g_sockets,0,sizeof(g_sockets));c_memset(&g_dhcp_lease,0,sizeof(g_dhcp_lease));
     c_memset(g_dns_cache,0,sizeof(g_dns_cache));arp_init();g_ephemeral_port=49152;}
@@ -577,6 +752,7 @@ void net_process_frame(const uint8_t *frame, size_t len){
     uint8_t proto;
     uint32_t src_ip, dst_ip;
     uint16_t src_port, dst_port;
+    size_t ip_total_len;
 
     if(!frame || len < 14) return;
 
@@ -600,6 +776,9 @@ void net_process_frame(const uint8_t *frame, size_t len){
 
     ihl = (ip_hdr[0] & 0x0F) * 4;
     if(ihl < 20 || (size_t)(14 + ihl) > len) return;
+    ip_total_len=((size_t)ip_hdr[2]<<8)|ip_hdr[3];
+    if(ip_total_len<(size_t)ihl)return;
+    if(14u+ip_total_len>len)ip_total_len=len-14u;
 
     proto = ip_hdr[9];
     src_ip = ((uint32_t)ip_hdr[12]<<24)|((uint32_t)ip_hdr[13]<<16)|
@@ -610,7 +789,7 @@ void net_process_frame(const uint8_t *frame, size_t len){
     /* TCP or UDP */
     if(proto == 6 || proto == 17){
         const uint8_t *tp = ip_hdr + ihl;
-        if((size_t)(14 + ihl + 4) > len) return;
+        if((size_t)ihl + 4u > ip_total_len) return;
         src_port = ((uint16_t)tp[0]<<8)|tp[1];
         dst_port = ((uint16_t)tp[2]<<8)|tp[3];
 
@@ -618,19 +797,38 @@ void net_process_frame(const uint8_t *frame, size_t len){
         for(i = 0; i < SOCK_MAX; ++i){
             socket_t *s = &g_sockets[i];
             if(!s->used) continue;
-            if(s->protocol != proto) continue;
+            if(s->domain != 2) continue;
+            if(proto == 6 && s->type != 1) continue;
+            if(proto == 17 && s->type != 2) continue;
+            if(s->protocol && s->protocol != proto) continue;
             if(!sock_ip_match(s->local_ip, dst_ip)) continue;
             if(s->local_port && s->local_port != dst_port) continue;
-            /* Found a match — deliver payload */
+            /* Also match remote for connected TCP sockets */
+            if(proto == 6 && s->remote_ip && s->remote_ip != src_ip) continue;
+            if(proto == 6 && s->remote_port && s->remote_port != src_port) continue;
+            /* Found a match; TCP7 decides if the payload is in-order. */
             {
                 size_t hdr_size = (proto == 6) ?
                     (((tp[12] >> 4) & 0xF) * 4) : 8; /* TCP hdr len / UDP 8 */
                 const uint8_t *payload = tp + hdr_size;
-                size_t payload_len = len - (14 + ihl + hdr_size);
-                if(payload_len > 0 && payload_len <= SOCK_BUF_SIZE){
-                    sock_push_rx(s, payload, payload_len);
-                    s->rx_msg_ip[s->rx_msg_head] = src_ip;
-                    s->rx_msg_port[s->rx_msg_head] = src_port;
+                if((proto==6&&hdr_size<20)||hdr_size<8||(size_t)ihl+hdr_size>ip_total_len)return;
+                size_t payload_len = ip_total_len - (size_t)ihl - hdr_size;
+                if(proto == 6){
+                    int tcp_accept=tcp7_incoming_segment(i, tp, ip_total_len - (size_t)ihl);
+                    if(tcp_accept>0&&payload_len>0&&payload_len<=SOCK_BUF_SIZE){
+                        (void)sock_push_rx(s, payload, payload_len);
+                    }
+                }else if(payload_len > 0 && payload_len <= SOCK_BUF_SIZE){
+                    size_t pushed=sock_push_rx(s, payload, payload_len);
+                    if(pushed==payload_len){
+                        uint8_t nq=(uint8_t)((s->rx_msg_head+1u)%SOCK_DGRAMQ);
+                        if(nq!=s->rx_msg_tail){
+                            s->rx_msg_len[s->rx_msg_head]=(uint16_t)payload_len;
+                            s->rx_msg_ip[s->rx_msg_head]=src_ip;
+                            s->rx_msg_port[s->rx_msg_head]=src_port;
+                            s->rx_msg_head=nq;
+                        }
+                    }
                 }
             }
             break;
@@ -643,6 +841,23 @@ void net_process_frame(const uint8_t *frame, size_t len){
 }
 static uint16_t alloc_eph(void){uint16_t p=g_ephemeral_port++;if(g_ephemeral_port>65500)g_ephemeral_port=49152;return p;}
 static bool sock_is_loopback_ip(uint32_t ip){return ip==0||((ip&0xFF000000u)==0x7F000000u);}
+static void sock_wake_socket_sleepers(void){
+    int ti,fd;
+    for(ti=0;ti<TASK_MAX;++ti){
+        task_t *t=&g_tasks[ti];
+        bool has_wait_fd=false;
+        if(!t->used||t->state!=TASK_SLEEPING)continue;
+        for(fd=0;fd<TASK_FD_MAX;++fd){
+            uint8_t kind=t->fdt.fds[fd].kind;
+            if(kind==FDKIND_SOCKET||kind==FDKIND_EPOLL){
+                has_wait_fd=true;
+                break;
+            }
+        }
+        if(!has_wait_fd)continue;
+        task_make_runnable(ti);
+    }
+}
 static bool sock_ip_match(uint32_t bind_ip,uint32_t target_ip){
     if(bind_ip==0||target_ip==0)return true;
     if(bind_ip==target_ip)return true;
@@ -657,6 +872,7 @@ static size_t sock_push_rx(socket_t *dst,const uint8_t *src,size_t len){size_t a
     av=SOCK_BUF_SIZE-used;
     if(len>av)len=av;
     for(i=0;i<len;++i){dst->rx_buf[dst->rx_head&(SOCK_BUF_SIZE-1)]=src[i];dst->rx_head++;}
+    if(len)sock_wake_socket_sleepers();
     return len;}
 static int sock_push_udp(socket_t *dst,const uint8_t *src,size_t len,uint32_t src_ip,uint16_t src_port){
     size_t av;
@@ -784,6 +1000,7 @@ static int sock_acceptq_push(socket_t *listener,int sfd){
     if(n==listener->accept_tail)return -EAGAIN;
     listener->accept_q[listener->accept_head]=sfd;
     listener->accept_head=n;
+    sock_wake_socket_sleepers();
     return 0;
 }
 static int sock_acceptq_pop(socket_t *listener){
@@ -903,6 +1120,11 @@ static bool            g_dbusv_hello[SOCK_MAX];
 static bool            g_dbusv_seeded=false;
 static uint32_t        g_dbusv_next_unique=1u;
 static uint32_t        g_dbusv_next_serial=1u;
+static uint8_t         g_dbusv_fields_scratch[2048];
+static uint8_t         g_dbusv_packet_scratch[6144];
+static uint8_t         g_dbusv_body_scratch[4096];
+static const char     *g_dbusv_names_scratch[DBUSV_BIND_MAX+SOCK_MAX];
+static char            g_sock_virt_req_snapshot[SOCK_VIRT_REQ_SNAPSHOT_SIZE];
 static void dbusv_emit_name_owner_changed(const char *name,const char *old_owner,const char *new_owner);
 
 /* compat7 protocol bridges (wired at runtime). */
@@ -922,8 +1144,8 @@ static bool sock_is_https_port(uint16_t port){
 static uint8_t sock_virtual_classify(uint32_t addr,uint16_t port){
     if(sock_is_loopback_ip(addr)){
         if(port>=6000&&port<6064)return SOCK_VIRT_X11;
-        if(port>=39010&&port<=39019)return SOCK_VIRT_WL;
-        if(port==39020||port==39021)return SOCK_VIRT_DBUS;
+        if((port>=39010&&port<=39019)||port==39099)return SOCK_VIRT_WL;
+        if(port==39020||port==39021||port==39022)return SOCK_VIRT_DBUS;
         return SOCK_VIRT_NONE;
     }
     if(sock_is_http_port(port))return SOCK_VIRT_HTTP;
@@ -1128,6 +1350,13 @@ static void dbusv_w_u32(dbusv_writer_t *w,uint32_t v){
     dbusv_wr_u32(w->buf+w->pos,v,w->le);
     w->pos+=4;
 }
+static void dbusv_w_u64(dbusv_writer_t *w,uint64_t v){
+    int i;
+    if(!w||!w->ok)return;
+    if(w->pos+8>w->cap){w->ok=false;return;}
+    for(i=0;i<8;++i)w->buf[w->pos+(size_t)i]=(uint8_t)(v>>(i*8));
+    w->pos+=8;
+}
 static void dbusv_w_bytes(dbusv_writer_t *w,const void *src,size_t n){
     if(!w||!w->ok||(!src&&n))return;
     if(w->pos+n>w->cap){w->ok=false;return;}
@@ -1180,6 +1409,7 @@ static int dbusv_sock_index(const socket_t *s){
 }
 static void dbusv_trace_method(int fd,const dbusv_msg_t *m,const char *phase){
     static uint32_t trace_count=0;
+    if(!compat_wayfire_debug_trace_enabled())return;
     if(trace_count>=160||!m)return;
     ++trace_count;
     __boot_serial_puts("[dbus-");
@@ -1206,6 +1436,7 @@ static void dbusv_trace_method(int fd,const dbusv_msg_t *m,const char *phase){
 }
 static void dbusv_trace_stream(socket_t *s,const char *phase,size_t used,size_t consumed){
     static uint32_t trace_count=0;
+    if(!compat_wayfire_debug_trace_enabled())return;
     if(trace_count>=96)return;
     ++trace_count;
     __boot_serial_puts("[dbus-stream] #");
@@ -1238,6 +1469,18 @@ static void dbusv_seed_defaults(void){
     g_dbusv_bindings[2].used=true;g_dbusv_bindings[2].owner_fd=-1;c_strlcpy(g_dbusv_bindings[2].name,"org.freedesktop.systemd1",sizeof(g_dbusv_bindings[2].name));
     g_dbusv_bindings[3].used=true;g_dbusv_bindings[3].owner_fd=-1;c_strlcpy(g_dbusv_bindings[3].name,"org.freedesktop.portal.Desktop",sizeof(g_dbusv_bindings[3].name));
     g_dbusv_bindings[4].used=true;g_dbusv_bindings[4].owner_fd=-1;c_strlcpy(g_dbusv_bindings[4].name,"org.freedesktop.portal.Settings",sizeof(g_dbusv_bindings[4].name));
+    g_dbusv_bindings[5].used=true;g_dbusv_bindings[5].owner_fd=-1;c_strlcpy(g_dbusv_bindings[5].name,"org.kde.kded6",sizeof(g_dbusv_bindings[5].name));
+    g_dbusv_bindings[6].used=true;g_dbusv_bindings[6].owner_fd=-1;c_strlcpy(g_dbusv_bindings[6].name,"org.kde.KWin",sizeof(g_dbusv_bindings[6].name));
+    g_dbusv_bindings[7].used=true;g_dbusv_bindings[7].owner_fd=-1;c_strlcpy(g_dbusv_bindings[7].name,"org.kde.plasmashell",sizeof(g_dbusv_bindings[7].name));
+    g_dbusv_bindings[8].used=true;g_dbusv_bindings[8].owner_fd=-1;c_strlcpy(g_dbusv_bindings[8].name,"org.kde.ActivityManager",sizeof(g_dbusv_bindings[8].name));
+    g_dbusv_bindings[9].used=true;g_dbusv_bindings[9].owner_fd=-1;c_strlcpy(g_dbusv_bindings[9].name,"org.kde.kglobalaccel",sizeof(g_dbusv_bindings[9].name));
+    g_dbusv_bindings[10].used=true;g_dbusv_bindings[10].owner_fd=-1;c_strlcpy(g_dbusv_bindings[10].name,"org.kde.StatusNotifierWatcher",sizeof(g_dbusv_bindings[10].name));
+    g_dbusv_bindings[11].used=true;g_dbusv_bindings[11].owner_fd=-1;c_strlcpy(g_dbusv_bindings[11].name,"org.freedesktop.PolicyKit1",sizeof(g_dbusv_bindings[11].name));
+    g_dbusv_bindings[12].used=true;g_dbusv_bindings[12].owner_fd=-1;c_strlcpy(g_dbusv_bindings[12].name,"org.freedesktop.Accounts",sizeof(g_dbusv_bindings[12].name));
+    g_dbusv_bindings[13].used=true;g_dbusv_bindings[13].owner_fd=-1;c_strlcpy(g_dbusv_bindings[13].name,"org.freedesktop.hostname1",sizeof(g_dbusv_bindings[13].name));
+    g_dbusv_bindings[14].used=true;g_dbusv_bindings[14].owner_fd=-1;c_strlcpy(g_dbusv_bindings[14].name,"org.freedesktop.locale1",sizeof(g_dbusv_bindings[14].name));
+    g_dbusv_bindings[15].used=true;g_dbusv_bindings[15].owner_fd=-1;c_strlcpy(g_dbusv_bindings[15].name,"org.freedesktop.timedate1",sizeof(g_dbusv_bindings[15].name));
+    g_dbusv_bindings[16].used=true;g_dbusv_bindings[16].owner_fd=-1;c_strlcpy(g_dbusv_bindings[16].name,"org.freedesktop.RealtimeKit1",sizeof(g_dbusv_bindings[16].name));
 }
 static int dbusv_find_binding(const char *name){
     int i;
@@ -1434,14 +1677,14 @@ static bool dbusv_body_get_u32(const dbusv_msg_t *m,size_t *off,uint32_t *v){
 static int dbusv_queue_message(socket_t *dst,uint8_t type,const char *path,const char *iface,const char *member,
                                const char *dest,const char *sender,const char *err_name,uint32_t reply_serial,
                                const char *sig,const uint8_t *body,size_t body_len){
-    uint8_t fields[2048];
-    uint8_t pkt[6144];
+    uint8_t *fields=g_dbusv_fields_scratch;
+    uint8_t *pkt=g_dbusv_packet_scratch;
     dbusv_writer_t fw;
     size_t body_off,total;
     uint32_t serial;
     if(!dst)return -EINVAL;
     dbusv_seed_defaults();
-    dbusv_w_init(&fw,fields,sizeof(fields),true);
+    dbusv_w_init(&fw,fields,sizeof(g_dbusv_fields_scratch),true);
     if(path&&path[0])dbusv_field_add_str(&fw,DBUSV_FIELD_PATH,path,'o');
     if(iface&&iface[0])dbusv_field_add_str(&fw,DBUSV_FIELD_IFACE,iface,'s');
     if(member&&member[0])dbusv_field_add_str(&fw,DBUSV_FIELD_MEMBER,member,'s');
@@ -1453,7 +1696,7 @@ static int dbusv_queue_message(socket_t *dst,uint8_t type,const char *path,const
     if(!fw.ok)return -E2BIG;
     body_off=dbusv_align(16u+fw.pos,8);
     total=body_off+body_len;
-    if(total>sizeof(pkt))return -E2BIG;
+    if(total>sizeof(g_dbusv_packet_scratch))return -E2BIG;
     c_memset(pkt,0,total);
     pkt[0]='l';
     pkt[1]=type;
@@ -1474,9 +1717,9 @@ static int dbusv_reply_void(socket_t *dst,const dbusv_msg_t *req,const char *sen
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,0,0,0);
 }
 static int dbusv_reply_u32(socket_t *dst,const dbusv_msg_t *req,uint32_t v,const char *sender){
-    uint8_t body[8];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,8,true);
     dbusv_w_align(&bw,4);
     dbusv_w_u32(&bw,v);
     if(!bw.ok)return -E2BIG;
@@ -1487,27 +1730,27 @@ static int dbusv_reply_bool(socket_t *dst,const dbusv_msg_t *req,bool v,const ch
     return dbusv_reply_u32(dst,req,v?1u:0u,sender);
 }
 static int dbusv_reply_str(socket_t *dst,const dbusv_msg_t *req,const char *s,const char *sender){
-    uint8_t body[1024];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,1024,true);
     dbusv_w_cstr(&bw,s?s:"",'s');
     if(!bw.ok)return -E2BIG;
     return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"s",body,bw.pos);
 }
 static int dbusv_reply_objpath(socket_t *dst,const dbusv_msg_t *req,const char *path,const char *sender){
-    uint8_t body[1024];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,1024,true);
     dbusv_w_cstr(&bw,path?path:"/",'o');
     if(!bw.ok)return -E2BIG;
     return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"o",body,bw.pos);
 }
 static int dbusv_reply_str4(socket_t *dst,const dbusv_msg_t *req,const char *a,const char *b,const char *c,const char *d,const char *sender){
-    uint8_t body[2048];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,2048,true);
     dbusv_w_cstr(&bw,a?a:"",'s');
     dbusv_w_cstr(&bw,b?b:"",'s');
     dbusv_w_cstr(&bw,c?c:"",'s');
@@ -1517,9 +1760,9 @@ static int dbusv_reply_str4(socket_t *dst,const dbusv_msg_t *req,const char *a,c
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"ssss",body,bw.pos);
 }
 static int dbusv_reply_variant_u32(socket_t *dst,const dbusv_msg_t *req,uint32_t v,const char *sender){
-    uint8_t body[64];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,64,true);
     dbusv_w_sig(&bw,"u");
     dbusv_w_align(&bw,4);
     dbusv_w_u32(&bw,v);
@@ -1527,10 +1770,55 @@ static int dbusv_reply_variant_u32(socket_t *dst,const dbusv_msg_t *req,uint32_t
     return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"v",body,bw.pos);
 }
-static int dbusv_reply_variant_str(socket_t *dst,const dbusv_msg_t *req,const char *s,const char *sender){
-    uint8_t body[320];
+static int dbusv_reply_variant_i32(socket_t *dst,const dbusv_msg_t *req,int32_t v,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,64,true);
+    dbusv_w_sig(&bw,"i");
+    dbusv_w_align(&bw,4);
+    dbusv_w_u32(&bw,(uint32_t)v);
+    if(!bw.ok)return -E2BIG;
+    return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
+        req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"v",body,bw.pos);
+}
+static int dbusv_reply_variant_i64(socket_t *dst,const dbusv_msg_t *req,int64_t v,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
+    dbusv_writer_t bw;
+    dbusv_w_init(&bw,body,64,true);
+    dbusv_w_sig(&bw,"x");
+    dbusv_w_align(&bw,8);
+    dbusv_w_u64(&bw,(uint64_t)v);
+    if(!bw.ok)return -E2BIG;
+    return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
+        req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"v",body,bw.pos);
+}
+static int dbusv_reply_variant_str(socket_t *dst,const dbusv_msg_t *req,const char *s,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
+    dbusv_writer_t bw;
+    dbusv_w_init(&bw,body,320,true);
+    dbusv_w_sig(&bw,"s");
+    dbusv_w_cstr(&bw,s?s:"",'s');
+    if(!bw.ok)return -E2BIG;
+    return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
+        req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"v",body,bw.pos);
+}
+static int dbusv_reply_settings_value_u32(socket_t *dst,const dbusv_msg_t *req,uint32_t v,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
+    dbusv_writer_t bw;
+    dbusv_w_init(&bw,body,64,true);
+    dbusv_w_sig(&bw,"v");
+    dbusv_w_sig(&bw,"u");
+    dbusv_w_align(&bw,4);
+    dbusv_w_u32(&bw,v);
+    if(!bw.ok)return -E2BIG;
+    return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
+        req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"v",body,bw.pos);
+}
+static int dbusv_reply_settings_value_str(socket_t *dst,const dbusv_msg_t *req,const char *s,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
+    dbusv_writer_t bw;
+    dbusv_w_init(&bw,body,320,true);
+    dbusv_w_sig(&bw,"v");
     dbusv_w_sig(&bw,"s");
     dbusv_w_cstr(&bw,s?s:"",'s');
     if(!bw.ok)return -E2BIG;
@@ -1538,20 +1826,66 @@ static int dbusv_reply_variant_str(socket_t *dst,const dbusv_msg_t *req,const ch
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"v",body,bw.pos);
 }
 static int dbusv_reply_settings_readall(socket_t *dst,const dbusv_msg_t *req,const char *sender){
-    uint8_t body[16];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    size_t outer_len_pos,outer_start,ns_len_pos,ns_start;
+    #define DBUSV_SETTINGS_SV_U32(_key,_value) do{ \
+        dbusv_w_align(&bw,8); \
+        dbusv_w_cstr(&bw,(_key),'s'); \
+        dbusv_w_sig(&bw,"v"); \
+        dbusv_w_sig(&bw,"u"); \
+        dbusv_w_align(&bw,4); \
+        dbusv_w_u32(&bw,(uint32_t)(_value)); \
+    }while(0)
+    #define DBUSV_SETTINGS_SV_STR(_key,_value) do{ \
+        dbusv_w_align(&bw,8); \
+        dbusv_w_cstr(&bw,(_key),'s'); \
+        dbusv_w_sig(&bw,"v"); \
+        dbusv_w_sig(&bw,"s"); \
+        dbusv_w_cstr(&bw,(_value),'s'); \
+    }while(0)
+    dbusv_w_init(&bw,body,sizeof(g_dbusv_body_scratch),true);
     dbusv_w_align(&bw,4);
+    outer_len_pos=bw.pos;
     dbusv_w_u32(&bw,0);
+    dbusv_w_align(&bw,8);
+    outer_start=bw.pos;
+
+    dbusv_w_align(&bw,8);
+    dbusv_w_cstr(&bw,"org.freedesktop.appearance",'s');
+    dbusv_w_align(&bw,4);
+    ns_len_pos=bw.pos;
+    dbusv_w_u32(&bw,0);
+    dbusv_w_align(&bw,8);
+    ns_start=bw.pos;
+    DBUSV_SETTINGS_SV_U32("color-scheme",0);
+    dbusv_wr_u32(body+ns_len_pos,(uint32_t)(bw.pos-ns_start),true);
+
+    dbusv_w_align(&bw,8);
+    dbusv_w_cstr(&bw,"org.freedesktop.desktop.interface",'s');
+    dbusv_w_align(&bw,4);
+    ns_len_pos=bw.pos;
+    dbusv_w_u32(&bw,0);
+    dbusv_w_align(&bw,8);
+    ns_start=bw.pos;
+    DBUSV_SETTINGS_SV_STR("gtk-theme","Adwaita");
+    DBUSV_SETTINGS_SV_STR("icon-theme","Adwaita");
+    DBUSV_SETTINGS_SV_STR("cursor-theme","Adwaita");
+    DBUSV_SETTINGS_SV_U32("cursor-size",28);
+    dbusv_wr_u32(body+ns_len_pos,(uint32_t)(bw.pos-ns_start),true);
+
     if(!bw.ok)return -E2BIG;
+    dbusv_wr_u32(body+outer_len_pos,(uint32_t)(bw.pos-outer_start),true);
+    #undef DBUSV_SETTINGS_SV_U32
+    #undef DBUSV_SETTINGS_SV_STR
     return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"a{sa{sv}}",body,bw.pos);
 }
 static int dbusv_reply_str_array(socket_t *dst,const dbusv_msg_t *req,const char **arr,int cnt,const char *sender){
-    uint8_t body[4096];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
     size_t len_pos,start,i;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,sizeof(g_dbusv_body_scratch),true);
     dbusv_w_align(&bw,4);
     len_pos=bw.pos;
     dbusv_w_u32(&bw,0);
@@ -1565,19 +1899,91 @@ static int dbusv_reply_str_array(socket_t *dst,const dbusv_msg_t *req,const char
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"as",body,bw.pos);
 }
 static int dbusv_reply_empty_dict_sv(socket_t *dst,const dbusv_msg_t *req,const char *sender){
-    uint8_t body[16];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,32,true);
     dbusv_w_align(&bw,4);
     dbusv_w_u32(&bw,0);
+    dbusv_w_align(&bw,8);
     if(!bw.ok)return -E2BIG;
     return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
         req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"a{sv}",body,bw.pos);
 }
-static int dbusv_reply_error(socket_t *dst,const dbusv_msg_t *req,const char *err_name,const char *msg,const char *sender){
-    uint8_t body[1024];
+static void dbusv_w_sv_i32(dbusv_writer_t *bw,const char *key,int32_t v){
+    dbusv_w_align(bw,8);
+    dbusv_w_cstr(bw,key,'s');
+    dbusv_w_sig(bw,"i");
+    dbusv_w_align(bw,4);
+    dbusv_w_u32(bw,(uint32_t)v);
+}
+static void dbusv_w_sv_u32(dbusv_writer_t *bw,const char *key,uint32_t v){
+    dbusv_w_align(bw,8);
+    dbusv_w_cstr(bw,key,'s');
+    dbusv_w_sig(bw,"u");
+    dbusv_w_align(bw,4);
+    dbusv_w_u32(bw,v);
+}
+static void dbusv_w_sv_i64(dbusv_writer_t *bw,const char *key,int64_t v){
+    dbusv_w_align(bw,8);
+    dbusv_w_cstr(bw,key,'s');
+    dbusv_w_sig(bw,"x");
+    dbusv_w_align(bw,8);
+    dbusv_w_u64(bw,(uint64_t)v);
+}
+static bool dbusv_is_realtime_iface(const char *iface){
+    return iface&&(
+        c_strcmp(iface,"org.freedesktop.portal.Realtime")==0||
+        c_strcmp(iface,"org.freedesktop.RealtimeKit1")==0);
+}
+static bool dbusv_is_realtime_i32_prop(const char *prop){
+    return prop&&(
+        c_strcmp(prop,"MaxRealtimePriority")==0||
+        c_strcmp(prop,"MinNiceLevel")==0);
+}
+static bool dbusv_is_realtime_i64_prop(const char *prop){
+    return prop&&c_strcmp(prop,"RTTimeUSecMax")==0;
+}
+static int dbusv_reply_realtimekit_getall(socket_t *dst,const dbusv_msg_t *req,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    size_t len_pos,start;
+    dbusv_w_init(&bw,body,sizeof(g_dbusv_body_scratch),true);
+    dbusv_w_align(&bw,4);
+    len_pos=bw.pos;
+    dbusv_w_u32(&bw,0);
+    dbusv_w_align(&bw,8);
+    start=bw.pos;
+    dbusv_w_sv_i32(&bw,"MaxRealtimePriority",20);
+    dbusv_w_sv_i32(&bw,"MinNiceLevel",-20);
+    dbusv_w_sv_i64(&bw,"RTTimeUSecMax",200000);
+    if(!bw.ok)return -E2BIG;
+    dbusv_wr_u32(body+len_pos,(uint32_t)(bw.pos-start),true);
+    return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
+        req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"a{sv}",body,bw.pos);
+}
+static int dbusv_reply_portal_realtime_getall(socket_t *dst,const dbusv_msg_t *req,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
+    dbusv_writer_t bw;
+    size_t len_pos,start;
+    dbusv_w_init(&bw,body,sizeof(g_dbusv_body_scratch),true);
+    dbusv_w_align(&bw,4);
+    len_pos=bw.pos;
+    dbusv_w_u32(&bw,0);
+    dbusv_w_align(&bw,8);
+    start=bw.pos;
+    dbusv_w_sv_i32(&bw,"MaxRealtimePriority",20);
+    dbusv_w_sv_i32(&bw,"MinNiceLevel",-20);
+    dbusv_w_sv_i64(&bw,"RTTimeUSecMax",200000);
+    dbusv_w_sv_u32(&bw,"version",1);
+    if(!bw.ok)return -E2BIG;
+    dbusv_wr_u32(body+len_pos,(uint32_t)(bw.pos-start),true);
+    return dbusv_queue_message(dst,DBUSV_MSG_METHOD_RETURN,0,0,0,
+        req&&req->sender[0]?req->sender:0,sender,0,req?req->serial:0,"a{sv}",body,bw.pos);
+}
+static int dbusv_reply_error(socket_t *dst,const dbusv_msg_t *req,const char *err_name,const char *msg,const char *sender){
+    uint8_t *body=g_dbusv_body_scratch;
+    dbusv_writer_t bw;
+    dbusv_w_init(&bw,body,1024,true);
     dbusv_w_cstr(&bw,msg?msg:"",'s');
     if(!bw.ok)return -E2BIG;
     return dbusv_queue_message(dst,DBUSV_MSG_ERROR,0,0,0,
@@ -1729,9 +2135,9 @@ static void dbusv_emit_signal_matching(const char *path,const char *iface,const 
     }
 }
 static void dbusv_emit_name_owner_changed(const char *name,const char *old_owner,const char *new_owner){
-    uint8_t body[1024];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,1024,true);
     dbusv_w_cstr(&bw,name?name:"",'s');
     dbusv_w_cstr(&bw,old_owner?old_owner:"",'s');
     dbusv_w_cstr(&bw,new_owner?new_owner:"",'s');
@@ -1740,7 +2146,7 @@ static void dbusv_emit_name_owner_changed(const char *name,const char *old_owner
         "org.freedesktop.DBus","sss",body,bw.pos,name,0);
 }
 static void dbusv_emit_name_signal(int target_fd,const char *member,const char *name){
-    uint8_t body[320];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
     const char *dest;
     socket_t *dst;
@@ -1750,7 +2156,7 @@ static void dbusv_emit_name_signal(int target_fd,const char *member,const char *
     if((dst->virt_flags&SOCK_VFLAG_DBUS_AUTH)==0||dst->virt_state==0)return;
     dest=dbusv_ensure_unique_fd(target_fd);
     if(!dest||!dest[0])return;
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,320,true);
     dbusv_w_cstr(&bw,name?name:"",'s');
     if(!bw.ok)return;
     (void)dbusv_emit_signal_to(dst,"/org/freedesktop/DBus","org.freedesktop.DBus",member,
@@ -1795,7 +2201,7 @@ static void dbusv_make_portal_handle_path(int fd,uint32_t serial,char *out,size_
     c_append_u32(out,&l,cap,serial?serial:1u);
 }
 static void dbusv_emit_portal_response(int fd,const char *handle_path){
-    uint8_t body[32];
+    uint8_t *body=g_dbusv_body_scratch;
     dbusv_writer_t bw;
     socket_t *dst;
     const char *dest;
@@ -1804,11 +2210,12 @@ static void dbusv_emit_portal_response(int fd,const char *handle_path){
     if(!dst->used||dst->virt_service!=SOCK_VIRT_DBUS)return;
     if((dst->virt_flags&SOCK_VFLAG_DBUS_AUTH)==0||dst->virt_state==0)return;
     dest=dbusv_ensure_unique_fd(fd);
-    dbusv_w_init(&bw,body,sizeof(body),true);
+    dbusv_w_init(&bw,body,32,true);
     dbusv_w_align(&bw,4);
     dbusv_w_u32(&bw,0); /* response=success */
     dbusv_w_align(&bw,4);
     dbusv_w_u32(&bw,0); /* a{sv} empty */
+    dbusv_w_align(&bw,8);
     if(!bw.ok)return;
     (void)dbusv_queue_message(dst,DBUSV_MSG_SIGNAL,handle_path,"org.freedesktop.portal.Request","Response",
         dest,"org.freedesktop.portal.Desktop",0,0,"ua{sv}",body,bw.pos);
@@ -1838,6 +2245,85 @@ static int dbusv_handle_service_method_call(socket_t *s,int fd,const dbusv_msg_t
     if(!s||!m||!member[0])return 0;
     portal=(iface&&c_starts_with(iface,"org.freedesktop.portal."))||
            (dest&&c_starts_with(dest,"org.freedesktop.portal."));
+    if((dest&&c_strcmp(dest,"org.freedesktop.RealtimeKit1")==0)||
+       (iface&&c_strcmp(iface,"org.freedesktop.RealtimeKit1")==0)){
+        const char *rt_sender="org.freedesktop.RealtimeKit1";
+        if(iface&&c_strcmp(iface,"org.freedesktop.DBus.Properties")==0){
+            size_t bo=0;
+            char prop_iface[128],prop_name[96];
+            prop_iface[0]=0;
+            prop_name[0]=0;
+            if(c_strcmp(member,"GetAll")==0){
+                (void)dbusv_body_get_str(m,&bo,prop_iface,sizeof(prop_iface));
+                return dbusv_reply_realtimekit_getall(s,m,rt_sender);
+            }
+            if(c_strcmp(member,"Get")==0){
+                (void)dbusv_body_get_str(m,&bo,prop_iface,sizeof(prop_iface));
+                (void)dbusv_body_get_str(m,&bo,prop_name,sizeof(prop_name));
+                if(c_strcmp(prop_name,"MaxRealtimePriority")==0)
+                    return dbusv_reply_variant_i32(s,m,20,rt_sender);
+                if(c_strcmp(prop_name,"MinNiceLevel")==0)
+                    return dbusv_reply_variant_i32(s,m,-20,rt_sender);
+                if(c_strcmp(prop_name,"RTTimeUSecMax")==0)
+                    return dbusv_reply_variant_i64(s,m,200000,rt_sender);
+                return dbusv_reply_variant_i32(s,m,0,rt_sender);
+            }
+        }
+        if(c_strcmp(member,"Introspect")==0)
+            return dbusv_reply_str(s,m,"<node></node>",rt_sender);
+        if(c_strcmp(member,"Ping")==0||c_starts_with(member,"MakeThread"))
+            return dbusv_reply_void(s,m,rt_sender);
+        return dbusv_reply_void(s,m,rt_sender);
+    }
+    if(iface&&c_strcmp(iface,"org.freedesktop.DBus.Properties")==0&&
+       (portal||(dest&&dest[0]))){
+        size_t bo=0;
+        char prop_iface[128],prop_name[96];
+        prop_iface[0]=0;
+        prop_name[0]=0;
+        if(c_strcmp(member,"GetAll")==0){
+            (void)dbusv_body_get_str(m,&bo,prop_iface,sizeof(prop_iface));
+            if(c_strcmp(prop_iface,"org.freedesktop.portal.Realtime")==0){
+                return dbusv_reply_portal_realtime_getall(s,m,
+                    (dest&&dest[0])?dest:"org.freedesktop.portal.Desktop");
+            }
+            if(c_strcmp(prop_iface,"org.freedesktop.RealtimeKit1")==0){
+                return dbusv_reply_realtimekit_getall(s,m,
+                    (dest&&dest[0])?dest:"org.freedesktop.RealtimeKit1");
+            }
+            return dbusv_reply_empty_dict_sv(s,m,
+                (dest&&dest[0])?dest:"org.freedesktop.portal.Desktop");
+        }
+        if(c_strcmp(member,"Get")==0){
+            (void)dbusv_body_get_str(m,&bo,prop_iface,sizeof(prop_iface));
+            (void)dbusv_body_get_str(m,&bo,prop_name,sizeof(prop_name));
+            if(dbusv_is_realtime_iface(prop_iface)){
+                const char *prop_sender=(dest&&dest[0])?dest:
+                    (c_strcmp(prop_iface,"org.freedesktop.RealtimeKit1")==0?
+                     "org.freedesktop.RealtimeKit1":"org.freedesktop.portal.Desktop");
+                if(dbusv_is_realtime_i32_prop(prop_name)){
+                    return dbusv_reply_variant_i32(s,m,
+                        c_strcmp(prop_name,"MinNiceLevel")==0?-20:20,
+                        prop_sender);
+                }
+                if(dbusv_is_realtime_i64_prop(prop_name)){
+                    return dbusv_reply_variant_i64(s,m,200000,prop_sender);
+                }
+                if(c_strcmp(prop_name,"version")==0||
+                   c_strcmp(prop_name,"Version")==0){
+                    return dbusv_reply_variant_u32(s,m,1,prop_sender);
+                }
+                return dbusv_reply_variant_i32(s,m,0,prop_sender);
+            }
+            if(c_strcmp(prop_name,"version")==0||
+               c_strcmp(prop_name,"Version")==0){
+                return dbusv_reply_variant_u32(s,m,1,
+                    (dest&&dest[0])?dest:"org.freedesktop.portal.Desktop");
+            }
+            return dbusv_reply_variant_str(s,m,"",
+                (dest&&dest[0])?dest:"org.freedesktop.portal.Desktop");
+        }
+    }
     if(portal){
         if(iface&&c_strcmp(iface,"org.freedesktop.portal.Settings")==0){
             if(c_strcmp(member,"Read")==0||c_strcmp(member,"ReadOne")==0){
@@ -1847,12 +2333,12 @@ static int dbusv_handle_service_method_call(socket_t *s,int fd,const dbusv_msg_t
                 (void)dbusv_body_get_str(m,&bo,ns,sizeof(ns));
                 (void)dbusv_body_get_str(m,&bo,key,sizeof(key));
                 if(c_strcmp(ns,"org.freedesktop.appearance")==0&&c_strcmp(key,"color-scheme")==0){
-                    return dbusv_reply_variant_u32(s,m,0,sender_name);
+                    return dbusv_reply_settings_value_u32(s,m,0,sender_name);
                 }
                 if(c_strcmp(ns,"org.freedesktop.desktop.interface")==0&&c_strcmp(key,"gtk-theme")==0){
-                    return dbusv_reply_variant_str(s,m,"Adwaita",sender_name);
+                    return dbusv_reply_settings_value_str(s,m,"Adwaita",sender_name);
                 }
-                return dbusv_reply_variant_str(s,m,"",sender_name);
+                return dbusv_reply_settings_value_str(s,m,"",sender_name);
             }
             if(c_strcmp(member,"ReadAll")==0){
                 return dbusv_reply_settings_readall(s,m,sender_name);
@@ -1893,6 +2379,53 @@ static int dbusv_handle_service_method_call(socket_t *s,int fd,const dbusv_msg_t
             return dbusv_reply_str4(s,m,"Ridux Notifications","RiduxOS","0.1","1.2","org.freedesktop.Notifications");
         }
         return dbusv_reply_void(s,m,"org.freedesktop.Notifications");
+    }
+    if((dest&&(
+            c_strcmp(dest,"org.freedesktop.login1")==0||
+            c_strcmp(dest,"org.freedesktop.systemd1")==0||
+            c_strcmp(dest,"org.freedesktop.PolicyKit1")==0||
+            c_strcmp(dest,"org.freedesktop.Accounts")==0||
+            c_strcmp(dest,"org.freedesktop.hostname1")==0||
+            c_strcmp(dest,"org.freedesktop.locale1")==0||
+            c_strcmp(dest,"org.freedesktop.timedate1")==0))||
+       (iface&&(
+            c_starts_with(iface,"org.freedesktop.login1")||
+            c_starts_with(iface,"org.freedesktop.systemd1")||
+            c_starts_with(iface,"org.freedesktop.PolicyKit1")||
+            c_starts_with(iface,"org.freedesktop.Accounts")||
+            c_starts_with(iface,"org.freedesktop.hostname1")||
+            c_starts_with(iface,"org.freedesktop.locale1")||
+            c_starts_with(iface,"org.freedesktop.timedate1")))){
+        const char *sys_sender=(dest&&dest[0])?dest:"org.freedesktop.systemd1";
+        if(iface&&c_strcmp(iface,"org.freedesktop.DBus.Properties")==0){
+            if(c_strcmp(member,"GetAll")==0)return dbusv_reply_empty_dict_sv(s,m,sys_sender);
+            if(c_strcmp(member,"Get")==0)return dbusv_reply_variant_str(s,m,"",sys_sender);
+        }
+        if(c_strcmp(member,"Introspect")==0)return dbusv_reply_str(s,m,"<node></node>",sys_sender);
+        if(c_strcmp(member,"Ping")==0)return dbusv_reply_void(s,m,sys_sender);
+        if(c_strcmp(member,"GetId")==0||c_strcmp(member,"GetMachineId")==0)
+            return dbusv_reply_str(s,m,"ridux-system",sys_sender);
+        if(c_strcmp(member,"CanPowerOff")==0||c_strcmp(member,"CanReboot")==0||
+           c_strcmp(member,"CanSuspend")==0||c_strcmp(member,"CanHibernate")==0)
+            return dbusv_reply_str(s,m,"na",sys_sender);
+        return dbusv_reply_void(s,m,sys_sender);
+    }
+    if((iface&&c_starts_with(iface,"org.kde."))||
+       (dest&&c_starts_with(dest,"org.kde."))){
+        const char *kde_sender=(dest&&dest[0])?dest:"org.kde.RiduxCompat";
+        if(c_strcmp(member,"GetVersion")==0||c_strcmp(member,"version")==0){
+            return dbusv_reply_u32(s,m,1,kde_sender);
+        }
+        if(c_strcmp(member,"GetId")==0||c_strcmp(member,"GetMachineId")==0){
+            return dbusv_reply_str(s,m,"ridux-kde-session",kde_sender);
+        }
+        if(c_strcmp(member,"Introspect")==0){
+            return dbusv_reply_str(s,m,"<node></node>",kde_sender);
+        }
+        if(c_strcmp(member,"isPlatformX11")==0||c_strcmp(member,"isPlatformWayland")==0){
+            return dbusv_reply_bool(s,m,c_strcmp(member,"isPlatformX11")==0,kde_sender);
+        }
+        return dbusv_reply_void(s,m,kde_sender);
     }
     return 0;
 }
@@ -1977,9 +2510,9 @@ static int dbusv_handle_method_call(socket_t *s,int fd,const dbusv_msg_t *m){
         return dbusv_reply_u32(s,m,result,sender);
     }
     if(c_strcmp(member,"ListNames")==0){
-        const char *names[DBUSV_BIND_MAX+SOCK_MAX];
-        int n=dbusv_collect_names(names,(int)(sizeof(names)/sizeof(names[0])));
-        return dbusv_reply_str_array(s,m,names,n,sender);
+        int n=dbusv_collect_names(g_dbusv_names_scratch,
+            (int)(sizeof(g_dbusv_names_scratch)/sizeof(g_dbusv_names_scratch[0])));
+        return dbusv_reply_str_array(s,m,g_dbusv_names_scratch,n,sender);
     }
     if(c_strcmp(member,"NameHasOwner")==0){
         size_t bo=0;
@@ -2022,7 +2555,9 @@ static int dbusv_handle_method_call(socket_t *s,int fd,const dbusv_msg_t *m){
         (void)dbusv_body_get_u32(m,&bo,&flags);
         (void)flags;
         if(dbusv_owner_fd_for_name(name)<-1){
-            if(c_starts_with(name,"org.freedesktop.portal.")||c_starts_with(name,"org.freedesktop.secrets")){
+            if(c_starts_with(name,"org.freedesktop.portal.")||
+               c_starts_with(name,"org.freedesktop.secrets")||
+               c_starts_with(name,"org.kde.")){
                 if(dbusv_add_binding(name,-1)>=0)result=1;
             }else{
                 result=1;
@@ -2213,7 +2748,7 @@ static int sock_virtual_peer_process(socket_t *client){
     }
 }
 static int sock_virtual_stream_on_send(socket_t *s,const uint8_t *buf,size_t len){
-    char req[SOCK_VIRT_REQ_SNAPSHOT_SIZE];
+    char *req=g_sock_virt_req_snapshot;
     size_t used;
     if(!s||!buf||!len||s->virt_service==SOCK_VIRT_NONE)return 0;
     if((s->virt_service==SOCK_VIRT_HTTP||s->virt_service==SOCK_VIRT_HTTPS)&&s->virt_state==1)return 0;
@@ -2222,7 +2757,7 @@ static int sock_virtual_stream_on_send(socket_t *s,const uint8_t *buf,size_t len
             if((s->virt_flags&SOCK_VFLAG_HTTP_TUNNEL)&&buf[0]==0x16u){
                 return sock_tls_queue_alert(s);
             }
-            used=sock_tx_snapshot(s,req,sizeof(req));
+            used=sock_tx_snapshot(s,req,SOCK_VIRT_REQ_SNAPSHOT_SIZE);
             if(used&&c_mem_has((const uint8_t*)req,used,"\r\n\r\n")){
                 if(c_starts_with(req,"CONNECT "))return sock_http_queue_connect_ok(s);
                 return sock_http_queue_response(s,req,used);
@@ -2230,7 +2765,7 @@ static int sock_virtual_stream_on_send(socket_t *s,const uint8_t *buf,size_t len
             break;
         case SOCK_VIRT_HTTPS:
             if(buf[0]==0x16u)return sock_tls_queue_alert(s);
-            used=sock_tx_snapshot(s,req,sizeof(req));
+            used=sock_tx_snapshot(s,req,SOCK_VIRT_REQ_SNAPSHOT_SIZE);
             if(used&&c_mem_has((const uint8_t*)req,used,"\r\n\r\n"))return sock_http_queue_response(s,req,used);
             break;
         case SOCK_VIRT_X11:
@@ -2239,7 +2774,7 @@ static int sock_virtual_stream_on_send(socket_t *s,const uint8_t *buf,size_t len
             s->virt_state=1;
             return 0;
         case SOCK_VIRT_DBUS:
-            used=sock_tx_snapshot(s,req,sizeof(req));
+            used=sock_tx_snapshot(s,req,SOCK_VIRT_REQ_SNAPSHOT_SIZE);
             return sock_dbus_on_send(s,req,used);
         default:
             break;
@@ -2253,7 +2788,9 @@ int sock_create(int domain,int type,int protocol){int i;
     if(type==3&&domain==16)type=2;
     if(type!=1&&type!=2)return -EINVAL;
     for(i=0;i<SOCK_MAX;++i)if(!g_sockets[i].used){c_memset(&g_sockets[i],0,sizeof(g_sockets[i]));
+        tcp7_drop_socket(i);
         g_sockets[i].used=true;g_sockets[i].domain=domain;g_sockets[i].type=type;
+        if(domain==2&&protocol==0)protocol=(type==1)?IP_PROTO_TCP:IP_PROTO_UDP;
         g_sockets[i].protocol=protocol;g_sockets[i].peer=-1;
         g_sockets[i].tcp_state=TCP_CLOSED;g_sockets[i].tcp_window=65535;return i;}
     return -ENOMEM;}
@@ -2290,29 +2827,67 @@ int sock_connect(int fd,uint32_t addr,uint16_t port){int lst,nsfd,rc;socket_t *c
     }
     if(c->type==2)return 0;
     if(!sock_is_loopback_ip(addr)){
-        if(c->virt_service==SOCK_VIRT_HTTP||c->virt_service==SOCK_VIRT_HTTPS){
-            c->tcp_state=TCP_ESTABLISHED;
-            c->tcp_seq=1;c->tcp_ack=1;
-            c->tcp_window=65535;
-            c->error=0;
-            if(c->virt_service==SOCK_VIRT_WL){
-                rc=wl7_attach_socket(nsfd);
-                if(rc<0){
-                    c->peer=-1;
-                    c->tcp_state=TCP_CLOSED;
-                    c->error=ECONNREFUSED;
-                    sock_close(nsfd);
-                    return -ECONNREFUSED;
-                }
-                c->virt_flags|=SOCK_VFLAG_WL_ATTACHED;
+        /* Real external TCP via TCP7 state machine + E1000 NIC */
+        if(c->type==1){
+            rc=tcp7_connect(fd,addr,port);
+            if(rc<0){
+                c->tcp_state=TCP_CLOSED;
+                c->error=ECONNREFUSED;
+                return rc;
             }
+            /* tcp7_connect sets c->tcp_state=TCP_SYN_SENT.
+             * Poll E1000 RX to process SYN-ACK and complete handshake. */
+            {
+                int attempts;
+                for(attempts=0;attempts<200;++attempts){
+                    e1000_poll_rx();
+                    if(c->tcp_state==TCP_ESTABLISHED)break;
+                    if((attempts%24)==23)tcp7_tick();
+                    {volatile int spin;for(spin=0;spin<50000;++spin)__asm__ volatile("pause");}
+                }
+            }
+            if(c->tcp_state!=TCP_ESTABLISHED){
+                /* Connection timed out or refused — keep SYN_SENT for
+                 * non-blocking sockets, fail for blocking ones. */
+                if(c->non_blocking)return -EINPROGRESS;
+                c->error=ETIMEDOUT;
+                return -ETIMEDOUT;
+            }
+            c->error=0;
             return 0;
         }
+        /* External UDP — already handled by type==2 return above */
         c->tcp_state=TCP_CLOSED;
         c->error=ECONNREFUSED;
         return -ECONNREFUSED;
     }
     lst=sock_find_listener(c->domain,addr,port);
+    if(compat_wayfire_debug_trace_enabled()&&
+       (port==39010||port==39020||port==39021||port==39099||(port>=6000&&port<6064))){
+        static uint32_t ipc_connect_trace;
+        if(ipc_connect_trace<96){
+            ++ipc_connect_trace;
+            __boot_serial_force_puts("[sock-ipc-connect!] #");
+            __boot_serial_force_putu32(ipc_connect_trace);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" dom=");
+            __boot_serial_force_putu32((uint32_t)c->domain);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)port);
+            __boot_serial_force_puts(" svc=");
+            __boot_serial_force_putu32((uint32_t)c->virt_service);
+            __boot_serial_force_puts(" lst=");
+            __boot_serial_force_putu32(lst<0?0xFFFFFFFFu:(uint32_t)lst);
+            if(lst>=0&&lst<SOCK_MAX){
+                __boot_serial_force_puts(" lst_state=");
+                __boot_serial_force_putu32((uint32_t)g_sockets[lst].tcp_state);
+                __boot_serial_force_puts(" lst_q=");
+                __boot_serial_force_putu32((uint32_t)sock_acceptq_len(&g_sockets[lst]));
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
     if(lst<0){
         if(c->virt_service==SOCK_VIRT_DBUS){
             dbusv_seed_defaults();
@@ -2361,6 +2936,24 @@ int sock_connect(int fd,uint32_t addr,uint16_t port){int lst,nsfd,rc;socket_t *c
         return 0;
     }
     l=&g_sockets[lst];
+    if(c->virt_service!=SOCK_VIRT_NONE){
+        static uint32_t virt_listener_trace;
+        if(compat_wayfire_debug_trace_enabled()&&virt_listener_trace<48){
+            ++virt_listener_trace;
+            __boot_serial_puts("[sock-virt-real-listener] fd=");
+            __boot_serial_putu32((uint32_t)fd);
+            __boot_serial_puts(" svc=");
+            __boot_serial_putu32((uint32_t)c->virt_service);
+            __boot_serial_puts(" port=");
+            __boot_serial_putu32((uint32_t)port);
+            __boot_serial_puts(" listener=");
+            __boot_serial_putu32((uint32_t)lst);
+            __boot_serial_puts("\n");
+        }
+        c->virt_service=SOCK_VIRT_NONE;
+        c->virt_state=0;
+        c->virt_flags=0;
+    }
     nsfd=sock_create(c->domain,1,c->protocol);
     if(nsfd<0)return nsfd;
     n=&g_sockets[nsfd];
@@ -2400,25 +2993,27 @@ int sock_pair_create(int domain,int type,int protocol,int out_pair[2]){int a,b;u
     if(type==1){g_sockets[a].tcp_state=TCP_ESTABLISHED;g_sockets[b].tcp_state=TCP_ESTABLISHED;}
     out_pair[0]=a;out_pair[1]=b;
     return 0;}
+static bool sock_pos_after(uint32_t a,uint32_t b){return (int32_t)(a-b)>0;}
 int sock_send_right(int fd,int pass_fd){socket_t *s,*p;uint8_t n;
     if(fd<0||fd>=SOCK_MAX||!g_sockets[fd].used)return -EBADF;
     s=&g_sockets[fd];
     if(s->peer<0||s->peer>=SOCK_MAX||!g_sockets[s->peer].used)return -EINVAL;
     p=&g_sockets[s->peer];
-    n=(uint8_t)((p->anc_head+1u)%8u);
+    n=(uint8_t)((p->anc_head+1u)%SOCK_ANCQ);
     if(n==p->anc_tail)return -EAGAIN;
     p->anc_fds[p->anc_head]=pass_fd;
     p->anc_pos[p->anc_head]=p->rx_head;
     p->anc_head=n;
+    sock_wake_socket_sleepers();
     return 0;}
 int sock_recv_right(int fd,int *pass_fd){socket_t *s;
     if(fd<0||fd>=SOCK_MAX||!g_sockets[fd].used)return -EBADF;
     if(!pass_fd)return -EFAULT;
     s=&g_sockets[fd];
     if(s->anc_head==s->anc_tail)return -EAGAIN;
-    if(s->anc_pos[s->anc_tail]!=s->rx_tail)return -EAGAIN;
+    if(sock_pos_after(s->anc_pos[s->anc_tail],s->rx_tail))return -EAGAIN;
     *pass_fd=s->anc_fds[s->anc_tail];
-    s->anc_tail=(uint8_t)((s->anc_tail+1u)%8u);
+    s->anc_tail=(uint8_t)((s->anc_tail+1u)%SOCK_ANCQ);
     return 0;}
 size_t sock_recv_limit_before_right(int fd,size_t cap){socket_t *s;uint32_t used,dist;
     if(fd<0||fd>=SOCK_MAX||!g_sockets[fd].used)return cap;
@@ -2426,7 +3021,7 @@ size_t sock_recv_limit_before_right(int fd,size_t cap){socket_t *s;uint32_t used
     if(s->type!=1)return cap;
     if(s->anc_head==s->anc_tail)return cap;
     dist=s->anc_pos[s->anc_tail]-s->rx_tail;
-    if(dist==0)return cap;
+    if((int32_t)dist<=0)return cap;
     used=s->rx_head-s->rx_tail;
     if(used>SOCK_BUF_SIZE)used=SOCK_BUF_SIZE;
     if(dist>used)return used<cap?used:cap;
@@ -2435,10 +3030,12 @@ int sock_send(int fd,const void *buf,size_t len,int flags){socket_t *s;size_t av
     if(fd<0||fd>=SOCK_MAX||!g_sockets[fd].used)return -EBADF;
     s=&g_sockets[fd];
     if(s->type==1&&s->tcp_state!=TCP_ESTABLISHED)return -ENOTCONN;
+    if(s->type==1&&s->shutdown_tx)return -EPIPE;
     p=(const uint8_t*)buf;
     if(s->type==2){
         uint32_t sip=s->local_ip;
         if(!s->remote_port)return -ENOTCONN;
+        if(!s->local_port)s->local_port=alloc_eph();
         if(!sip){
             if(sock_is_loopback_ip(s->remote_ip))sip=0x7F000001u;
             else if(g_dhcp_lease.obtained&&g_dhcp_lease.ip)sip=g_dhcp_lease.ip;
@@ -2450,8 +3047,29 @@ int sock_send(int fd,const void *buf,size_t len,int flags){socket_t *s;size_t av
             if(rc<0)return rc;
             len=(size_t)rc;
         }else if(s->remote_port==53){
-            int rc=sock_dns_reply(s,p,len);
-            if(rc<0)return rc;
+            bool got_real_dns=false;
+            if(net_is_real_external(s->remote_ip)){
+                uint32_t rx0=s->rx_head-s->rx_tail;
+                int send_rc=-1;
+                int tries;
+                for(tries=0;tries<24;++tries){
+                    send_rc=net_send_udp_frame(fd,p,len);
+                    e1000_poll_rx();
+                    if(send_rc>0)break;
+                    {volatile int spin;for(spin=0;spin<20000;++spin)__asm__ volatile("pause");}
+                }
+                if(send_rc>0){
+                    for(tries=0;tries<240;++tries){
+                        e1000_poll_rx();
+                        if((uint32_t)(s->rx_head-s->rx_tail)!=rx0){got_real_dns=true;break;}
+                        {volatile int spin;for(spin=0;spin<20000;++spin)__asm__ volatile("pause");}
+                    }
+                }
+            }
+            if(!got_real_dns){
+                int rc=sock_dns_reply(s,p,len);
+                if(rc<0)return rc;
+            }
         }else if(sock_is_loopback_ip(s->remote_ip)){
             int dst=sock_find_udp_bound(s->domain,fd,s->remote_ip,s->remote_port);
             if(dst>=0){
@@ -2461,10 +3079,16 @@ int sock_send(int fd,const void *buf,size_t len,int flags){socket_t *s;size_t av
             }else{
                 /* UDP to unbound loopback port: drop and report sent. */
             }
-        }else{
-            /* External UDP path not wired yet: drop and report sent to keep resolvers moving. */
+        }else if(net_is_real_external(s->remote_ip)){
+            /* Real external UDP via E1000 NIC */
+            net_send_udp_frame(fd,p,len);
         }
+    }else if(s->type==1&&net_is_real_external(s->remote_ip)){
+        int rc=tcp7_send(fd,p,len);
+        if(rc<0)return rc;
+        len=(size_t)rc;
     }else if(s->peer>=0&&s->peer<SOCK_MAX&&g_sockets[s->peer].used){
+        if(g_sockets[s->peer].shutdown_rx)return -EPIPE;
         len=sock_push_rx(&g_sockets[s->peer],p,len);
         if((s->virt_service==SOCK_VIRT_X11||s->virt_service==SOCK_VIRT_WL)){
             int vrc=sock_virtual_peer_process(s);
@@ -2488,6 +3112,7 @@ int sock_send(int fd,const void *buf,size_t len,int flags){socket_t *s;size_t av
 int sock_recv(int fd,void *buf,size_t len,int flags){socket_t *s;size_t av,i;uint8_t *p;uint32_t used;
     if(fd<0||fd>=SOCK_MAX||!g_sockets[fd].used)return -EBADF;
     s=&g_sockets[fd];
+    if(net_is_real_external(s->remote_ip))e1000_poll_rx();
     if(s->type==2){
         int rc=sock_pop_udp(s,buf,len,flags);
         if(rc>0){
@@ -2500,7 +3125,7 @@ int sock_recv(int fd,void *buf,size_t len,int flags){socket_t *s;size_t av,i;uin
     if(used>SOCK_BUF_SIZE)used=SOCK_BUF_SIZE;
     av=used;
     if(!av){
-        if(s->type==1&&s->tcp_state==TCP_CLOSED)return 0;
+        if(s->type==1&&(s->tcp_state==TCP_CLOSED||s->shutdown_rx))return 0;
         return(s->non_blocking||(flags&0x40))?-EAGAIN:0;
     }
     if(len>av)len=av;
@@ -2509,6 +3134,24 @@ int sock_recv(int fd,void *buf,size_t len,int flags){socket_t *s;size_t av,i;uin
     s->tcp_ack+=(uint32_t)len;
     if(g_net_iface_count>0){g_net_ifaces[0].rx_bytes+=len;g_net_ifaces[0].rx_packets++;}
     return(int)len;
+}
+int sock_shutdown(int fd,int how){socket_t *s;int peer;
+    if(fd<0||fd>=SOCK_MAX||!g_sockets[fd].used)return -EBADF;
+    if(how<0||how>2)return -EINVAL;
+    s=&g_sockets[fd];
+    if(s->type!=1)return -ENOTCONN;
+    if(how==0||how==2){
+        s->shutdown_rx=1;
+        s->rx_tail=s->rx_head;
+    }
+    if(how==1||how==2){
+        s->shutdown_tx=1;
+        peer=s->peer;
+        if(peer>=0&&peer<SOCK_MAX&&g_sockets[peer].used&&g_sockets[peer].peer==fd)
+            g_sockets[peer].shutdown_rx=1;
+    }
+    sock_wake_socket_sleepers();
+    return 0;
 }
 int sock_close(int fd){socket_t *s;int peer;
     if(fd<0||fd>=SOCK_MAX||!g_sockets[fd].used)return -EBADF;
@@ -2520,7 +3163,11 @@ int sock_close(int fd){socket_t *s;int peer;
             (void)x11_detach_socket(s->peer);
         }
     }else if(s->virt_service==SOCK_VIRT_WL){
-        (void)wl7_detach_socket(fd);
+        if(s->peer>=0&&s->peer<SOCK_MAX&&g_sockets[s->peer].used){
+            (void)wl7_detach_socket(s->peer);
+        }else{
+            (void)wl7_detach_socket(fd);
+        }
     }
     while(s->accept_head!=s->accept_tail){
         int qfd=s->accept_q[s->accept_tail];
@@ -2533,11 +3180,13 @@ int sock_close(int fd){socket_t *s;int peer;
         if(internal_bridge){
             c_memset(&g_sockets[peer],0,sizeof(g_sockets[peer]));
         }else{
+            g_sockets[peer].shutdown_rx=1;
             g_sockets[peer].peer=-1;
             if(g_sockets[peer].type==1)g_sockets[peer].tcp_state=TCP_CLOSED;
         }
+        sock_wake_socket_sleepers();
     }
-    if(s->type==1)s->tcp_state=TCP_CLOSED;
+    if(s->type==1){tcp7_drop_socket(fd);s->tcp_state=TCP_CLOSED;}
     c_memset(s,0,sizeof(*s));
     return 0;}
 int sock_setsockopt(int fd,int l,int o,const void *v,size_t n){(void)l;(void)o;(void)v;(void)n;
@@ -2623,11 +3272,12 @@ bool dns_resolve(const char *h,uint32_t *ip){int i;
     for(i=0;i<DNS_CACHE_SIZE;++i)if(g_dns_cache[i].valid&&c_strcmp(g_dns_cache[i].name,h)==0){*ip=g_dns_cache[i].ip;return true;}
     if(c_strcmp(h,"localhost")==0){*ip=c_make_ip4(127,0,0,1);return true;}
     if(c_strcmp(h,"riduxos.local")==0){*ip=c_make_ip4(10,0,2,15);return true;}
-    if(c_strcmp(h,"google.com")==0||c_strcmp(h,"www.google.com")==0||c_strcmp(h,"dns.google")==0){*ip=c_make_ip4(142,250,80,46);dns_cache_put(h,*ip,300);return true;}
-    if(c_strcmp(h,"youtube.com")==0||c_strcmp(h,"www.youtube.com")==0){*ip=c_make_ip4(142,250,184,14);dns_cache_put(h,*ip,300);return true;}
+    if(c_strcmp(h,"google.com")==0||c_strcmp(h,"dns.google")==0){*ip=c_make_ip4(142,251,129,110);dns_cache_put(h,*ip,300);return true;}
+    if(c_strcmp(h,"www.google.com")==0){*ip=c_make_ip4(142,251,151,119);dns_cache_put(h,*ip,300);return true;}
+    if(c_strcmp(h,"youtube.com")==0||c_strcmp(h,"www.youtube.com")==0){*ip=c_make_ip4(172,217,28,238);dns_cache_put(h,*ip,300);return true;}
     if(c_strcmp(h,"ytimg.com")==0||c_strcmp(h,"www.ytimg.com")==0){*ip=c_make_ip4(142,250,184,78);dns_cache_put(h,*ip,300);return true;}
-    if(c_strcmp(h,"github.com")==0||c_strcmp(h,"www.github.com")==0){*ip=c_make_ip4(140,82,112,4);dns_cache_put(h,*ip,300);return true;}
-    if(c_strcmp(h,"example.com")==0||c_strcmp(h,"www.example.com")==0){*ip=c_make_ip4(93,184,216,34);dns_cache_put(h,*ip,300);return true;}
+    if(c_strcmp(h,"github.com")==0||c_strcmp(h,"www.github.com")==0){*ip=c_make_ip4(4,228,31,150);dns_cache_put(h,*ip,300);return true;}
+    if(c_strcmp(h,"example.com")==0||c_strcmp(h,"www.example.com")==0){*ip=c_make_ip4(172,66,147,243);dns_cache_put(h,*ip,300);return true;}
     if(dns_should_synthesize(h)){
         *ip=dns_synth_ipv4(h);
         dns_cache_put(h,*ip,120);
@@ -2942,7 +3592,7 @@ void syscall_init(void) {
  * serial logging alone can turn startup into minutes. Raise these locally
  * only when chasing an early loader failure. */
 #ifndef BOOT_SYSCALL_TRACE_MAX
-#define BOOT_SYSCALL_TRACE_MAX 256
+#define BOOT_SYSCALL_TRACE_MAX 96
 #endif
 #ifndef BOOT_FUTEX_TRACE_MAX
 #define BOOT_FUTEX_TRACE_MAX 32
@@ -2952,6 +3602,7 @@ void syscall_init(void) {
 #endif
 
 static void compat_syscall_trace_enosys_print(uint64_t nr,uint64_t a0,uint64_t a1){
+    if(!compat_wayfire_debug_trace_enabled())return;
     if(g_boot_enosys_trace_count>=BOOT_ENOSYS_TRACE_MAX)return;
     ++g_boot_enosys_trace_count;
     __boot_serial_puts("[sys ENOSYS #");
@@ -2977,6 +3628,67 @@ static bool compat_sys_task_is_browser(const task_t *t){
        c_mem_has((const uint8_t*)t->name,c_strlen(t->name),"Chrome")||
        c_mem_has((const uint8_t*)t->name,c_strlen(t->name),"ThreadPool"))return true;
     return false;
+}
+
+static bool compat_sys_task_is_wayfire(const task_t *t){
+    if(!t)return false;
+    if(c_starts_with(t->exec_path,"/opt/wayfire/")||
+       c_mem_has((const uint8_t*)t->exec_path,c_strlen(t->exec_path),"/wayfire")||
+       c_mem_has((const uint8_t*)t->exec_path,c_strlen(t->exec_path),"/wf-")||
+       c_mem_has((const uint8_t*)t->exec_path,c_strlen(t->exec_path),"/wf-shell")||
+       c_mem_has((const uint8_t*)t->exec_path,c_strlen(t->exec_path),"/wcm"))return true;
+    if(c_mem_has((const uint8_t*)t->name,c_strlen(t->name),"wayfire")||
+       c_mem_has((const uint8_t*)t->name,c_strlen(t->name),"wf-")||
+       c_mem_has((const uint8_t*)t->name,c_strlen(t->name),"wf-shell")||
+       c_mem_has((const uint8_t*)t->name,c_strlen(t->name),"wcm"))return true;
+    return false;
+}
+
+static volatile uint32_t g_wayfire_after_keymap_trace;
+static uint32_t g_wayfire_after_keymap_trace_count;
+#define COMPAT_SYSCALL_PENDING_RC (-0x7fffffffffffffffLL - 1LL)
+
+void compat_syscall_trace_wayfire_after_keymap(void){
+    if(g_wayfire_after_keymap_trace)return;
+    g_wayfire_after_keymap_trace=1;
+    __boot_serial_force_puts("[wf-post-keymap-sys-start!]\n");
+}
+
+static bool compat_syscall_trace_wayfire_after_keymap_on(const task_t *cur){
+    return g_wayfire_after_keymap_trace &&
+           g_wayfire_after_keymap_trace_count<260u &&
+           compat_sys_task_is_wayfire(cur);
+}
+
+static void compat_syscall_trace_wayfire_after_keymap_print(const char *tag,
+        const task_t *cur,uint64_t nr,uint64_t a0,uint64_t a1,int64_t rc){
+    if(!compat_syscall_trace_wayfire_after_keymap_on(cur))return;
+    ++g_wayfire_after_keymap_trace_count;
+    __boot_serial_force_puts(tag);
+    __boot_serial_force_puts(" #");
+    __boot_serial_force_putu32(g_wayfire_after_keymap_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    if(cur&&cur->name[0]){
+        __boot_serial_force_puts(" name=");
+        __boot_serial_force_puts(cur->name);
+    }
+    __boot_serial_force_puts(" nr=");
+    __boot_serial_force_putu32((uint32_t)nr);
+    __boot_serial_force_puts(" rc=");
+    if(rc==COMPAT_SYSCALL_PENDING_RC){
+        __boot_serial_force_puts("pending");
+    }else if(rc<0){
+        __boot_serial_force_puts("-");
+        __boot_serial_force_putu32((uint32_t)(-rc));
+    }else{
+        __boot_serial_force_puthex64((uint64_t)rc);
+    }
+    __boot_serial_force_puts(" a0=");
+    __boot_serial_force_puthex64(a0);
+    __boot_serial_force_puts(" a1=");
+    __boot_serial_force_puthex64(a1);
+    __boot_serial_force_puts("\n");
 }
 
 static bool compat_syscall_is_browser_interesting(uint64_t nr,int64_t rc){
@@ -3040,12 +3752,183 @@ static void compat_syscall_trace_browser_force(uint64_t nr,uint64_t a0,uint64_t 
     __boot_serial_force_puts("\n");
 }
 
+static bool compat_syscall_is_wayfire_interesting(uint64_t nr,int64_t rc){
+    if(rc<0)return true;
+    switch(nr){
+        case 0:   /* read */
+        case 1:   /* write */
+        case 2:   /* open */
+        case 3:   /* close */
+        case 7:   /* poll */
+        case 9:   /* mmap */
+        case 10:  /* mprotect */
+        case 11:  /* munmap */
+        case 16:  /* ioctl */
+        case 25:  /* mremap */
+        case 28:  /* madvise */
+        case 41:  /* socket */
+        case 49:  /* bind */
+        case 50:  /* listen */
+        case 53:  /* socketpair */
+        case 56:  /* clone */
+        case 59:  /* execve */
+        case 60:  /* exit */
+        case 61:  /* wait4 */
+        case 72:  /* fcntl */
+        case 158: /* arch_prctl */
+        case 202: /* futex */
+        case 217: /* getdents64 */
+        case 218: /* set_tid_address */
+        case 228: /* clock_gettime */
+        case 231: /* exit_group */
+        case 232: /* epoll_wait */
+        case 233: /* epoll_ctl */
+        case 257: /* openat */
+        case 262: /* newfstatat */
+        case 273: /* set_robust_list */
+        case 274: /* get_robust_list */
+        case 281: /* epoll_pwait */
+        case 283: /* timerfd_create */
+        case 286: /* timerfd_settime */
+        case 289: /* signalfd4 */
+        case 290: /* eventfd2 */
+        case 291: /* epoll_create1 */
+        case 292: /* dup3 */
+        case 293: /* pipe2 */
+        case 302: /* prlimit64 */
+        case 318: /* getrandom */
+        case 319: /* memfd_create */
+        case 332: /* statx */
+        case 334: /* rseq */
+        case 441: /* epoll_pwait2 */
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool compat_wayfire_debug_trace_enabled(void);
+
+static void compat_syscall_trace_wayfire_force(uint64_t nr,uint64_t a0,uint64_t a1,int64_t rc){
+    static uint32_t wayfire_sys_trace_count;
+    task_t *cur=task_current();
+    bool early=wayfire_sys_trace_count<220u;
+    if(!compat_wayfire_debug_trace_enabled())return;
+    if(wayfire_sys_trace_count>=900u)return;
+    if(!compat_sys_task_is_wayfire(cur))return;
+    if(!early&&!compat_syscall_is_wayfire_interesting(nr,rc))return;
+    ++wayfire_sys_trace_count;
+    __boot_serial_force_puts("[wsys!] pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    if(cur->name[0]){
+        __boot_serial_force_puts(" name=");
+        __boot_serial_force_puts(cur->name);
+    }
+    __boot_serial_force_puts(" nr=");
+    __boot_serial_force_putu32((uint32_t)nr);
+    __boot_serial_force_puts(" rc=");
+    if(rc<0){
+        __boot_serial_force_puts("-");
+        __boot_serial_force_putu32((uint32_t)(-rc));
+    }else{
+        __boot_serial_force_puthex64((uint64_t)rc);
+    }
+    __boot_serial_force_puts(" a0=");
+    __boot_serial_force_puthex64(a0);
+    __boot_serial_force_puts(" a1=");
+    __boot_serial_force_puthex64(a1);
+    __boot_serial_force_puts("\n");
+}
+
+static bool compat_syscall_trace_is_ridux_ui(uint64_t nr){
+    return nr>=500u&&nr<=505u;
+}
+
+static bool compat_ridux_native_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0)cached=kvfs_exists("/etc/ridux-native-debug.enable")?1:0;
+    return cached!=0;
+}
+
+static void compat_syscall_trace_ridux_force(const char *tag,uint64_t nr,uint64_t a0,uint64_t a1,int64_t rc){
+    static uint32_t ridux_sys_trace_count;
+    task_t *cur=task_current();
+    if(!compat_syscall_trace_is_ridux_ui(nr))return;
+    if(!compat_ridux_native_debug_trace_enabled())return;
+    if(ridux_sys_trace_count>=96u)return;
+    ++ridux_sys_trace_count;
+    __boot_serial_force_puts(tag);
+    __boot_serial_force_puts(" #");
+    __boot_serial_force_putu32(ridux_sys_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    if(cur&&cur->name[0]){
+        __boot_serial_force_puts(" name=");
+        __boot_serial_force_puts(cur->name);
+    }
+    __boot_serial_force_puts(" nr=");
+    __boot_serial_force_putu32((uint32_t)nr);
+    __boot_serial_force_puts(" rc=");
+    if(rc==COMPAT_SYSCALL_PENDING_RC){
+        __boot_serial_force_puts("pending");
+    }else if(rc<0){
+        __boot_serial_force_puts("-");
+        __boot_serial_force_putu32((uint32_t)(-rc));
+    }else{
+        __boot_serial_force_puthex64((uint64_t)rc);
+    }
+    __boot_serial_force_puts(" a0=");
+    __boot_serial_force_puthex64(a0);
+    __boot_serial_force_puts(" a1=");
+    __boot_serial_force_puthex64(a1);
+    __boot_serial_force_puts("\n");
+}
+
+static bool compat_wayfire_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0)cached=kvfs_exists("/etc/ridux-wayfire-debug.enable")?1:0;
+    return cached!=0;
+}
+
 int64_t syscall_dispatch(uint64_t nr,uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint64_t a4,uint64_t a5) {
     int64_t rc;
+    task_t *post_keymap_trace_task;
+    task_t *cur_for_hypr_trace;
+    bool trace_hypr_sys=false;
     bool is_futex = (nr == 202);
-    bool do_trace = (g_boot_syscall_trace_count < BOOT_SYSCALL_TRACE_MAX) &&
-                    (!is_futex || g_boot_futex_trace_count < BOOT_FUTEX_TRACE_MAX);
+    bool do_trace = compat_wayfire_debug_trace_enabled() &&
+                    (g_boot_syscall_trace_count < BOOT_SYSCALL_TRACE_MAX) &&
+                    (!is_futex || g_boot_futex_trace_count < BOOT_FUTEX_TRACE_MAX) &&
+                    !compat_syscall_trace_is_ridux_ui(nr);
+    bool trace_ipc_loop = (nr==7||nr==43||nr==48||nr==213||nr==232||nr==233||
+                           nr==270||nr==271||nr==281||nr==288||nr==291||nr==441);
     task_capture_syscall_user_context();
+    post_keymap_trace_task=task_current();
+    cur_for_hypr_trace=post_keymap_trace_task;
+    if(compat_wayfire_debug_trace_enabled()&&
+       cur_for_hypr_trace&&compat_task_name_contains(cur_for_hypr_trace,"Hyprland")){
+        static uint32_t hypr_exec_ioctl_count;
+        static uint32_t hypr_post_exec_sys_count;
+        if(nr==16&&((uint32_t)a1&0xFFu)==66u)
+            ++hypr_exec_ioctl_count;
+        if(hypr_exec_ioctl_count>=1u&&hypr_post_exec_sys_count<128u){
+            ++hypr_post_exec_sys_count;
+            trace_hypr_sys=true;
+            __boot_serial_force_puts("[hypr-sys>] #");
+            __boot_serial_force_putu32(hypr_post_exec_sys_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur_for_hypr_trace->pid);
+            __boot_serial_force_puts(" nr=");
+            __boot_serial_force_putu32((uint32_t)nr);
+            __boot_serial_force_puts(" a0=");
+            __boot_serial_force_puthex64(a0);
+            __boot_serial_force_puts(" a1=");
+            __boot_serial_force_puthex64(a1);
+            __boot_serial_force_puts(" a2=");
+            __boot_serial_force_puthex64(a2);
+            __boot_serial_force_puts("\n");
+        }
+    }
     if (is_futex && g_boot_futex_trace_count < 0xFFFFFFFFu) ++g_boot_futex_trace_count;
     if (do_trace) {
         ++g_boot_syscall_trace_count;
@@ -3060,6 +3943,7 @@ int64_t syscall_dispatch(uint64_t nr,uint64_t a0,uint64_t a1,uint64_t a2,uint64_
         __boot_serial_puts(" ...\n");
     }
     if(nr>=SYSCALL_MAX||!g_syscall_table[nr]){
+        compat_syscall_trace_wayfire_after_keymap_print("[wf-postsys>]",post_keymap_trace_task,nr,a0,a1,COMPAT_SYSCALL_PENDING_RC);
         compat_syscall_trace_note(nr,a0,-ENOSYS);
         if (do_trace) {
             __boot_serial_puts("[sys]   -> ENOSYS (nr=");
@@ -3071,9 +3955,43 @@ int64_t syscall_dispatch(uint64_t nr,uint64_t a0,uint64_t a1,uint64_t a2,uint64_
         task_browser_coop_yield_after_syscall(nr);
         task_restore_current_user_msrs();
         compat_syscall_trace_browser_force(nr,a0,a1,-ENOSYS);
+        compat_syscall_trace_wayfire_force(nr,a0,a1,-ENOSYS);
+        compat_syscall_trace_ridux_force("[r3sys<]",nr,a0,a1,-ENOSYS);
+        compat_syscall_trace_wayfire_after_keymap_print("[wf-postsys<]",post_keymap_trace_task,nr,a0,a1,-ENOSYS);
+        if(trace_ipc_loop&&compat_wayfire_debug_trace_enabled()){
+            static uint32_t ipc_sys_trace;
+            task_t *cur=task_current();
+            if(ipc_sys_trace<160){
+                ++ipc_sys_trace;
+                __boot_serial_force_puts("[ipc-sys!] #");
+                __boot_serial_force_putu32(ipc_sys_trace);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+                if(cur&&cur->name[0]){__boot_serial_force_puts(" name=");__boot_serial_force_puts(cur->name);}
+                __boot_serial_force_puts(" nr=");
+                __boot_serial_force_putu32((uint32_t)nr);
+                __boot_serial_force_puts(" rc=-38 a0=");
+                __boot_serial_force_puthex64(a0);
+                __boot_serial_force_puts(" a1=");
+                __boot_serial_force_puthex64(a1);
+                __boot_serial_force_puts("\n");
+            }
+        }
         return -ENOSYS;
     }
+    compat_syscall_trace_wayfire_after_keymap_print("[wf-postsys>]",post_keymap_trace_task,nr,a0,a1,COMPAT_SYSCALL_PENDING_RC);
+    compat_syscall_trace_ridux_force("[r3sys>]",nr,a0,a1,COMPAT_SYSCALL_PENDING_RC);
     rc=g_syscall_table[nr](a0,a1,a2,a3,a4,a5);
+    if(trace_hypr_sys){
+        __boot_serial_force_puts("[hypr-sys<] nr=");
+        __boot_serial_force_putu32((uint32_t)nr);
+        __boot_serial_force_puts(" rc=");
+        if(rc<0){__boot_serial_force_puts("-");__boot_serial_force_putu32((uint32_t)(-rc));}
+        else __boot_serial_force_puthex64((uint64_t)rc);
+        __boot_serial_force_puts("\n");
+    }
+    compat_syscall_trace_wayfire_after_keymap_print("[wf-postsys<]",post_keymap_trace_task,nr,a0,a1,rc);
+    compat_syscall_trace_ridux_force("[r3sys<]",nr,a0,a1,rc);
     compat_syscall_trace_note(nr,a0,rc);
     if (rc == -ENOSYS && !do_trace) {
         compat_syscall_trace_enosys_print(nr,a0,a1);
@@ -3089,8 +4007,50 @@ int64_t syscall_dispatch(uint64_t nr,uint64_t a0,uint64_t a1,uint64_t a2,uint64_
         __boot_serial_puts("\n");
     }
     compat_syscall_trace_browser_force(nr,a0,a1,rc);
+    compat_syscall_trace_wayfire_force(nr,a0,a1,rc);
+    if(trace_ipc_loop&&compat_wayfire_debug_trace_enabled()){
+        static uint32_t ipc_sys_trace;
+        task_t *cur=task_current();
+        if(ipc_sys_trace<240){
+            ++ipc_sys_trace;
+            __boot_serial_force_puts("[ipc-sys!] #");
+            __boot_serial_force_putu32(ipc_sys_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+            if(cur&&cur->name[0]){__boot_serial_force_puts(" name=");__boot_serial_force_puts(cur->name);}
+            __boot_serial_force_puts(" nr=");
+            __boot_serial_force_putu32((uint32_t)nr);
+            __boot_serial_force_puts(" rc=");
+            if(rc<0){__boot_serial_force_puts("-");__boot_serial_force_putu32((uint32_t)(-rc));}
+            else __boot_serial_force_puthex64((uint64_t)rc);
+            __boot_serial_force_puts(" a0=");
+            __boot_serial_force_puthex64(a0);
+            __boot_serial_force_puts(" a1=");
+            __boot_serial_force_puthex64(a1);
+            __boot_serial_force_puts("\n");
+        }
+    }
     task_browser_coop_yield_after_syscall(nr);
+    if(trace_hypr_sys){
+        __boot_serial_force_puts("[hypr-sys-retmsr>] nr=");
+        __boot_serial_force_putu32((uint32_t)nr);
+        __boot_serial_force_puts("\n");
+    }
     task_restore_current_user_msrs();
+    if(trace_hypr_sys){
+        uint64_t *sf=task_syscall_user_frame(cur_for_hypr_trace);
+        __boot_serial_force_puts("[hypr-sys-return] nr=");
+        __boot_serial_force_putu32((uint32_t)nr);
+        if(sf){
+            __boot_serial_force_puts(" rip=");
+            __boot_serial_force_puthex64(sf[17]);
+            __boot_serial_force_puts(" rflags=");
+            __boot_serial_force_puthex64(sf[19]);
+            __boot_serial_force_puts(" rsp=");
+            __boot_serial_force_puthex64(sf[20]);
+        }
+        __boot_serial_force_puts("\n");
+    }
     return rc;
 }
 
@@ -3269,10 +4229,12 @@ int vdev_generate_proc_net_dev(char *b,int mx){size_t l=0;int i;b[0]=0;
 int vdev_generate_sys_kernel_hostname(char *b,int mx){size_t l=0;b[0]=0;c_append_str(b,&l,(size_t)mx,"ridux\n");return(int)l;}
 int vdev_generate_sys_kernel_osrelease(char *b,int mx){size_t l=0;b[0]=0;c_append_str(b,&l,(size_t)mx,"1.0.0-ridux\n");return(int)l;}
 
-/* DRM + evdev + ALSA stubs */
+/* Framebuffer, input and sound device state used by the Linux ABI. */
 drm_mode_t g_drm_mode;
 evdev_device_t g_evdev_kbd;
 evdev_device_t g_evdev_mouse;
+static uint64_t g_evdev_time_usec;
+static uint64_t g_evdev_boot_tsc;
 
 typedef struct {
     uint8_t *address;
@@ -3305,15 +4267,225 @@ void drm_init(void){
         g_drm_mode.fb_size=g_drm_mode.pitch*g_drm_mode.height;
     }
 }
-void evdev_init(void){c_memset(&g_evdev_kbd,0,sizeof(g_evdev_kbd));c_memset(&g_evdev_mouse,0,sizeof(g_evdev_mouse));}
+static inline uint64_t evdev_rdtsc(void){
+    uint32_t lo,hi;
+    __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));
+    return((uint64_t)hi<<32)|lo;
+}
+static uint64_t evdev_now_usec(void){
+    timespec_t ts;
+    if(real_sys_clock_gettime(1,&ts)==0&&ts.tv_sec>=0&&ts.tv_nsec>=0)
+        return(uint64_t)ts.tv_sec*1000000ULL+(uint64_t)ts.tv_nsec/1000ULL;
+    {
+        uint64_t now=evdev_rdtsc();
+        uint64_t delta;
+        if(!g_evdev_boot_tsc)g_evdev_boot_tsc=now;
+        delta=now-g_evdev_boot_tsc;
+        return(delta*1000000ULL)/3000000000ULL;
+    }
+}
+void evdev_init(void){
+    c_memset(&g_evdev_kbd,0,sizeof(g_evdev_kbd));
+    c_memset(&g_evdev_mouse,0,sizeof(g_evdev_mouse));
+    g_evdev_time_usec=0;
+    g_evdev_boot_tsc=evdev_rdtsc();
+}
+static bool evdev_ref_matches(int got,int want){
+    if(want<0)return true;
+    if(got==want)return true;
+    return want==1&&got==2;
+}
+
+static bool evdev_task_fd_waits_input_ref(const task_t *t,int fd,int depth,int ref){
+    real_fd_t fe;
+    int i;
+    if(!t||fd<0||fd>=TASK_FD_MAX)return false;
+    fe=t->fdt.fds[fd];
+    if(fe.kind==FDKIND_DEVINPUT)return evdev_ref_matches(fe.ref,ref);
+    if(fe.kind!=FDKIND_EPOLL||depth>=4)return false;
+    if(fe.ref<0||fe.ref>=EPOLL_INSTANCES||!g_epoll_instances[fe.ref].used)return false;
+    for(i=0;i<g_epoll_instances[fe.ref].count;++i){
+        epoll_item_t *it=&g_epoll_instances[fe.ref].items[i];
+        if(!it->used)continue;
+        if(evdev_task_fd_waits_input_ref(t,it->fd,depth+1,ref))return true;
+    }
+    return false;
+}
+
+static bool evdev_task_waits_input_ref(const task_t *t,int ref){
+    int fd;
+    if(!t||!t->used)return false;
+    if(t->state==TASK_FREE||t->state==TASK_ZOMBIE)return false;
+    for(fd=0;fd<TASK_FD_MAX;++fd)
+        if(evdev_task_fd_waits_input_ref(t,fd,0,ref))return true;
+    return false;
+}
+
+static int evdev_device_ref(const evdev_device_t *d){
+    if(d==&g_evdev_mouse)return 1;
+    return 0;
+}
+
+static void evdev_wake_input_sleepers(int ref){
+    address_space_t *owner_as[TASK_MAX];
+    int owner_tgid[TASK_MAX];
+    int as_count=0,tgid_count=0;
+    int ti,i;
+    uint32_t woke=0;
+    bool prefer_wayfire=false;
+    for(ti=0;ti<TASK_MAX;++ti){
+        task_t *t=&g_tasks[ti];
+        if(!evdev_task_waits_input_ref(t,ref))continue;
+        if(compat_sys_task_is_wayfire(t)){prefer_wayfire=true;break;}
+    }
+    for(ti=0;ti<TASK_MAX;++ti){
+        task_t *t=&g_tasks[ti];
+        int tgid;
+        bool seen;
+        if(!evdev_task_waits_input_ref(t,ref))continue;
+        if(prefer_wayfire&&!compat_sys_task_is_wayfire(t))continue;
+        if(t->addr_space){
+            seen=false;
+            for(i=0;i<as_count;++i)if(owner_as[i]==t->addr_space){seen=true;break;}
+            if(!seen&&as_count<TASK_MAX)owner_as[as_count++]=t->addr_space;
+        }
+        tgid=t->tgid?t->tgid:t->pid;
+        if(tgid>0){
+            seen=false;
+            for(i=0;i<tgid_count;++i)if(owner_tgid[i]==tgid){seen=true;break;}
+            if(!seen&&tgid_count<TASK_MAX)owner_tgid[tgid_count++]=tgid;
+        }
+    }
+    for(ti=0;ti<TASK_MAX;++ti){
+        task_t *t=&g_tasks[ti];
+        bool related=false;
+        int tgid;
+        if(!t->used||t->state!=TASK_SLEEPING)continue;
+        if(evdev_task_waits_input_ref(t,ref)&&
+           (!prefer_wayfire||compat_sys_task_is_wayfire(t)))related=true;
+        if(!related&&prefer_wayfire&&compat_sys_task_is_wayfire(t))related=true;
+        if(!related&&t->addr_space){
+            for(i=0;i<as_count;++i){
+                if(owner_as[i]==t->addr_space){related=true;break;}
+            }
+        }
+        tgid=t->tgid?t->tgid:t->pid;
+        if(!related&&tgid>0){
+            for(i=0;i<tgid_count;++i){
+                if(owner_tgid[i]==tgid){related=true;break;}
+            }
+        }
+        if(!related)continue;
+        if(task_make_runnable(ti)){
+            ++woke;
+#if 0
+            static uint32_t evdev_wake_trace;
+            if(evdev_wake_trace<128u){
+                ++evdev_wake_trace;
+                __boot_serial_force_puts("[evdev-wake!] #");
+                __boot_serial_force_putu32(evdev_wake_trace);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)t->pid);
+                if(t->name[0]){
+                    __boot_serial_force_puts(" name=");
+                    __boot_serial_force_puts(t->name);
+                }
+                __boot_serial_force_puts(" tgid=");
+                __boot_serial_force_putu32((uint32_t)tgid);
+                __boot_serial_force_puts(" owners_as=");
+                __boot_serial_force_putu32((uint32_t)as_count);
+                __boot_serial_force_puts(" owners_tgid=");
+                __boot_serial_force_putu32((uint32_t)tgid_count);
+                __boot_serial_force_puts("\n");
+            }
+#endif
+        }
+    }
+#if 0
+    {
+        static uint32_t evdev_wake_summary_trace;
+        if(evdev_wake_summary_trace<64u){
+            ++evdev_wake_summary_trace;
+            __boot_serial_force_puts("[evdev-wake-sum!] #");
+            __boot_serial_force_putu32(evdev_wake_summary_trace);
+            __boot_serial_force_puts(" owners_as=");
+            __boot_serial_force_putu32((uint32_t)as_count);
+            __boot_serial_force_puts(" owners_tgid=");
+            __boot_serial_force_putu32((uint32_t)tgid_count);
+            __boot_serial_force_puts(" woke=");
+            __boot_serial_force_putu32(woke);
+            __boot_serial_force_puts("\n");
+        }
+    }
+#endif
+    (void)woke;
+}
+#if 0
+static void evdev_trace_i32(int32_t v){
+    if(v<0){
+        __boot_serial_force_puts("-");
+        __boot_serial_force_putu32((uint32_t)(-v));
+    }else{
+        __boot_serial_force_putu32((uint32_t)v);
+    }
+}
+#endif
+static void evdev_push_event_raw(evdev_device_t *d,uint16_t type,uint16_t code,int32_t value,bool wake){
+    int next;
+    uint64_t usec;
+    if(!d)return;
+    next=(d->head+1)%INPUT_EVENT_RING;
+    if(next==d->tail)return;
+    usec=evdev_now_usec();
+    if(usec<=g_evdev_time_usec)usec=g_evdev_time_usec+1ULL;
+    g_evdev_time_usec=usec;
+    d->events[d->head].time_sec=usec/1000000ULL;
+    d->events[d->head].time_usec=usec%1000000ULL;
+    d->events[d->head].type=type;
+    d->events[d->head].code=code;
+    d->events[d->head].value=value;
+    d->head=next;
+#if 0
+    if(type==EV_KEY||type==EV_REL){
+        static uint32_t evdev_push_trace;
+        if(evdev_push_trace<96u){
+            ++evdev_push_trace;
+            __boot_serial_force_puts("[evdev-push!] #");
+            __boot_serial_force_putu32(evdev_push_trace);
+            __boot_serial_force_puts(d==&g_evdev_mouse?" dev=mouse":" dev=kbd");
+            __boot_serial_force_puts(" type=");
+            __boot_serial_force_putu32((uint32_t)type);
+            __boot_serial_force_puts(" code=");
+            __boot_serial_force_putu32((uint32_t)code);
+            __boot_serial_force_puts(" val=");
+            evdev_trace_i32(value);
+            __boot_serial_force_puts(" head=");
+            __boot_serial_force_putu32((uint32_t)d->head);
+            __boot_serial_force_puts(" tail=");
+            __boot_serial_force_putu32((uint32_t)d->tail);
+            __boot_serial_force_puts("\n");
+        }
+    }
+#endif
+    if(wake)evdev_wake_input_sleepers(evdev_device_ref(d));
+}
 void evdev_push_key(uint16_t code,int32_t value){
-    evdev_device_t *d=&g_evdev_kbd;int next=(d->head+1)%INPUT_EVENT_RING;
-    if(next==d->tail)return;d->events[d->head].type=EV_KEY;d->events[d->head].code=code;
-    d->events[d->head].value=value;d->head=next;}
+    evdev_push_event_raw(&g_evdev_kbd,EV_KEY,code,value,false);
+    evdev_push_event_raw(&g_evdev_kbd,EV_SYN,SYN_REPORT,0,true);
+}
+void evdev_push_mouse_key(uint16_t code,int32_t value){
+    evdev_push_event_raw(&g_evdev_mouse,EV_KEY,code,value,false);
+    evdev_push_event_raw(&g_evdev_mouse,EV_SYN,SYN_REPORT,0,true);
+}
 void evdev_push_rel(uint16_t code,int32_t value){
-    evdev_device_t *d=&g_evdev_mouse;int next=(d->head+1)%INPUT_EVENT_RING;
-    if(next==d->tail)return;d->events[d->head].type=EV_REL;d->events[d->head].code=code;
-    d->events[d->head].value=value;d->head=next;}
+    evdev_push_event_raw(&g_evdev_mouse,EV_REL,code,value,false);
+    evdev_push_event_raw(&g_evdev_mouse,EV_SYN,SYN_REPORT,0,true);
+}
+void evdev_push_rel_xy(int32_t dx,int32_t dy){
+    if(dx)evdev_push_event_raw(&g_evdev_mouse,EV_REL,0,(int32_t)dx,false);
+    if(dy)evdev_push_event_raw(&g_evdev_mouse,EV_REL,1,(int32_t)dy,false);
+    evdev_push_event_raw(&g_evdev_mouse,EV_SYN,SYN_REPORT,0,true);
+}
 
 /* epoll/poll/select stubs */
 epoll_instance_t g_epoll_instances[EPOLL_INSTANCES];
@@ -3412,6 +4584,80 @@ static void cmd_nslookup(const char *a,char *o,int mx){size_t l=0;uint32_t ip;o[
     if(!a||!*a){c_append_str(o,&l,(size_t)mx,"usage: nslookup <hostname>\n");return;}
     if(dns_resolve(a,&ip)){c_append_str(o,&l,(size_t)mx,a);c_append_str(o,&l,(size_t)mx," => ");c_append_ip4(o,&l,(size_t)mx,ip);c_append_ch(o,&l,(size_t)mx,'\n');}
     else{c_append_str(o,&l,(size_t)mx,"nslookup: could not resolve ");c_append_str(o,&l,(size_t)mx,a);c_append_ch(o,&l,(size_t)mx,'\n');}}
+
+static void cmd_tcpget(const char *a,char *o,int mx){
+    char host[128];
+    char path[128];
+    char req[384];
+    char tmp[512];
+    size_t l=0,hi=0,pi=0,rl=0;
+    const char *p=a;
+    uint32_t ip=0;
+    uint32_t gw=0;
+    uint8_t gw_mac[6];
+    int fd,rc,tries,got=0;
+    o[0]=0;host[0]=0;path[0]='/';path[1]=0;
+    if(!p||!*p)p="example.com/";
+    if(c_strncmp(p,"http://",7)==0)p+=7;
+    while(*p&&*p!='/'&&*p!=' '&&hi+1<sizeof(host))host[hi++]=*p++;
+    host[hi]=0;
+    if(*p=='/'){
+        while(*p&&*p!=' '&&pi+1<sizeof(path))path[pi++]=*p++;
+        path[pi]=0;
+    }
+    if(!host[0]){c_append_str(o,&l,(size_t)mx,"tcpget: usage tcpget <host>/<path>\n");return;}
+    if(!dns_resolve(host,&ip)){c_append_str(o,&l,(size_t)mx,"tcpget: dns failed\n");return;}
+    gw=net_get_gateway_ip(ip);
+    c_append_str(o,&l,(size_t)mx,"tcpget: ");c_append_str(o,&l,(size_t)mx,host);
+    c_append_str(o,&l,(size_t)mx," -> ");c_append_ip4(o,&l,(size_t)mx,ip);c_append_ch(o,&l,(size_t)mx,'\n');
+    fd=sock_create(2,1,0);
+    if(fd<0){c_append_str(o,&l,(size_t)mx,"socket failed\n");return;}
+    g_sockets[fd].non_blocking=true;
+    rc=sock_connect(fd,ip,80);
+    c_append_str(o,&l,(size_t)mx,"connect rc=");c_append_i32(o,&l,(size_t)mx,rc);
+    c_append_str(o,&l,(size_t)mx," state=");c_append_u32(o,&l,(size_t)mx,(uint32_t)g_sockets[fd].tcp_state);c_append_ch(o,&l,(size_t)mx,'\n');
+    for(tries=0;tries<3000&&g_sockets[fd].tcp_state==TCP_SYN_SENT;++tries){
+        e1000_poll_rx();
+        if((tries&15)==15)tcp7_tick();
+        {volatile int spin;for(spin=0;spin<20000;++spin)__asm__ volatile("pause");}
+    }
+    c_append_str(o,&l,(size_t)mx,"after pump state=");c_append_u32(o,&l,(size_t)mx,(uint32_t)g_sockets[fd].tcp_state);
+    c_append_str(o,&l,(size_t)mx," err=");c_append_i32(o,&l,(size_t)mx,g_sockets[fd].error);c_append_ch(o,&l,(size_t)mx,'\n');
+    c_append_str(o,&l,(size_t)mx,"gateway ");c_append_ip4(o,&l,(size_t)mx,gw);
+    if(arp_resolve(gw,gw_mac)){
+        c_append_str(o,&l,(size_t)mx," mac=");c_append_mac(o,&l,(size_t)mx,gw_mac);c_append_ch(o,&l,(size_t)mx,'\n');
+    }else{
+        c_append_str(o,&l,(size_t)mx," arp=miss\n");
+    }
+    if(g_sockets[fd].tcp_state!=TCP_ESTABLISHED){sock_close(fd);return;}
+    c_append_str(req,&rl,sizeof(req),"GET ");
+    c_append_str(req,&rl,sizeof(req),path);
+    c_append_str(req,&rl,sizeof(req)," HTTP/1.0\r\nHost: ");
+    c_append_str(req,&rl,sizeof(req),host);
+    c_append_str(req,&rl,sizeof(req),"\r\nUser-Agent: RiduxOS tcpget\r\nConnection: close\r\n\r\n");
+    rc=sock_send(fd,req,rl,0);
+    c_append_str(o,&l,(size_t)mx,"send rc=");c_append_i32(o,&l,(size_t)mx,rc);c_append_ch(o,&l,(size_t)mx,'\n');
+    for(tries=0;tries<3000&&l+1<(size_t)mx;++tries){
+        rc=sock_recv(fd,tmp,sizeof(tmp)-1,0);
+        if(rc>0){
+            int j;
+            tmp[rc]=0;
+            for(j=0;j<rc&&l+1<(size_t)mx;++j){
+                char ch=tmp[j];
+                if(ch=='\r')continue;
+                o[l++]=(ch>=' '||ch=='\n'||ch=='\t')?ch:'.';
+                o[l]=0;
+                if(++got>1200)break;
+            }
+            if(got>1200)break;
+        }else{
+            e1000_poll_rx();
+            if((tries&15)==15)tcp7_tick();
+            {volatile int spin;for(spin=0;spin<20000;++spin)__asm__ volatile("pause");}
+        }
+    }
+    sock_close(fd);
+}
 
 static void cmd_dhcp(const char *a,char *o,int mx){size_t l=0;(void)a;o[0]=0;
     dhcp_discover(0);c_append_str(o,&l,(size_t)mx,"DHCP: ip=");c_append_ip4(o,&l,(size_t)mx,g_dhcp_lease.ip);
@@ -3592,6 +4838,7 @@ void compat_init_all(void) {
     register_cmd("lsdev","List /dev devices",cmd_lsdev);
     register_cmd("catproc","Read /proc files",cmd_cat_proc);
     register_cmd("nslookup","DNS lookup",cmd_nslookup);
+    register_cmd("tcpget","HTTP GET over real TCP",cmd_tcpget);
     register_cmd("dhclient","Run DHCP",cmd_dhcp);
     register_cmd("ahci","Show AHCI status",cmd_ahci);
     register_cmd("syscalls","Show registered syscalls",cmd_syscalls);

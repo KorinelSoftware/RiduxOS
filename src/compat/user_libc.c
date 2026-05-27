@@ -172,6 +172,7 @@ int ulibc_tolower(int c){return ulibc_isupper(c)?c+32:c;}
 /* stdlib - malloc/free (simple bump+freelist allocator) */
 #define CHUNK_MAGIC 0xA110CA7E
 #define CHUNK_FREE  0xFEEEFEEE
+#define ALIGN_MAGIC 0xA11A110C
 #define MIN_ALLOC   32
 typedef struct chunk_hdr {
     uint32_t magic;
@@ -179,6 +180,13 @@ typedef struct chunk_hdr {
     struct chunk_hdr *next; /* next free chunk (when free) */
     uint32_t flags; /* 1=free */
 } chunk_hdr_t;
+typedef struct align_hdr {
+    void *raw;
+    uint32_t magic;
+    uint32_t reserved;
+    size_t size;
+    size_t align;
+} align_hdr_t;
 
 static uint8_t g_heap[ULIBC_HEAP_SIZE] __attribute__((aligned(16)));
 static chunk_hdr_t *g_free_list = 0;
@@ -189,6 +197,27 @@ static void heap_init(void) {
     g_heap_init = true;
     g_heap_used = 0;
     g_free_list = 0;
+}
+
+static bool ulibc_is_pow2_size(size_t v) {
+    return v && ((v & (v - 1)) == 0);
+}
+
+static size_t ulibc_round_pow2_size(size_t v) {
+    size_t p = sizeof(void*);
+    while(p < v && p <= (((size_t)-1) >> 1)) p <<= 1;
+    return p < v ? 0 : p;
+}
+
+static void *ulibc_aligned_raw_ptr(void *ptr) {
+    align_hdr_t *ah;
+    chunk_hdr_t *raw_hdr;
+    if(!ptr) return 0;
+    ah = ((align_hdr_t*)ptr) - 1;
+    if(ah->magic != ALIGN_MAGIC || !ah->raw) return 0;
+    raw_hdr = (chunk_hdr_t*)((uint8_t*)ah->raw - sizeof(chunk_hdr_t));
+    if(raw_hdr->magic != CHUNK_MAGIC) return 0;
+    return ah->raw;
 }
 
 void *ulibc_malloc(size_t size) {
@@ -238,8 +267,16 @@ void *ulibc_malloc(size_t size) {
 
 void ulibc_free(void *ptr) {
     chunk_hdr_t *c;
+    void *raw;
     if(!ptr) return;
     c = (chunk_hdr_t*)((uint8_t*)ptr - sizeof(chunk_hdr_t));
+    if(c->magic != CHUNK_MAGIC) {
+        raw = ulibc_aligned_raw_ptr(ptr);
+        if(!raw) return; /* corrupt or foreign */
+        ((align_hdr_t*)ptr)[-1].magic = 0;
+        ptr = raw;
+        c = (chunk_hdr_t*)((uint8_t*)ptr - sizeof(chunk_hdr_t));
+    }
     if(c->magic != CHUNK_MAGIC) return; /* corrupt */
     c->magic = CHUNK_FREE;
     c->flags = 1;
@@ -250,9 +287,25 @@ void ulibc_free(void *ptr) {
 void *ulibc_realloc(void *ptr, size_t size) {
     chunk_hdr_t *c;
     void *new_ptr;
+    align_hdr_t *ah;
     if(!ptr) return ulibc_malloc(size);
     if(!size) { ulibc_free(ptr); return 0; }
     c = (chunk_hdr_t*)((uint8_t*)ptr - sizeof(chunk_hdr_t));
+    if(c->magic != CHUNK_MAGIC) {
+        void *raw = ulibc_aligned_raw_ptr(ptr);
+        if(!raw) return 0;
+        (void)raw;
+        ah = ((align_hdr_t*)ptr) - 1;
+        if(ah->size >= size) {
+            ah->size = size;
+            return ptr;
+        }
+        new_ptr = ulibc_memalign(ah->align, size);
+        if(!new_ptr) return 0;
+        ulibc_memcpy(new_ptr, ptr, ah->size);
+        ulibc_free(ptr);
+        return new_ptr;
+    }
     if(c->magic != CHUNK_MAGIC) return 0;
     if(c->size >= size) return ptr;
     new_ptr = ulibc_malloc(size);
@@ -270,18 +323,44 @@ void *ulibc_calloc(size_t nmemb, size_t size) {
 }
 
 void *ulibc_memalign(size_t align, size_t size) {
-    /* Simplified: over-allocate and align */
-    void *p = ulibc_malloc(size + align);
+    size_t rounded;
+    size_t total;
+    uintptr_t raw, aligned;
+    void *p;
+    align_hdr_t *ah;
+    if(align < sizeof(void*)) align = sizeof(void*);
+    rounded = ulibc_is_pow2_size(align) ? align : ulibc_round_pow2_size(align);
+    if(!rounded) return 0;
+    align = rounded;
+    if(size > ((size_t)-1) - align - sizeof(align_hdr_t)) return 0;
+    total = size + align + sizeof(align_hdr_t);
+    p = ulibc_malloc(total);
     if(!p) return 0;
-    uintptr_t addr = ((uintptr_t)p + align - 1) & ~(align - 1);
-    return (void*)addr;
+    raw = (uintptr_t)p + sizeof(align_hdr_t);
+    aligned = (raw + align - 1) & ~(uintptr_t)(align - 1);
+    ah = ((align_hdr_t*)aligned) - 1;
+    ah->raw = p;
+    ah->magic = ALIGN_MAGIC;
+    ah->reserved = 0;
+    ah->size = size;
+    ah->align = align;
+    return (void*)aligned;
 }
 
 int ulibc_posix_memalign(void **memptr, size_t align, size_t size) {
-    void *p = ulibc_memalign(align, size);
+    void *p;
+    if(!memptr) return EINVAL;
+    if(align < sizeof(void*) || !ulibc_is_pow2_size(align)) return EINVAL;
+    p = ulibc_memalign(align, size);
     if(!p) return ENOMEM;
     *memptr = p;
     return 0;
+}
+
+void *ulibc_aligned_alloc(size_t align, size_t size) {
+    if(align < sizeof(void*) || !ulibc_is_pow2_size(align)) return 0;
+    if(size & (align - 1)) return 0;
+    return ulibc_memalign(align, size);
 }
 
 /* stdlib - conversions (strtol family from musl) */
@@ -1143,334 +1222,12 @@ int ulibc_pthread_attr_destroy(ulibc_pthread_attr_t *attr) { (void)attr; return 
 int ulibc_pthread_attr_setdetachstate(ulibc_pthread_attr_t *attr, int state) { (void)attr;(void)state; return 0; }
 int ulibc_pthread_attr_setstacksize(ulibc_pthread_attr_t *attr, size_t stacksize) { (void)attr;(void)stacksize; return 0; }
 
-/* DRM / framebuffer ioctl handlers */
-/* framebuffer_t defined in kernel.c */
-typedef struct {
-    uint8_t *address;
-    uint32_t pitch;
-    uint32_t width;
-    uint32_t height;
-    uint8_t  bpp;
-    uint8_t  red_pos, red_size;
-    uint8_t  green_pos, green_size;
-    uint8_t  blue_pos, blue_size;
-    bool     ready;
-} compat4_fb_t;
-extern compat4_fb_t g_fb;
-
-#define C4_DRM_ID_FB 1u
-#define C4_DRM_ID_CRTC 42u
-#define C4_DRM_ID_CONNECTOR 43u
-#define C4_DRM_ID_ENCODER 44u
-
-typedef struct {
-    uint32_t clock;
-    uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
-    uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
-    uint32_t vrefresh;
-    uint32_t flags;
-    uint32_t type;
-    char name[32];
-} c4_drm_mode_modeinfo_t;
-
-typedef struct {
-    uint64_t fb_id_ptr;
-    uint64_t crtc_id_ptr;
-    uint64_t connector_id_ptr;
-    uint64_t encoder_id_ptr;
-    uint32_t count_fbs;
-    uint32_t count_crtcs;
-    uint32_t count_connectors;
-    uint32_t count_encoders;
-    uint32_t min_width;
-    uint32_t max_width;
-    uint32_t min_height;
-    uint32_t max_height;
-} c4_drm_mode_card_res_t;
-
-typedef struct {
-    uint64_t set_connectors_ptr;
-    uint32_t count_connectors;
-    uint32_t crtc_id;
-    uint32_t fb_id;
-    uint32_t x;
-    uint32_t y;
-    uint32_t gamma_size;
-    uint32_t mode_valid;
-    c4_drm_mode_modeinfo_t mode;
-} c4_drm_mode_crtc_t;
-
-typedef struct {
-    uint32_t encoder_id;
-    uint32_t encoder_type;
-    uint32_t crtc_id;
-    uint32_t possible_crtcs;
-    uint32_t possible_clones;
-} c4_drm_mode_get_encoder_t;
-
-typedef struct {
-    uint64_t encoders_ptr;
-    uint64_t modes_ptr;
-    uint64_t props_ptr;
-    uint64_t prop_values_ptr;
-    uint32_t count_modes;
-    uint32_t count_props;
-    uint32_t count_encoders;
-    uint32_t encoder_id;
-    uint32_t connector_id;
-    uint32_t connector_type;
-    uint32_t connector_type_id;
-    uint32_t connection;
-    uint32_t mm_width;
-    uint32_t mm_height;
-    uint32_t subpixel;
-    uint32_t pad;
-} c4_drm_mode_get_connector_t;
-
-typedef struct {
-    uint32_t fb_id;
-    uint32_t width;
-    uint32_t height;
-    uint32_t pitch;
-    uint32_t bpp;
-    uint32_t depth;
-    uint32_t handle;
-} c4_drm_mode_fb_cmd_t;
-
-typedef struct {
-    uint32_t height;
-    uint32_t width;
-    uint32_t bpp;
-    uint32_t flags;
-    uint32_t handle;
-    uint32_t pitch;
-    uint64_t size;
-} c4_drm_mode_create_dumb_t;
-
-typedef struct {
-    uint32_t handle;
-    uint32_t pad;
-    uint64_t offset;
-} c4_drm_mode_map_dumb_t;
-
-typedef struct {
-    uint64_t capability;
-    uint64_t value;
-} c4_drm_get_cap_t;
-
-typedef struct {
-    uint32_t handle;
-    uint32_t flags;
-    int32_t  fd;
-} c4_drm_prime_handle_t;
-
-typedef struct {
-    uint32_t handle;
-    uint32_t pad;
-} c4_drm_gem_close_t;
-
-static int32_t g_c4_drm_prime_export_fd = 100;
-
-static void c4_drm_fill_mode(c4_drm_mode_modeinfo_t *m){
-    uint32_t w=(g_fb.width?g_fb.width:1024u);
-    uint32_t h=(g_fb.height?g_fb.height:768u);
-    if(!m)return;
-    ulibc_memset(m,0,sizeof(*m));
-    m->hdisplay=(uint16_t)w;
-    m->hsync_start=(uint16_t)(w+16u);
-    m->hsync_end=(uint16_t)(w+16u+32u);
-    m->htotal=(uint16_t)(w+16u+32u+48u);
-    m->vdisplay=(uint16_t)h;
-    m->vsync_start=(uint16_t)(h+10u);
-    m->vsync_end=(uint16_t)(h+10u+2u);
-    m->vtotal=(uint16_t)(h+10u+2u+33u);
-    m->vrefresh=60;
-    m->type=1;
-    ulibc_strcpy(m->name,"ridux-60");
-}
-
-int drm_ioctl_handler(int fd, uint64_t request, void *arg) {
-    (void)fd;
-    if(request == DRM_IOCTL_VERSION) {
-        /* Return driver version info */
-        if(arg) {
-            uint32_t *v = (uint32_t*)arg;
-            v[0] = 1; v[1] = 0; v[2] = 0; /* major.minor.patch */
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_GET_CAP) {
-        if(arg) {
-            c4_drm_get_cap_t *cap=(c4_drm_get_cap_t*)arg;
-            cap->value=1;
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_SET_MASTER || request == DRM_IOCTL_DROP_MASTER) return 0;
-    if(request == DRM_IOCTL_GEM_CLOSE || (request&0xFFu)==0x09u) {
-        if(arg){
-            c4_drm_gem_close_t *c=(c4_drm_gem_close_t*)arg;
-            (void)c->handle;
-            c->handle=0;
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_PRIME_HANDLE_TO_FD || (request&0xFFu)==0x2Du) {
-        if(arg){
-            c4_drm_prime_handle_t *p=(c4_drm_prime_handle_t*)arg;
-            if(!p->fd)p->fd=g_c4_drm_prime_export_fd++;
-            if(g_c4_drm_prime_export_fd<100)g_c4_drm_prime_export_fd=100;
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_PRIME_FD_TO_HANDLE || (request&0xFFu)==0x2Eu) {
-        if(arg){
-            c4_drm_prime_handle_t *p=(c4_drm_prime_handle_t*)arg;
-            p->handle=1;
-            (void)p->flags;
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_GETRESOURCES) {
-        c4_drm_mode_card_res_t *r=(c4_drm_mode_card_res_t*)arg;
-        uint32_t w=(g_fb.width?g_fb.width:1024u);
-        uint32_t h=(g_fb.height?g_fb.height:768u);
-        if(!r)return 0;
-        if(r->fb_id_ptr&&r->count_fbs>0)((uint32_t*)(uintptr_t)r->fb_id_ptr)[0]=C4_DRM_ID_FB;
-        if(r->crtc_id_ptr&&r->count_crtcs>0)((uint32_t*)(uintptr_t)r->crtc_id_ptr)[0]=C4_DRM_ID_CRTC;
-        if(r->connector_id_ptr&&r->count_connectors>0)((uint32_t*)(uintptr_t)r->connector_id_ptr)[0]=C4_DRM_ID_CONNECTOR;
-        if(r->encoder_id_ptr&&r->count_encoders>0)((uint32_t*)(uintptr_t)r->encoder_id_ptr)[0]=C4_DRM_ID_ENCODER;
-        r->count_fbs=1;
-        r->count_crtcs=1;
-        r->count_connectors=1;
-        r->count_encoders=1;
-        r->min_width=64;
-        r->max_width=w;
-        r->min_height=64;
-        r->max_height=h;
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_GETCRTC) {
-        c4_drm_mode_crtc_t *c=(c4_drm_mode_crtc_t*)arg;
-        if(!c)return 0;
-        if(c->crtc_id&&c->crtc_id!=C4_DRM_ID_CRTC)return -EINVAL;
-        c->crtc_id=C4_DRM_ID_CRTC;
-        c->fb_id=C4_DRM_ID_FB;
-        c->x=0;c->y=0;
-        c->gamma_size=256;
-        c->mode_valid=1;
-        c4_drm_fill_mode(&c->mode);
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_GETENCODER) {
-        c4_drm_mode_get_encoder_t *e=(c4_drm_mode_get_encoder_t*)arg;
-        if(!e)return 0;
-        if(e->encoder_id&&e->encoder_id!=C4_DRM_ID_ENCODER)return -EINVAL;
-        e->encoder_id=C4_DRM_ID_ENCODER;
-        e->encoder_type=1;
-        e->crtc_id=C4_DRM_ID_CRTC;
-        e->possible_crtcs=1;
-        e->possible_clones=0;
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_GETCONNECTOR) {
-        c4_drm_mode_get_connector_t *c=(c4_drm_mode_get_connector_t*)arg;
-        uint32_t w=(g_fb.width?g_fb.width:1024u);
-        uint32_t h=(g_fb.height?g_fb.height:768u);
-        if(!c)return 0;
-        if(c->connector_id&&c->connector_id!=C4_DRM_ID_CONNECTOR)return -EINVAL;
-        if(c->encoders_ptr&&c->count_encoders>0)((uint32_t*)(uintptr_t)c->encoders_ptr)[0]=C4_DRM_ID_ENCODER;
-        if(c->modes_ptr&&c->count_modes>0)c4_drm_fill_mode((c4_drm_mode_modeinfo_t*)(uintptr_t)c->modes_ptr);
-        c->count_encoders=1;
-        c->count_modes=1;
-        c->count_props=0;
-        c->encoder_id=C4_DRM_ID_ENCODER;
-        c->connector_id=C4_DRM_ID_CONNECTOR;
-        c->connector_type=1;
-        c->connector_type_id=1;
-        c->connection=1;
-        c->mm_width=w/4u;
-        c->mm_height=h/4u;
-        c->subpixel=1;
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_CREATE_DUMB) {
-        /* Return framebuffer as dumb buffer */
-        if(arg) {
-            c4_drm_mode_create_dumb_t *d=(c4_drm_mode_create_dumb_t*)arg;
-            uint32_t w=(g_fb.width?g_fb.width:1024u);
-            uint32_t h=(g_fb.height?g_fb.height:768u);
-            uint32_t bpp=(d->bpp?d->bpp:32u);
-            if(d->width)d->width=(d->width<w)?d->width:w;
-            else d->width=w;
-            if(d->height)d->height=(d->height<h)?d->height:h;
-            else d->height=h;
-            d->bpp=bpp;
-            d->pitch=((d->width*bpp)+7u)/8u;
-            d->size=(uint64_t)d->pitch*d->height;
-            d->handle=1;
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_MAP_DUMB) {
-        if(arg) {
-            c4_drm_mode_map_dumb_t *m=(c4_drm_mode_map_dumb_t*)arg;
-            m->offset=(uint64_t)(uintptr_t)g_fb.address;
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_DESTROY_DUMB) {
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_ADDFB) {
-        if(arg){
-            c4_drm_mode_fb_cmd_t *f=(c4_drm_mode_fb_cmd_t*)arg;
-            (void)f->width;(void)f->height;(void)f->pitch;(void)f->bpp;(void)f->depth;(void)f->handle;
-            f->fb_id=C4_DRM_ID_FB;
-        }
-        return 0;
-    }
-    if(request == DRM_IOCTL_MODE_SETCRTC) {
-        if(arg){
-            c4_drm_mode_crtc_t *s=(c4_drm_mode_crtc_t*)arg;
-            if(s->crtc_id&&s->crtc_id!=C4_DRM_ID_CRTC)return -EINVAL;
-            s->crtc_id=C4_DRM_ID_CRTC;
-            if(!s->fb_id)s->fb_id=C4_DRM_ID_FB;
-            s->mode_valid=1;
-        }
-        return 0;
-    }
-    return -ENOTTY;
-}
-
-int fb_ioctl_handler(int fd, uint64_t request, void *arg) {
-    (void)fd;
-    if(request == FBIOGET_VSCREENINFO) {
-        fb_var_screeninfo_t *v = (fb_var_screeninfo_t*)arg;
-        ulibc_memset(v, 0, sizeof(*v));
-        v->xres = g_fb.width; v->yres = g_fb.height;
-        v->xres_virtual = g_fb.width; v->yres_virtual = g_fb.height;
-        v->bits_per_pixel = 32;
-        v->red_offset = 16; v->red_length = 8;
-        v->green_offset = 8; v->green_length = 8;
-        v->blue_offset = 0; v->blue_length = 8;
-        v->transp_offset = 24; v->transp_length = 8;
-        return 0;
-    }
-    if(request == FBIOPUT_VSCREENINFO) return 0;
-    if(request == FBIOGET_FSCREENINFO) {
-        fb_fix_screeninfo_t *f = (fb_fix_screeninfo_t*)arg;
-        ulibc_memset(f, 0, sizeof(*f));
-        ulibc_strcpy(f->id, "ridux-fb");
-        f->smem_start = (uint64_t)(uintptr_t)g_fb.address;
-        f->smem_len = g_fb.width * g_fb.height * 4;
-        f->type = 0; /* FB_TYPE_PACKED_PIXELS */
-        f->visual = 2; /* FB_VISUAL_TRUECOLOR */
-        f->line_length = g_fb.pitch;
-        return 0;
-    }
-    return -ENOTTY;
-}
+/* DRM/GPU compatibility is kept as an internal include for now.
+ * It still compiles inside user_libc.c because many helpers are static
+ * and share ulibc-local runtime state. This split is the first step
+ * toward moving DRM/KMS, virtio-gpu and VMSVGA into real modules.
+ */
+#include "user_libc_drm.inc"
 
 /* Dynamic linker stub */
 static uintptr_t g_stack_chk_guard = 0x9e3779b97f4a7c15ULL;
@@ -1599,6 +1356,8 @@ static const ulibc_sym_entry_t g_dlsym_table[] = {
     {"dl_iterate_phdr", (void*)ulibc_dl_iterate_phdr},
     {"malloc",  (void*)ulibc_malloc},  {"free",    (void*)ulibc_free},
     {"realloc", (void*)ulibc_realloc}, {"calloc",  (void*)ulibc_calloc},
+    {"memalign",(void*)ulibc_memalign}, {"posix_memalign",(void*)ulibc_posix_memalign},
+    {"aligned_alloc",(void*)ulibc_aligned_alloc},
     {"atoi",    (void*)ulibc_atoi},    {"atol",    (void*)ulibc_atol},
     {"strtol",  (void*)ulibc_strtol},  {"strtoul", (void*)ulibc_strtoul},
     {"qsort",   (void*)ulibc_qsort},   {"bsearch", (void*)ulibc_bsearch},

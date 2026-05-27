@@ -132,6 +132,11 @@ int  e1000_recv(uint8_t *buf, size_t buf_size);
 void e1000_poll_rx(void);
 void net_process_frame(const uint8_t *frame, size_t len);
 
+/* Real network frame helpers — build full Eth+IP+TCP/UDP and send via E1000 */
+int  net_send_tcp_frame(int sock_fd, const uint8_t *tcp_seg, size_t seg_len);
+int  net_send_udp_frame(int sock_fd, const uint8_t *payload, size_t len);
+bool net_is_real_external(uint32_t ip);
+
 /* TCP/IP stack */
 
 /* IP */
@@ -207,6 +212,7 @@ typedef enum {
 #define SOCK_BUF_SIZE   65536
 #define SOCK_ACCEPTQ    16
 #define SOCK_DGRAMQ     32
+#define SOCK_ANCQ       64
 #define SOCK_VIRT_NONE   0
 #define SOCK_VIRT_HTTP   1
 #define SOCK_VIRT_HTTPS  2
@@ -234,8 +240,8 @@ typedef struct {
     uint8_t    tx_buf[SOCK_BUF_SIZE];
     uint32_t   tx_head;
     uint32_t   tx_tail;
-    int        anc_fds[8];
-    uint32_t   anc_pos[8];
+    int        anc_fds[SOCK_ANCQ];
+    uint32_t   anc_pos[SOCK_ANCQ];
     uint8_t    anc_head;
     uint8_t    anc_tail;
     uint16_t   rx_msg_len[SOCK_DGRAMQ];
@@ -252,6 +258,8 @@ typedef struct {
     uint8_t    virt_service;
     uint8_t    virt_state;
     uint16_t   virt_flags;
+    uint8_t    shutdown_rx;
+    uint8_t    shutdown_tx;
 } socket_t;
 
 extern socket_t g_sockets[SOCK_MAX];
@@ -268,6 +276,7 @@ int     sock_recv_right(int fd, int *pass_fd);
 size_t  sock_recv_limit_before_right(int fd, size_t cap);
 int     sock_send(int fd, const void *buf, size_t len, int flags);
 int     sock_recv(int fd, void *buf, size_t len, int flags);
+int     sock_shutdown(int fd, int how);
 int     sock_close(int fd);
 int     sock_setsockopt(int fd, int level, int optname, const void *val, size_t len);
 
@@ -456,6 +465,7 @@ typedef void (*sighandler_t)(int);
 #define ERANGE      34
 #define ENOSYS      38
 #define ENOTEMPTY   39
+#define ELOOP       40
 #define EADDRINUSE  98
 #define EISCONN    106
 #define ENOTCONN   107
@@ -516,6 +526,7 @@ int64_t  syscall_dispatch(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5);
 void     compat_syscall_trace_note(uint64_t nr, uint64_t a0, int64_t ret);
 void     compat_syscall_trace_reset(void);
+void     compat_syscall_trace_wayfire_after_keymap(void);
 
 /* Virtual memory / paging stubs */
 
@@ -750,7 +761,7 @@ int  vdev_generate_proc_net_dev(char *buf, int max);
 int  vdev_generate_sys_kernel_hostname(char *buf, int max);
 int  vdev_generate_sys_kernel_osrelease(char *buf, int max);
 
-/* DRM / framebuffer / evdev / ALSA device stubs */
+/* Linux-style desktop devices exposed by the compat layer. */
 
 typedef struct {
     uint32_t width;
@@ -763,7 +774,7 @@ typedef struct {
 
 typedef struct {
     uint64_t time_sec;
-    uint32_t time_usec;
+    uint64_t time_usec;
     uint16_t type;
     uint16_t code;
     int32_t  value;
@@ -775,13 +786,15 @@ typedef struct {
 #define EV_REL 0x02
 #define EV_ABS 0x03
 
+#define SYN_REPORT 0x00
+
 /* Common key codes (Linux evdev) */
 #define KEY_ESC       1
 #define KEY_ENTER    28
 #define KEY_SPACE    57
 #define KEY_BACKSPACE 14
 
-#define INPUT_EVENT_RING 64
+#define INPUT_EVENT_RING 512
 
 typedef struct {
     input_event_t events[INPUT_EVENT_RING];
@@ -795,7 +808,9 @@ extern drm_mode_t     g_drm_mode;
 void drm_init(void);
 void evdev_init(void);
 void evdev_push_key(uint16_t code, int32_t value);
+void evdev_push_mouse_key(uint16_t code, int32_t value);
 void evdev_push_rel(uint16_t code, int32_t value);
+void evdev_push_rel_xy(int32_t dx, int32_t dy);
 
 /* epoll / poll / select stubs */
 
@@ -820,11 +835,12 @@ typedef struct {
     uint64_t     data;
 } epoll_item_t;
 
-#define EPOLL_INSTANCES 8
+#define EPOLL_INSTANCES 64
 typedef struct {
     bool       used;
     epoll_item_t items[EPOLL_MAX_EVENTS];
     int        count;
+    int        next_scan;
 } epoll_instance_t;
 
 extern epoll_instance_t g_epoll_instances[EPOLL_INSTANCES];

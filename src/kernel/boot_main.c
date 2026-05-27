@@ -31,6 +31,102 @@ static void calibrate_frame_period(void) {
     }
 }
 
+static const char *kernel_native_shell_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (vfs_read("/bin/desktop-shell-r3.elf", &data, &size)) return "/bin/desktop-shell-r3.elf";
+    return NULL;
+}
+
+static const char *kernel_gl_compositor_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-gl-compositor.enable")) return NULL;
+    if (vfs_read("/usr/bin/ridux-gl-compositor", &data, &size)) return "/usr/bin/ridux-gl-compositor";
+    return NULL;
+}
+
+static const char *kernel_riduxui_shell_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-ui-shell.enable")) return NULL;
+    if (vfs_read("/usr/bin/injury-compositor", &data, &size)) return "/usr/bin/injury-compositor";
+    if (vfs_read("/usr/bin/ridux-ui-shell", &data, &size)) return "/usr/bin/ridux-ui-shell";
+    return NULL;
+}
+
+static const char *kernel_wayfire_shell_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-wayfire-primary.enable")) return NULL;
+    if (vfs_read("/opt/wayfire/bin/wayfire", &data, &size)) return "/opt/wayfire/bin/wayfire";
+    if (vfs_read("/usr/bin/wayfire", &data, &size)) return "/usr/bin/wayfire";
+    return NULL;
+}
+
+static const char *kernel_hyprland_shell_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-hyprland-primary.enable")) return NULL;
+    /*
+     * RiduxOS is the session supervisor here. The upstream start-hyprland
+     * watchdog expects full Linux process/session semantics and can exit before
+     * Hyprland publishes Wayland/IPC sockets on our ABI layer, leaving a black
+     * desktop. Launch the compositor directly and keep start-hyprland available
+     * for later once the remaining supervisor ABI is complete.
+     */
+    if (vfs_read("/opt/hyprland/bin/Hyprland", &data, &size)) return "/opt/hyprland/bin/Hyprland";
+    if (vfs_read("/opt/hyprland/usr/bin/Hyprland", &data, &size)) return "/opt/hyprland/usr/bin/Hyprland";
+    if (vfs_read("/usr/bin/Hyprland", &data, &size)) return "/usr/bin/Hyprland";
+    if (vfs_read("/usr/bin/hyprland", &data, &size)) return "/usr/bin/hyprland";
+    if (vfs_read("/usr/bin/start-hyprland", &data, &size)) return "/usr/bin/start-hyprland";
+    if (vfs_read("/opt/hyprland/bin/start-hyprland", &data, &size)) return "/opt/hyprland/bin/start-hyprland";
+    return NULL;
+}
+
+static const char *kernel_hyprland_dbus_session_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-hyprland-primary.enable")) return NULL;
+    if (vfs_read("/usr/bin/ridux-dbus-session", &data, &size)) return "/usr/bin/ridux-dbus-session";
+    return NULL;
+}
+
+static const char *kernel_hyprland_dbus_system_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-hyprland-primary.enable")) return NULL;
+    if (!kvfs_exists("/etc/ridux-dbus-system-real.enable")) return NULL;
+    if (vfs_read("/usr/bin/ridux-dbus-system", &data, &size)) return "/usr/bin/ridux-dbus-system";
+    return NULL;
+}
+
+static const char *kernel_vulkan_probe_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-vulkan-autoprobe.enable")) return NULL;
+    if (vfs_read("/usr/bin/ridux-vulkan-probe", &data, &size)) return "/usr/bin/ridux-vulkan-probe";
+    return NULL;
+}
+
+static const char *kernel_qt_shell_path(void) {
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+
+    if (!kvfs_exists("/etc/ridux-qt-shell.enable")) return NULL;
+    if (vfs_read("/usr/bin/ridux-shell-direct", &data, &size)) return "/usr/bin/ridux-shell-direct";
+    if (vfs_read("/usr/bin/ridux-shell", &data, &size)) return "/usr/bin/ridux-shell";
+    return NULL;
+}
+
 static void parse_multiboot_info(uint32_t mbi_addr) {
     uint8_t *ptr;
     uint32_t total_size;
@@ -40,6 +136,8 @@ static void parse_multiboot_info(uint32_t mbi_addr) {
     g_initrd_end = NULL;
     g_initrd_overlay_start = NULL;
     g_initrd_overlay_end = NULL;
+    g_phys_mem_top = 0;
+    pmm_clear_usable_ranges();
     total_size = *((uint32_t *)(uintptr_t)mbi_addr);
     ptr = (uint8_t *)(uintptr_t)(mbi_addr + 8u);
 
@@ -71,6 +169,21 @@ static void parse_multiboot_info(uint32_t mbi_addr) {
                 g_initrd_overlay_start = (const uint8_t *)(uintptr_t)m->mod_start;
                 g_initrd_overlay_end   = (const uint8_t *)(uintptr_t)m->mod_end;
             }
+        } else if (tag->type == MB2_TAG_MMAP) {
+            const mb2_tag_mmap_t *mm = (const mb2_tag_mmap_t *)tag;
+            const uint8_t *ep = (const uint8_t *)mm->entries;
+            const uint8_t *end = ((const uint8_t *)tag) + tag->size;
+            if (mm->entry_size >= sizeof(mb2_mmap_entry_t)) {
+                while (ep + sizeof(mb2_mmap_entry_t) <= end) {
+                    const mb2_mmap_entry_t *e = (const mb2_mmap_entry_t *)ep;
+                    if (e->type == 1u && e->len && e->addr + e->len > e->addr) {
+                        uint64_t top = e->addr + e->len;
+                        if (top > g_phys_mem_top) g_phys_mem_top = top;
+                        pmm_add_usable_range(e->addr, e->len);
+                    }
+                    ep += mm->entry_size;
+                }
+            }
         } else if ((tag->type == MB2_TAG_ACPI_OLD || tag->type == MB2_TAG_ACPI_NEW) &&
                    g_acpi_rsdp == NULL && tag->size > 8u) {
             const mb2_tag_acpi_t *a = (const mb2_tag_acpi_t *)tag;
@@ -93,9 +206,9 @@ static uint64_t kernel_phys_reserve_end(void){
     return(end+PAGE_SIZE-1ULL)&~(PAGE_SIZE-1ULL);
 }
 
-/* VirtualBox can expose the linear framebuffer above 4 GiB.
- * Boot64 only identity-maps the first 4 GiB, so we add missing
- * kernel mappings once compat2 paging is online. */
+/* Hypervisors can expose a linear framebuffer outside the pages that boot64
+ * actually identity-mapped. Add missing kernel mappings once compat2 paging is
+ * online, regardless of whether the address is below or above 4 GiB. */
 static void map_high_framebuffer_if_needed(void){
     address_space_t *kas;
     uint64_t fb_phys,fb_size,start,end,va;
@@ -103,7 +216,6 @@ static void map_high_framebuffer_if_needed(void){
     fb_phys=(uint64_t)(uintptr_t)g_fb.address;
     fb_size=(uint64_t)g_fb.pitch*(uint64_t)g_fb.height;
     if(fb_size==0)fb_size=(uint64_t)g_fb.width*(uint64_t)g_fb.height*4ULL;
-    if(fb_phys+fb_size<=0x100000000ULL)return;
     kas=paging_get_kernel_space();
     if(!kas||!kas->pml4)return;
     start=fb_phys&~(PAGE_SIZE-1ULL);
@@ -189,6 +301,19 @@ void __boot_serial_force_putu32(uint32_t v) {
 }
 
 void kernel_main(uint32_t magic, uint32_t mbi_addr) {
+    const char *native_shell_path = NULL;
+    const char *riduxui_shell_path = NULL;
+    const char *hyprland_shell_path = NULL;
+    const char *qt_shell_path = NULL;
+    const char *gl_compositor_path = NULL;
+    const char *vulkan_probe_path = NULL;
+    bool native_shell_started = false;
+    bool riduxui_shell_started = false;
+    bool hyprland_shell_started = false;
+    bool qt_shell_started = false;
+    bool gl_compositor_started = false;
+    bool native_desktop_disabled = false;
+
     __boot_serial_init_direct();
     /* Force g_serial_ready so klog()/shell_push_line() actually emit
      * bytes. The normal serial_probe does a loopback self-test that
@@ -206,10 +331,22 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr) {
     parse_multiboot_info(mbi_addr);
     __boot_serial_puts("[boot] MBI parsed\n");
     if (!g_fb.ready || g_fb.bpp < 24) {
-        __boot_serial_puts("[boot] FATAL: framebuffer not ready (fb.ready or bpp<24), halting\n");
-        for (;;) __asm__ volatile("cli; hlt");
+        __boot_serial_puts("[boot] framebuffer not ready; continuing for DRM/virtio-gpu path\n");
+        g_fb.address = NULL;
+        g_fb.pitch = 4096;
+        g_fb.width = 1024;
+        g_fb.height = 768;
+        g_fb.bpp = 32;
+        g_fb.red_pos = 16;
+        g_fb.red_size = 8;
+        g_fb.green_pos = 8;
+        g_fb.green_size = 8;
+        g_fb.blue_pos = 0;
+        g_fb.blue_size = 8;
+        g_fb.ready = false;
+    } else {
+        __boot_serial_puts("[boot] framebuffer ready\n");
     }
-    __boot_serial_puts("[boot] framebuffer ready\n");
 
     shell_reset_history();
     g_shell_input[0] = 0; g_shell_input_len = 0;
@@ -245,6 +382,8 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr) {
     g_mouse_right_down = false;
     g_mouse_dragging = false;
     g_mouse_drag_window_id = -1;
+    g_mouse_drag_kind = 0;
+    g_mouse_resize_edges = 0;
 
     /* GDT + heap first (no interrupts yet). */
     __boot_serial_puts("[boot] gdt_install...\n");
@@ -325,7 +464,24 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr) {
     klog("compat layer ready");
     __boot_serial_puts("[boot] compat done\n");
 
-    pmm_set_alloc_base(kernel_phys_reserve_end());
+    {
+        uint64_t reserve_end = kernel_phys_reserve_end();
+        __boot_serial_puts("[boot] initrd main=");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)g_initrd_start);
+        __boot_serial_puts("-");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)g_initrd_end);
+        __boot_serial_puts(" overlay=");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)g_initrd_overlay_start);
+        __boot_serial_puts("-");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)g_initrd_overlay_end);
+        __boot_serial_puts(" reserve_end=");
+        __boot_serial_puthex64(reserve_end);
+        __boot_serial_puts(" mem_top=");
+        __boot_serial_puthex64(g_phys_mem_top);
+        __boot_serial_puts("\n");
+        if (g_phys_mem_top) pmm_set_memory_limit(g_phys_mem_top);
+        pmm_set_alloc_base(reserve_end);
+    }
 
     /* Deep infrastructure: PMM, paging, TSS, tasks, TTY, signals,
      * ext2 full, net packets, shared memory, timers. */
@@ -386,44 +542,202 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr) {
     proc_bootstrap();
     __boot_serial_puts("[boot] scheduler_tick...\n");
     scheduler_tick();
+
+    const char *wayfire_shell_path = kernel_wayfire_shell_path();
+    bool wayfire_shell_started = false;
+    hyprland_shell_path = kernel_hyprland_shell_path();
+    riduxui_shell_path = kernel_riduxui_shell_path();
+    gl_compositor_path = kernel_gl_compositor_path();
+    native_shell_path = kernel_native_shell_path();
+    qt_shell_path = kernel_qt_shell_path();
+    vulkan_probe_path = kernel_vulkan_probe_path();
+    g_wayfire_desktop_active = false;
+    if (hyprland_shell_path) {
+        klog("Hyprland wlroots/Mesa desktop payload found");
+        __boot_serial_puts("[boot] Hyprland wlroots/Mesa desktop payload found\n");
+    } else if (wayfire_shell_path) {
+        klog("Wayfire wlroots/Mesa desktop payload found");
+        __boot_serial_puts("[boot] Wayfire wlroots/Mesa desktop payload found\n");
+    } else if (riduxui_shell_path) {
+        klog("RiduxUI native accelerated shell payload found");
+        __boot_serial_puts("[boot] RiduxUI native accelerated shell payload found\n");
+    } else if (gl_compositor_path) {
+        klog("Ridux Mesa/OpenGL compositor payload found");
+        __boot_serial_puts("[boot] Ridux Mesa/OpenGL compositor payload found\n");
+    } else if (native_shell_path) {
+        klog("Ridux native shell payload found");
+        __boot_serial_puts("[boot] Ridux native shell payload found\n");
+    } else if (qt_shell_path) {
+        klog("Ridux Qt EGLFS/KMS shell payload found as compatibility fallback");
+        __boot_serial_puts("[boot] Ridux Qt EGLFS/KMS shell payload found as fallback\n");
+    } else {
+        klog("Ridux native Ring3 shell payload missing; kernel compositor fallback active");
+        __boot_serial_puts("[boot] Ridux native shell missing; kernel compositor fallback active\n");
+    }
+
     __boot_serial_puts("[boot] ui_build_layout...\n");
 
-    /* UI layout first so window defaults fit. */
+    /* Keep geometry initialized before the Ring 3 shell opens its desktop
+     * surface. The kernel compositor still owns window management and input. */
     ui_build_layout();
-    __boot_serial_puts("[boot] apps_bootstrap...\n");
-    apps_bootstrap();
-    __boot_serial_puts("[boot] apps_bootstrap done\n");
+    __boot_serial_puts("[boot] native compositor active; launching Ridux shell\n");
     g_kernel_preempt_disable++;
     {
-        char detail[128];
+        char detail[384];
+        int shell_rc;
         detail[0] = 0;
-        if (compat5_spawn_user_elf_background("/bin/desktop-shell-r3.elf",
-                                              detail, sizeof(detail)) >= 0) {
-            klog("desktop shell Ring 3 launched");
-            __boot_serial_puts("[boot] desktop-shell-r3 launched\n");
-        } else {
-            __boot_serial_puts("[boot] desktop-shell-r3 not available\n");
+
+        if (hyprland_shell_path) {
+            const char *dbus_system_path = kernel_hyprland_dbus_system_path();
+            const char *dbus_session_path = kernel_hyprland_dbus_session_path();
+            if (dbus_system_path) {
+                int dbus_sys_rc = compat5_spawn_user_elf_background(dbus_system_path,
+                                                                    detail, sizeof(detail));
+                if (dbus_sys_rc >= 0) {
+                    __boot_serial_puts("[boot] Hyprland DBus system bus launched\n");
+                } else {
+                    __boot_serial_puts("[boot] Hyprland DBus system bus launch failed\n");
+                }
+            }
+            if (dbus_session_path) {
+                int dbus_rc = compat5_spawn_user_elf_background(dbus_session_path,
+                                                                detail, sizeof(detail));
+                if (dbus_rc >= 0) {
+                    __boot_serial_puts("[boot] Hyprland DBus session bus launched\n");
+                } else {
+                    __boot_serial_puts("[boot] Hyprland DBus session bus launch failed\n");
+                }
+            }
+            shell_rc = compat5_spawn_user_elf_background(hyprland_shell_path,
+                                                         detail, sizeof(detail));
+            if (shell_rc >= 0) {
+                hyprland_shell_started = true;
+                native_desktop_disabled = true;
+                g_wayfire_desktop_active = true;
+                klog("Hyprland wlroots/Mesa desktop launched as primary desktop");
+                __boot_serial_puts("[boot] Hyprland wlroots/Mesa desktop launched\n");
+            } else {
+                hyprland_shell_started = false;
+                native_desktop_disabled = false;
+                klog("Hyprland primary desktop launch failed");
+                __boot_serial_puts("[boot] Hyprland primary desktop launch failed\n");
+            }
+        }
+
+        if (!hyprland_shell_started && wayfire_shell_path) {
+            shell_rc = compat5_spawn_user_elf_background(wayfire_shell_path,
+                                                         detail, sizeof(detail));
+            if (shell_rc >= 0) {
+                wayfire_shell_started = true;
+                native_desktop_disabled = true;
+                g_wayfire_desktop_active = true;
+                klog("Wayfire wlroots/Mesa desktop launched as primary desktop");
+                __boot_serial_puts("[boot] Wayfire wlroots/Mesa desktop launched\n");
+            } else {
+                wayfire_shell_started = false;
+                native_desktop_disabled = false;
+                klog("Wayfire primary desktop launch failed");
+                __boot_serial_puts("[boot] Wayfire primary desktop launch failed\n");
+            }
+        }
+
+        if (!hyprland_shell_started && !wayfire_shell_started && riduxui_shell_path) {
+            shell_rc = compat5_spawn_user_elf_background(riduxui_shell_path,
+                                                         detail, sizeof(detail));
+            if (shell_rc >= 0) {
+                riduxui_shell_started = true;
+                native_desktop_disabled = true;
+                g_wayfire_desktop_active = true;
+                klog("RiduxUI native accelerated shell launched as primary desktop");
+                __boot_serial_puts("[boot] RiduxUI native accelerated shell launched\n");
+            } else {
+                riduxui_shell_started = false;
+                native_desktop_disabled = false;
+                klog("RiduxUI native accelerated shell launch failed; falling back to GL compositor");
+                __boot_serial_puts("[boot] RiduxUI shell launch failed; fallback active\n");
+            }
+        }
+
+        if (!hyprland_shell_started && !wayfire_shell_started && !riduxui_shell_started && gl_compositor_path) {
+            shell_rc = compat5_spawn_user_elf_background(gl_compositor_path,
+                                                         detail, sizeof(detail));
+            if (shell_rc >= 0) {
+                gl_compositor_started = true;
+                native_desktop_disabled = true;
+                g_wayfire_desktop_active = true;
+                klog("Ridux Mesa/OpenGL compositor launched as primary desktop");
+                __boot_serial_puts("[boot] Ridux Mesa/OpenGL compositor launched\n");
+            } else {
+                gl_compositor_started = false;
+                native_desktop_disabled = false;
+                klog("Ridux Mesa/OpenGL compositor launch failed; falling back to R3 shell");
+                __boot_serial_puts("[boot] Ridux Mesa/OpenGL compositor launch failed; fallback active\n");
+            }
+        }
+
+        if (!hyprland_shell_started && !wayfire_shell_started && !riduxui_shell_started && !gl_compositor_started && native_shell_path) {
+            shell_rc = compat5_spawn_user_elf_background(native_shell_path,
+                                                         detail, sizeof(detail));
+            if (shell_rc >= 0) {
+                native_shell_started = true;
+                klog("Ridux native shell launched as primary desktop");
+                __boot_serial_puts("[boot] Ridux native shell launched\n");
+            } else {
+                native_shell_started = false;
+                klog("Ridux native Ring3 shell launch failed; kernel compositor fallback remains active");
+                __boot_serial_puts("[boot] Ridux native shell launch failed; kernel compositor fallback remains active\n");
+            }
+        }
+
+        if (!hyprland_shell_started && !wayfire_shell_started && !riduxui_shell_started && !gl_compositor_started && !native_shell_started && qt_shell_path) {
+            shell_rc = compat5_spawn_user_elf_background_args(qt_shell_path,
+                                                              "--direct-kms --mode=session",
+                                                              detail, sizeof(detail));
+            if (shell_rc >= 0) {
+                qt_shell_started = true;
+                native_desktop_disabled = true;
+                g_wayfire_desktop_active = true;
+                klog("Ridux Qt EGLFS/KMS shell launched as primary desktop");
+                __boot_serial_puts("[boot] Ridux Qt EGLFS/KMS shell launched\n");
+            } else {
+                qt_shell_started = false;
+                native_desktop_disabled = false;
+                klog("Ridux Qt EGLFS/KMS shell launch failed; falling back to GL compositor");
+                __boot_serial_puts("[boot] Ridux Qt EGLFS/KMS shell launch failed; fallback active\n");
+            }
         }
     }
-    {
-        char detail[128];
-        detail[0] = 0;
-        if (compat5_spawn_user_elf_background("/bin/terminal-r3.elf",
-                                              detail, sizeof(detail)) >= 0) {
-            klog("terminal Ring 3 launched");
-            __boot_serial_puts("[boot] terminal-r3 launched\n");
-        } else {
-            __boot_serial_puts("[boot] terminal-r3 not available\n");
-        }
-    }
+    /* La terminal vive en el dock. Arrancarla encima del escritorio haria
+     * que RiduxUI pareciera una demo de debug en vez de un desktop real. */
     if (g_kernel_preempt_disable) --g_kernel_preempt_disable;
+    if (vulkan_probe_path) {
+        char vk_detail[384];
+        int vk_rc;
+        vk_detail[0] = 0;
+        vk_rc = compat5_spawn_user_elf_background(vulkan_probe_path,
+                                                  vk_detail, sizeof(vk_detail));
+        if (vk_rc >= 0) {
+            __boot_serial_puts("[boot] Vulkan hardware probe launched\n");
+        } else {
+            __boot_serial_puts("[boot] Vulkan hardware probe launch failed\n");
+        }
+    }
+    if (hyprland_shell_started || wayfire_shell_started || native_shell_started || riduxui_shell_started || qt_shell_started || gl_compositor_started) {
+        __boot_serial_puts("[boot] priming Ridux desktop scheduler\n");
+        task_schedule();
+        __boot_serial_puts("[boot] Ridux desktop scheduler prime returned\n");
+    }
     __boot_serial_puts("[boot] wm_focus done\n");
 
     shell_boot_message();
     __boot_serial_puts("[boot] shell_boot_message done\n");
-    __boot_serial_puts("[boot] calling initial render_scene()\n");
-    render_scene();
-    __boot_serial_puts("[boot] initial render_scene() returned\n");
+    if (!native_desktop_disabled) {
+        __boot_serial_puts("[boot] calling initial render_scene()\n");
+        render_scene();
+        __boot_serial_puts("[boot] initial render_scene() returned\n");
+    } else {
+        __boot_serial_puts("[boot] initial native render skipped\n");
+    }
     /* Keep boot diagnostics, but do not let runtime/browser trace spam turn
      * the UART into a global scheduler lock. Panic/klog still use serial_write. */
     g_boot_serial_runtime_quiet = true;
@@ -433,9 +747,13 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr) {
     g_shift_down = g_ctrl_down = g_extended_scancode = false;
     g_keyboard_accept_after_tick = g_pit_ticks + 300u;
     __boot_serial_puts("[boot] shell_run_autoboot done\n");
-    __boot_serial_puts("[boot] calling post-autoboot render_scene()\n");
-    render_scene();
-    __boot_serial_puts("[boot] post-autoboot render_scene() returned\n");
+    if (!native_desktop_disabled) {
+        __boot_serial_puts("[boot] calling post-autoboot render_scene()\n");
+        render_scene();
+        __boot_serial_puts("[boot] post-autoboot render_scene() returned\n");
+    } else {
+        __boot_serial_puts("[boot] post-autoboot native render skipped\n");
+    }
     klog("ready");
     {
         char dbg[96];
@@ -471,7 +789,15 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr) {
          * period; between those, the cursor fast-path runs unbounded
          * so mouse motion is fluid even when render_scene is heavy. */
         now = rdtsc32();
-        if (g_needs_redraw &&
+        if (native_desktop_disabled) {
+            /* External compositor mode is disabled for the Ridux native shell
+             * path. Keep this branch as an emergency kill switch. */
+            if ((uint32_t)(now - g_last_render_tsc) >= g_frame_period_tsc) {
+                compat7_tick_all();
+                g_last_render_tsc = now;
+                ++g_frame_counter;
+            }
+        } else if (g_needs_redraw &&
             (uint32_t)(now - g_last_render_tsc) >= g_frame_period_tsc) {
             render_scene();
             compat7_tick_all();
@@ -479,6 +805,11 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr) {
             ++g_frame_counter;
         } else if (!g_needs_redraw && g_cursor_moved) {
             render_cursor_only();
+        }
+        if (g_irq0_preempt_request && !g_kernel_preempt_disable) {
+            g_irq0_preempt_request = false;
+            task_schedule();
+            continue;
         }
         if (!had_input && !g_needs_redraw && !g_cursor_moved) {
             __asm__ volatile("sti; hlt" ::: "memory");

@@ -47,6 +47,11 @@ enum {
 #define WINF_NO_FOCUS   0x00000004u
 #define WINF_NO_TASKBAR 0x00000008u
 
+/* Declaro esto arriba porque wm_close lo usa antes de la definicion real. */
+static int app_index_by_id(int app_id);
+static bool r3wm_force_close_wid(int wid, bool kill_task);
+extern void task_exit(int pid, int code);
+
 static const theme_t *current_theme(void) {
     return &g_theme_table[g_theme_index % (uint32_t)THEME_COUNT];
 }
@@ -60,10 +65,12 @@ static ui_rect_t window_body_rect(const window_t *w) {
         r.h = w->h;
         return r;
     }
-    r.x = w->x + 1;
+    r.x = w->x + 3;
     r.y = w->y + WIN_TITLE_H;
-    r.w = w->w - 2;
-    r.h = w->h - WIN_TITLE_H - 1;
+    r.w = w->w - 6;
+    r.h = w->h - WIN_TITLE_H - 4;
+    if (r.w < 1) r.w = 1;
+    if (r.h < 1) r.h = 1;
     return r;
 }
 static ui_rect_t window_title_rect(const window_t *w) {
@@ -140,6 +147,7 @@ static int wm_add_window(const char *title, int app_id, bool visible,
     win = &g_windows[i];
     k_memset(win, 0, sizeof(*win));
     win->used = true;
+    if (g_next_window_id <= 0) g_next_window_id = 1;
     win->id = g_next_window_id++;
     win->app_id = app_id;
     win->visible = visible;
@@ -237,12 +245,46 @@ static void wm_minimize(int id) {
     w->minimized = true;
     wm_focus_last_visible();
 }
+static void wm_minimize_app_windows(int app_id) {
+    int i;
+    bool refocus = false;
+    for (i = 0; i < g_window_count; ++i) {
+        window_t *w = &g_windows[i];
+        if (!w->used || !w->visible || w->app_id != app_id) continue;
+        w->minimized = true;
+        if (g_window_focus == i) refocus = true;
+    }
+    if (refocus) wm_focus_last_visible();
+}
 static void wm_close(int id) {
+    int idx;
+    int app_idx;
     window_t *w = wm_get_by_id(id);
     if (!w) return;
+    if ((w->flags & WINF_DESKTOP) && w->app_id == APP_RING3_BACKED) {
+        /* Nunca cerrar el desktop Ring 3 desde el chrome de ventanas. */
+        return;
+    }
+    if (w->app_id == APP_RING3_BACKED && r3wm_force_close_wid(id, true)) {
+        return;
+    }
+    idx = wm_index_by_id(id);
+    app_idx = app_index_by_id(w->app_id);
+    if (app_idx >= 0 && g_apps[app_idx].window_id == id) {
+        g_apps[app_idx].window_id = 0;
+        g_app_launch_count[app_idx] = 0;
+    }
     w->visible = false;
     w->minimized = false;
+    if (g_mouse_dragging && g_mouse_drag_window_id == id) {
+        g_mouse_dragging = false;
+        g_mouse_drag_window_id = -1;
+        g_mouse_drag_kind = 0;
+        g_mouse_resize_edges = 0;
+    }
     wm_focus_last_visible();
+    if (idx >= 0 && g_window_focus == idx) wm_focus_last_visible();
+    g_needs_redraw = true;
 }
 
 static void wm_set_line(window_t *win, int i, const char *t) {
@@ -285,15 +327,28 @@ static int app_index_by_name(const char *name) {
     if (k_strcasecmp_ascii(name, "ridux files") == 0) return app_index_by_name("Files");
     if (k_strcasecmp_ascii(name, "about ridux") == 0) return app_index_by_name("About");
     if (k_strcasecmp_ascii(name, "system monitor") == 0) return app_index_by_name("Monitor");
+    if (k_strcasecmp_ascii(name, "about") == 0) return app_index_by_name("About");
+    if (k_strcasecmp_ascii(name, "calc") == 0) return app_index_by_name("Calculator");
+    if (k_strcasecmp_ascii(name, "store") == 0) return app_index_by_name("Ridux Store");
+    if (k_strcasecmp_ascii(name, "task") == 0 ||
+        k_strcasecmp_ascii(name, "taskmgr") == 0) return app_index_by_name("Task Manager");
+    if (k_strcasecmp_ascii(name, "log") == 0) return app_index_by_name("Log Viewer");
+    if (k_strcasecmp_ascii(name, "sysinfo") == 0 ||
+        k_strcasecmp_ascii(name, "system") == 0) return app_index_by_name("System Info");
+    if (k_strcasecmp_ascii(name, "ttt") == 0 ||
+        k_strcasecmp_ascii(name, "tictactoe") == 0) return app_index_by_name("Tic-Tac-Toe");
+    if (k_strcasecmp_ascii(name, "ring3") == 0) return app_index_by_name("Ring 3 Demo");
     return -1;
 }
 
 static bool app_focus_existing_instance(int idx) {
     int id;
+    int widx;
     if (idx < 0 || idx >= g_app_count) return false;
     id = g_apps[idx].window_id;
     if (id <= 0) return false;
-    if (wm_index_by_id(id) < 0) {
+    widx = wm_index_by_id(id);
+    if (widx < 0 || !g_windows[widx].used || !g_windows[widx].visible) {
         g_apps[idx].window_id = 0;
         g_app_launch_count[idx] = 0;
         return false;
@@ -336,8 +391,8 @@ static const char *app_user_path_for_id(int app_id) {
 
 static bool app_launch_firefox_real(void) {
     static const char *const paths[] = {
-        "/opt/firefox/firefox-bin",
         "/opt/firefox/firefox",
+        "/opt/firefox/firefox-bin",
         "/usr/lib/firefox-esr/firefox-esr",
         "/usr/lib/firefox/firefox"
     };
@@ -399,8 +454,12 @@ static app_t *app_by_window(const window_t *w) {
 }
 static bool app_is_running(int app_id) {
     int idx = app_index_by_id(app_id);
+    int widx;
     if (idx < 0) return false;
-    if (g_apps[idx].window_id > 0 && wm_index_by_id(g_apps[idx].window_id) >= 0) return true;
+    if (g_apps[idx].window_id > 0) {
+        widx = wm_index_by_id(g_apps[idx].window_id);
+        if (widx >= 0 && g_windows[widx].used && g_windows[widx].visible) return true;
+    }
     if (g_apps[idx].window_id > 0) {
         g_apps[idx].window_id = 0;
         g_app_launch_count[idx] = 0;
@@ -590,19 +649,19 @@ static void render_window(const window_t *w, bool focused) {
 
     /* Title icon (larger, centered vertically in title bar) */
     if (app && app->icon_id >= 0 && app->icon_id < RIDUX_ICON_COUNT) {
-        int is = 24;
+        int is = 20;
         flush_image(w->x + 12, w->y + (WIN_TITLE_H - is) / 2, is, is,
                     &RIDUX_ICONS[app->icon_id], focused ? 240 : 180);
     }
 
-    /* Title text: 2x rendered from high-res glyph atlas for crisp edges. */
+    /* Titulo chico y limpio; el 2x anterior parecia cartel pegado al vidrio. */
     {
-        const int title_scale = 2;
+        const int title_scale = 1;
         const int title_h = 16 * title_scale;
-        int tx = w->x + 44;
+        int tx = w->x + 40;
         int ty = w->y + (WIN_TITLE_H - title_h) / 2;
         /* Clip so long titles don't overlap window controls. */
-        int clip_w = w->w - 44 - WIN_CTRL_W * 3 - 8;
+        int clip_w = w->w - 40 - WIN_CTRL_W * 3 - 8;
         if (clip_w < 40) clip_w = 40;
         flush_scissor_push(tx, w->y, clip_w, WIN_TITLE_H);
         flush_text_scaled(tx, ty, title_scale, text_color,
@@ -637,6 +696,14 @@ static void render_window(const window_t *w, bool focused) {
     /* Outline ring */
     flush_stroke_round(w->x, w->y, w->w, w->h, WIN_RADIUS, 1,
                        rgb_hex(th->stroke), focused ? 200 : 120);
+    if (!w->maximized && !(w->flags & WINF_DESKTOP) && !(w->flags & WINF_BORDERLESS)) {
+        uint32_t grip = focused ? accent : muted;
+        int gx = w->x + w->w - 18;
+        int gy = w->y + w->h - 18;
+        flush_line(gx + 11, gy + 3, gx + 3, gy + 11, 1, grip, focused ? 130 : 82);
+        flush_line(gx + 15, gy + 7, gx + 7, gy + 15, 1, grip, focused ? 150 : 92);
+        flush_line(gx + 16, gy + 12, gx + 12, gy + 16, 1, grip, focused ? 170 : 110);
+    }
     (void)i; (void)muted;
 }
 
@@ -717,6 +784,12 @@ typedef struct ridux_r3win {
 
 static ridux_r3win_t g_r3wins[RIDUX_WIN_MAX];
 
+static bool r3wm_debug_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = kvfs_exists("/etc/ridux-native-debug.enable") ? 1 : 0;
+    return cached != 0;
+}
+
 /* Find slot by WM window id (the public id, NOT g_windows index). */
 static ridux_r3win_t *r3wm_find_by_wid(int wid) {
     int i;
@@ -752,6 +825,46 @@ static void r3wm_free_fb(ridux_r3win_t *r) {
     r->fb_pages = 0;
     r->fb_user_va = 0;
     r->as = NULL;
+}
+
+static bool r3wm_force_close_wid(int wid, bool kill_task) {
+    ridux_r3win_t *r = r3wm_find_by_wid(wid);
+    int idx;
+    int app_idx;
+    int pid;
+    if (!r) return false;
+    idx = r->window_idx;
+    if (idx < 0 || idx >= g_window_count || g_windows[idx].id != wid) {
+        idx = wm_index_by_id(wid);
+    }
+    if (idx >= 0 && idx < g_window_count &&
+        (g_windows[idx].flags & WINF_DESKTOP) &&
+        g_windows[idx].app_id == APP_RING3_BACKED) {
+        return false;
+    }
+    app_idx = app_index_by_id(r->app_id);
+    if (app_idx >= 0 && g_apps[app_idx].window_id == wid) {
+        g_apps[app_idx].window_id = 0;
+        g_app_launch_count[app_idx] = 0;
+    }
+    r3wm_free_fb(r);
+    if (idx >= 0 && idx < g_window_count) {
+        g_windows[idx].used = false;
+        g_windows[idx].visible = false;
+        g_windows[idx].minimized = false;
+        if (g_window_focus == idx) wm_focus_last_visible();
+    }
+    if (g_mouse_dragging && g_mouse_drag_window_id == wid) {
+        g_mouse_dragging = false;
+        g_mouse_drag_window_id = -1;
+        g_mouse_drag_kind = 0;
+        g_mouse_resize_edges = 0;
+    }
+    pid = r->pid;
+    k_memset(r, 0, sizeof(*r));
+    if (kill_task && pid > 1) task_exit(pid, 0);
+    g_needs_redraw = true;
+    return true;
 }
 
 /* Allocate framebuffer pages, map them in the user's address space at
@@ -818,6 +931,35 @@ static void r3wm_compose_window(int window_idx, ui_rect_t body) {
     if (body.x + (int)copy_w > (int)g_fb.width)  copy_w = g_fb.width  - (uint32_t)body.x;
     if (body.y + (int)copy_h > (int)g_fb.height) copy_h = g_fb.height - (uint32_t)body.y;
 
+    if (body.w > 0 && body.h > 0 &&
+        ((uint32_t)body.w != r->width || (uint32_t)body.h != r->height)) {
+        uint32_t out_w = (uint32_t)body.w;
+        uint32_t out_h = (uint32_t)body.h;
+        if (body.x + (int)out_w > (int)g_fb.width) out_w = g_fb.width - (uint32_t)body.x;
+        if (body.y + (int)out_h > (int)g_fb.height) out_h = g_fb.height - (uint32_t)body.y;
+        for (y = 0; y < out_h; ++y) {
+            uint32_t sy = (uint32_t)(((uint64_t)y * r->height) / out_h);
+            uint32_t row_byte = sy * r->stride;
+            uint32_t pg = row_byte >> 12;
+            uint32_t in_pg = row_byte & 0xFFFu;
+            uint32_t x;
+            if (pg >= r->fb_pages) break;
+            for (x = 0; x < out_w; ++x) {
+                uint32_t sx = (uint32_t)(((uint64_t)x * r->width) / out_w);
+                uint32_t off = in_pg + sx * 4u;
+                uint32_t src_pg = pg + (off >> 12);
+                uint32_t src_in = off & 0xFFFu;
+                uint32_t *dst = g_backbuffer
+                              + (size_t)(body.y + (int)y) * FB_MAX_WIDTH
+                              + (size_t)(body.x + (int)x);
+                if (src_pg >= r->fb_pages) continue;
+                *dst = *(const uint32_t *)((const uint8_t *)PHYS_TO_DMAP(r->fb_frames[src_pg]) + src_in);
+            }
+        }
+        r->damaged = false;
+        return;
+    }
+
     for (y = 0; y < copy_h; ++y) {
         uint32_t row_byte = y * r->stride;
         uint32_t pg = row_byte >> 12;
@@ -858,7 +1000,17 @@ static void r3wm_post_mouse(int window_idx, uint32_t type,
                             int win_x, int win_y, uint32_t button) {
     ridux_r3win_t *r = r3wm_find_by_window_idx(window_idx);
     ridux_event_t ev;
+    ui_rect_t body;
     if (!r) return;
+    body = window_body_rect(&g_windows[window_idx]);
+    if (body.w > 0 && body.h > 0) {
+        if (win_x < 0) win_x = 0;
+        if (win_y < 0) win_y = 0;
+        if (win_x >= body.w) win_x = body.w - 1;
+        if (win_y >= body.h) win_y = body.h - 1;
+        win_x = (int)(((uint64_t)(uint32_t)win_x * r->width) / (uint32_t)body.w);
+        win_y = (int)(((uint64_t)(uint32_t)win_y * r->height) / (uint32_t)body.h);
+    }
     k_memset(&ev, 0, sizeof(ev));
     ev.type = type;
     ev.x = win_x;
@@ -902,12 +1054,34 @@ static int64_t r3wm_sys_window_open(uint64_t a0, uint64_t a1, uint64_t a2,
     uint32_t req_flags;
     uint32_t req_w;
     uint32_t req_h;
+    bool trace = r3wm_debug_trace_enabled();
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
 
-    if (!args || !cur || !cur->addr_space) return -14; /* -EFAULT */
+    if (trace) {
+        __boot_serial_force_puts("[r3wm-open>] pid=");
+        __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+        if(cur&&cur->name[0]){__boot_serial_force_puts(" name=");__boot_serial_force_puts(cur->name);}
+        __boot_serial_force_puts(" args=");
+        __boot_serial_force_puthex64(a0);
+        __boot_serial_force_puts("\n");
+    }
+
+    if (!args || !cur || !cur->addr_space) {
+        if (trace) __boot_serial_force_puts("[r3wm-open!] bad task/args\n");
+        return -14; /* -EFAULT */
+    }
     req_flags = args->flags;
     req_w = args->width;
     req_h = args->height;
+    if (trace) {
+        __boot_serial_force_puts("[r3wm-open] req w=");
+        __boot_serial_force_putu32(req_w);
+        __boot_serial_force_puts(" h=");
+        __boot_serial_force_putu32(req_h);
+        __boot_serial_force_puts(" flags=");
+        __boot_serial_force_puthex64(req_flags);
+        __boot_serial_force_puts("\n");
+    }
     if (req_flags & RIDUX_WIN_FLAG_DESKTOP) {
         /* El escritorio de Ring 3 no deberia adivinar la resolucion.
          * Si el framebuffer cambia, el kernel le da el tamano real y listo. */
@@ -918,8 +1092,14 @@ static int64_t r3wm_sys_window_open(uint64_t a0, uint64_t a1, uint64_t a2,
         if (req_w < RIDUX_WIN_MIN_W) req_w = RIDUX_WIN_MIN_W;
         if (req_h < RIDUX_WIN_MIN_H) req_h = RIDUX_WIN_MIN_H;
     }
-    if (req_w < RIDUX_WIN_MIN_W || req_w > RIDUX_WIN_MAX_W) return -22;
-    if (req_h < RIDUX_WIN_MIN_H || req_h > RIDUX_WIN_MAX_H) return -22;
+    if (req_w < RIDUX_WIN_MIN_W || req_w > RIDUX_WIN_MAX_W) {
+        if (trace) __boot_serial_force_puts("[r3wm-open!] bad width\n");
+        return -22;
+    }
+    if (req_h < RIDUX_WIN_MIN_H || req_h > RIDUX_WIN_MAX_H) {
+        if (trace) __boot_serial_force_puts("[r3wm-open!] bad height\n");
+        return -22;
+    }
     if (req_flags & RIDUX_WIN_FLAG_BORDERLESS) win_flags |= WINF_BORDERLESS;
     if (req_flags & RIDUX_WIN_FLAG_DESKTOP) {
         win_flags |= WINF_DESKTOP | WINF_BORDERLESS | WINF_NO_FOCUS | WINF_NO_TASKBAR;
@@ -945,7 +1125,10 @@ static int64_t r3wm_sys_window_open(uint64_t a0, uint64_t a1, uint64_t a2,
     for (i = 0; i < RIDUX_WIN_MAX; ++i) {
         if (!g_r3wins[i].used) { slot = i; break; }
     }
-    if (slot < 0) return -24; /* -EMFILE */
+    if (slot < 0) {
+        if (trace) __boot_serial_force_puts("[r3wm-open!] no slots\n");
+        return -24; /* -EMFILE */
+    }
     r = &g_r3wins[slot];
     k_memset(r, 0, sizeof(*r));
     r->used = true;
@@ -957,10 +1140,29 @@ static int64_t r3wm_sys_window_open(uint64_t a0, uint64_t a1, uint64_t a2,
     r->flags = req_flags;
 
     /* Allocate + map FB into user address space. */
+    if (trace) {
+        __boot_serial_force_puts("[r3wm-open] allocfb pages for w=");
+        __boot_serial_force_putu32(req_w);
+        __boot_serial_force_puts(" h=");
+        __boot_serial_force_putu32(req_h);
+        __boot_serial_force_puts("\n");
+    }
     rc = r3wm_alloc_fb(r, cur->addr_space, req_w, req_h);
     if (rc < 0) {
+        if (trace) {
+            __boot_serial_force_puts("[r3wm-open!] allocfb rc=-");
+            __boot_serial_force_putu32((uint32_t)(-rc));
+            __boot_serial_force_puts("\n");
+        }
         k_memset(r, 0, sizeof(*r));
         return rc;
+    }
+    if (trace) {
+        __boot_serial_force_puts("[r3wm-open] fb va=");
+        __boot_serial_force_puthex64(r->fb_user_va);
+        __boot_serial_force_puts(" pages=");
+        __boot_serial_force_putu32(r->fb_pages);
+        __boot_serial_force_puts("\n");
     }
 
     if (win_flags & WINF_BORDERLESS) {
@@ -986,6 +1188,7 @@ static int64_t r3wm_sys_window_open(uint64_t a0, uint64_t a1, uint64_t a2,
                         x, y, win_w, win_h,
                         232);
     if (wid < 0) {
+        if (trace) __boot_serial_force_puts("[r3wm-open!] wm_add_window failed\n");
         r3wm_free_fb(r);
         k_memset(r, 0, sizeof(*r));
         return -24;
@@ -997,6 +1200,7 @@ static int64_t r3wm_sys_window_open(uint64_t a0, uint64_t a1, uint64_t a2,
         if (g_windows[i].id == wid) { r->window_idx = i; break; }
     }
     if (r->window_idx < 0) {
+        if (trace) __boot_serial_force_puts("[r3wm-open!] window_idx missing\n");
         r3wm_free_fb(r);
         k_memset(r, 0, sizeof(*r));
         return -22;
@@ -1015,6 +1219,17 @@ static int64_t r3wm_sys_window_open(uint64_t a0, uint64_t a1, uint64_t a2,
     args->fb_user_va = r->fb_user_va;
     args->stride = r->stride;
     args->flags = r->flags;
+    if (trace) {
+        __boot_serial_force_puts("[r3wm-open<] wid=");
+        __boot_serial_force_putu32((uint32_t)wid);
+        __boot_serial_force_puts(" idx=");
+        __boot_serial_force_putu32((uint32_t)r->window_idx);
+        __boot_serial_force_puts(" size=");
+        __boot_serial_force_putu32(req_w);
+        __boot_serial_force_puts("x");
+        __boot_serial_force_putu32(req_h);
+        __boot_serial_force_puts("\n");
+    }
     return 0;
 }
 
@@ -1028,6 +1243,21 @@ static int64_t r3wm_sys_window_present(uint64_t a0, uint64_t a1, uint64_t a2,
     ridux_r3win_t *r = r3wm_find_by_wid(wid);
     (void)a5;
     if (!r) return -9; /* -EBADF */
+    if (r3wm_debug_trace_enabled()) {
+        static uint32_t present_trace;
+        if (present_trace < 16u) {
+            ++present_trace;
+            __boot_serial_force_puts("[r3wm-present] #");
+            __boot_serial_force_putu32(present_trace);
+            __boot_serial_force_puts(" wid=");
+            __boot_serial_force_putu32((uint32_t)wid);
+            __boot_serial_force_puts(" rect=");
+            __boot_serial_force_putu32((uint32_t)(w < 0 ? 0 : w));
+            __boot_serial_force_puts("x");
+            __boot_serial_force_putu32((uint32_t)(h < 0 ? 0 : h));
+            __boot_serial_force_puts("\n");
+        }
+    }
     if (w <= 0 || h <= 0) {
         r->damaged = true;
         r->dmg_x = 0; r->dmg_y = 0;
@@ -1066,7 +1296,18 @@ static int64_t r3wm_sys_window_poll(uint64_t a0, uint64_t a1, uint64_t a2,
      * this yield they hog the CPU and starve the kernel main thread
      * that draws the desktop, so the window itself never becomes
      * visible even though it was opened successfully. */
-    if (n == 0) task_schedule();
+    if (n == 0) {
+        static uint32_t poll_yield_trace;
+        if (r3wm_debug_trace_enabled() && poll_yield_trace < 12u) {
+            ++poll_yield_trace;
+            __boot_serial_force_puts("[r3wm-poll-yield] #");
+            __boot_serial_force_putu32(poll_yield_trace);
+            __boot_serial_force_puts(" wid=");
+            __boot_serial_force_putu32((uint32_t)wid);
+            __boot_serial_force_puts("\n");
+        }
+        task_schedule();
+    }
     return (int64_t)n;
 }
 
@@ -1077,6 +1318,17 @@ static int64_t r3wm_sys_desktop_state(uint64_t a0, uint64_t a1, uint64_t a2,
     int i;
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     if (!st) return -14; /* -EFAULT */
+    if (r3wm_debug_trace_enabled()) {
+        static uint32_t state_trace;
+        if (state_trace < 12u) {
+            ++state_trace;
+            __boot_serial_force_puts("[r3wm-state] #");
+            __boot_serial_force_putu32(state_trace);
+            __boot_serial_force_puts(" st=");
+            __boot_serial_force_puthex64(a0);
+            __boot_serial_force_puts("\n");
+        }
+    }
     k_memset(st, 0, sizeof(*st));
     st->width = g_fb.width;
     st->height = g_fb.height;
@@ -1089,6 +1341,28 @@ static int64_t r3wm_sys_desktop_state(uint64_t a0, uint64_t a1, uint64_t a2,
     st->day = g_rtc_now.day;
     st->month = g_rtc_now.month;
     st->year = g_rtc_now.year;
+    st->gpu_real = ridux_gpu_real_present_available() ? 1u : 0u;
+    st->mesa_ready = kvfs_exists("/usr/share/glvnd/egl_vendor.d/50_mesa.json") ? 1u : 0u;
+    st->opengl_ready =
+        (kvfs_exists("/usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0") ||
+         kvfs_exists("/lib64/libEGL_mesa.so.0")) ? 1u : 0u;
+    st->vulkan_ready =
+        (kvfs_exists("/usr/share/vulkan/icd.d/intel_icd.x86_64.json") ||
+         kvfs_exists("/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json") ||
+         kvfs_exists("/usr/share/vulkan/icd.d/radeon_icd.x86_64.json") ||
+         kvfs_exists("/usr/share/vulkan/icd.d/nouveau_icd.x86_64.json") ||
+         kvfs_exists("/usr/share/vulkan/icd.d/virtio_icd.x86_64.json") ||
+         kvfs_exists("/usr/share/vulkan/icd.d/vmwgfx_icd.x86_64.json")) ? 1u : 0u;
+    st->physical_gpu_preferred = kvfs_exists("/etc/ridux-physical-gpu-preferred.enable") ? 1u : 0u;
+    if (st->gpu_real && st->mesa_ready && st->opengl_ready && st->vulkan_ready) {
+        k_strlcpy(st->gpu_backend, "GPU present + Mesa OpenGL/Vulkan", sizeof(st->gpu_backend));
+    } else if (st->gpu_real) {
+        k_strlcpy(st->gpu_backend, ridux_gpu_present_backend(), sizeof(st->gpu_backend));
+    } else if (st->physical_gpu_preferred && st->mesa_ready && st->opengl_ready && st->vulkan_ready) {
+        k_strlcpy(st->gpu_backend, "Mesa physical GPU path staged", sizeof(st->gpu_backend));
+    } else {
+        k_strlcpy(st->gpu_backend, ridux_gpu_present_backend(), sizeof(st->gpu_backend));
+    }
     for (i = 0; i < g_app_count && out < RIDUX_DESKTOP_APP_MAX; ++i) {
         ridux_desktop_app_state_t *dst;
         if (!g_apps[i].pinned_task) continue;
@@ -1112,28 +1386,16 @@ static int64_t r3wm_sys_window_close(uint64_t a0, uint64_t a1, uint64_t a2,
     int wid = (int)a0;
     ridux_r3win_t *r = r3wm_find_by_wid(wid);
     int idx;
-    int app_idx;
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     if (!r) return -9; /* -EBADF */
     idx = r->window_idx;
-    app_idx = app_index_by_id(r->app_id);
-    if (app_idx >= 0 && g_apps[app_idx].window_id == wid) {
-        g_apps[app_idx].window_id = 0;
-        g_app_launch_count[app_idx] = 0;
+    if (idx >= 0 && idx < g_window_count &&
+        (g_windows[idx].flags & WINF_DESKTOP) &&
+        g_windows[idx].app_id == APP_RING3_BACKED) {
+        /* El desktop shell no debe autodestruirse. */
+        return -1;
     }
-    r3wm_free_fb(r);
-    /* Hide the window in the WM. We don't fully delete it from
-     * g_windows[] (the existing WM doesn't support compaction during
-     * runtime); marking unused + invisible is enough to take it out
-     * of the render and click paths. */
-    if (idx >= 0 && idx < g_window_count) {
-        g_windows[idx].used = false;
-        g_windows[idx].visible = false;
-        if (g_window_focus == idx) g_window_focus = -1;
-    }
-    k_memset(r, 0, sizeof(*r));
-    g_needs_redraw = true;
-    return 0;
+    return r3wm_force_close_wid(wid, false) ? 0 : -9;
 }
 
 /* Called from kernel_main during boot, AFTER compat3_rewire_syscalls()
@@ -3016,7 +3278,10 @@ static void app_draw_sysinfo(window_t *w, ui_rect_t body) {
                                                            : "  single-core/BSP");
                    });
     ROW("Framebuffer", { k_append_u32(line, &l, sizeof(line), g_fb.width); k_append_ch(line, &l, sizeof(line), 'x'); k_append_u32(line, &l, sizeof(line), g_fb.height); k_append_ch(line, &l, sizeof(line), 'x'); k_append_u32(line, &l, sizeof(line), g_fb.bpp); k_append_str(line, &l, sizeof(line), g_fb_fast_bgra ? "  (BGRA fast path)" : "  (generic)"); });
-    ROW("GPU accel",   k_append_str(line, &l, sizeof(line), g_gpu_accel_kind));
+    ROW("GPU accel",   { k_append_str(line, &l, sizeof(line), g_gpu_accel_kind);
+                         k_append_str(line, &l, sizeof(line), " | present=");
+                         k_append_str(line, &l, sizeof(line), ridux_gpu_present_backend());
+                       });
     ROW("Heap",        { k_append_u32(line, &l, sizeof(line), used / 1024u); k_append_str(line, &l, sizeof(line), "K / "); k_append_u32(line, &l, sizeof(line), HEAP_SIZE / 1024u); k_append_str(line, &l, sizeof(line), "K (peak "); k_append_u32(line, &l, sizeof(line), peak / 1024u); k_append_str(line, &l, sizeof(line), "K)"); });
     ROW("Allocs",      { k_append_u32(line, &l, sizeof(line), allocs); k_append_str(line, &l, sizeof(line), " allocs / "); k_append_u32(line, &l, sizeof(line), frees); k_append_str(line, &l, sizeof(line), " frees"); });
     ROW("Processes",   k_append_u32(line, &l, sizeof(line), (uint32_t)proc_count()));
@@ -3837,6 +4102,13 @@ static volatile int g_render_in_progress = 0;
 
 static void render_scene(void) {
     int i;
+    if (g_wayfire_desktop_active) {
+        /* Wayfire presents through the DRM compat path. If the old Flush
+         * compositor paints here, it races the real desktop and wipes frames. */
+        g_needs_redraw = false;
+        g_cursor_moved = false;
+        return;
+    }
 
     /* Reentrancy guard. render_scene runs from two contexts:
      *   1. The kernel main loop in kernel_main()
@@ -3899,15 +4171,11 @@ static void render_scene(void) {
         if (g_quick_open) render_quick_settings();
     }
 
-    /* Two-pass flush: commit the non-cursor scene to the backbuffer,
-     * snapshot the clean pixels under where the cursor will be drawn,
-     * then queue + commit the cursor sprite on top. Cost: one extra
-     * fb_present (the second one diffs to ~one cursor's worth of MMIO,
-     * which is essentially free). Benefit: subsequent cursor-only
-     * frames can erase the old cursor by restoring the underbuffer
-     * instead of recomputing the entire scene. */
-    flush_execute();
-    x11_render_now();
+    /* Build the whole scene in the backbuffer first. Presenting before the
+     * X11 overlay made Firefox clicks flash the desktop underneath. */
+    flush_execute_to_backbuffer();
+    x11_render_scene_overlay_to_backbuffer_now();
+    wl7_render_surfaces_to_backbuffer_now();
     flush_cursor_save_under(g_mouse_x - 4, g_mouse_y - 4, 24, 24);
     flush_reset();
     render_cursor();
@@ -3925,6 +4193,10 @@ static void render_scene(void) {
  * rects. This is what makes mouse motion feel instantaneous even
  * though render_scene itself takes several ms. */
 static void render_cursor_only(void) {
+    if (g_wayfire_desktop_active) {
+        g_cursor_moved = false;
+        return;
+    }
     if (!g_fb.ready || g_panic_active) return;
     if (g_needs_redraw) return;
     flush_cursor_restore_under();
@@ -3938,6 +4210,10 @@ static void render_cursor_only(void) {
 void ridux_request_cursor_redraw(void) {
     if (!g_fb.ready || g_panic_active) return;
     g_cursor_moved = true;
+}
+
+bool ridux_scene_needs_redraw(void) {
+    return g_needs_redraw;
 }
 
 void ridux_present_cursor_after_external_blit(int x, int y, int w, int h) {

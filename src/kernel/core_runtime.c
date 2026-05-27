@@ -122,6 +122,15 @@ static bool k_contains(const char *text, const char *needle) {
     }
     return false;
 }
+extern bool kvfs_exists(const char *path);
+static bool k_desktop_debug_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = (kvfs_exists("/etc/ridux-wayfire-debug.enable") ||
+                  kvfs_exists("/etc/ridux-hyprland-debug.enable")) ? 1 : 0;
+    }
+    return cached != 0;
+}
 static void k_append_str(char *dst, size_t *len, size_t cap, const char *src) {
     while (*src && *len + 1 < cap) { dst[(*len)++] = *src++; }
     dst[*len] = 0;
@@ -153,6 +162,13 @@ static void k_append_hex(char *dst, size_t *len, size_t cap, uint32_t v, int dig
     static const char *hx = "0123456789ABCDEF";
     for (i = digits - 1; i >= 0; --i) {
         k_append_ch(dst, len, cap, hx[(v >> (i * 4)) & 0xF]);
+    }
+}
+static void k_append_hex64(char *dst, size_t *len, size_t cap, uint64_t v, int digits) {
+    int i;
+    static const char *hx = "0123456789ABCDEF";
+    for (i = digits - 1; i >= 0; --i) {
+        k_append_ch(dst, len, cap, hx[(v >> ((uint32_t)i * 4u)) & 0xFULL]);
     }
 }
 static int k_atoi(const char *s) {
@@ -551,30 +567,64 @@ static uint16_t pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8
     uint32_t v = pci_config_read32(bus, slot, func, (uint8_t)(off & 0xFCu));
     return (uint16_t)((v >> ((off & 2u) * 8u)) & 0xFFFFu);
 }
+static uint8_t pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    uint32_t v = pci_config_read32(bus, slot, func, (uint8_t)(off & 0xFCu));
+    return (uint8_t)((v >> ((off & 3u) * 8u)) & 0xFFu);
+}
 
 static bool pci_probe(void) { return true; }
 static void pci_enumerate(void) {
-    int b, s, f;
+    int b, s, f, bar;
     g_pci_device_count = 0;
     for (b = 0; b < 1; ++b) {
         for (s = 0; s < 32; ++s) {
-            for (f = 0; f < 1; ++f) {
+            for (f = 0; f < 8; ++f) {
                 uint16_t vid = pci_config_read16((uint8_t)b, (uint8_t)s, (uint8_t)f, 0);
                 uint32_t cls;
                 if (vid == 0xFFFF) continue;
                 if (g_pci_device_count >= PCI_MAX_DEVICES) break;
                 uint16_t did = pci_config_read16((uint8_t)b, (uint8_t)s, (uint8_t)f, 2);
                 cls = pci_config_read32((uint8_t)b, (uint8_t)s, (uint8_t)f, 8);
+                g_pci_devices[g_pci_device_count].header_type = pci_config_read8((uint8_t)b, (uint8_t)s, (uint8_t)f, 0x0E);
                 g_pci_devices[g_pci_device_count].bus = (uint8_t)b;
                 g_pci_devices[g_pci_device_count].slot = (uint8_t)s;
                 g_pci_devices[g_pci_device_count].func = (uint8_t)f;
                 g_pci_devices[g_pci_device_count].vendor_id = vid;
                 g_pci_devices[g_pci_device_count].device_id = did;
+                for (bar = 0; bar < 6; ++bar) {
+                    g_pci_devices[g_pci_device_count].bar[bar] = pci_config_read32((uint8_t)b, (uint8_t)s, (uint8_t)f, (uint8_t)(0x10 + bar * 4));
+                }
                 g_pci_devices[g_pci_device_count].revision = (uint8_t)(cls & 0xFFu);
                 g_pci_devices[g_pci_device_count].prog_if  = (uint8_t)((cls >> 8) & 0xFFu);
                 g_pci_devices[g_pci_device_count].subclass = (uint8_t)((cls >> 16) & 0xFFu);
                 g_pci_devices[g_pci_device_count].class_code = (uint8_t)((cls >> 24) & 0xFFu);
+                __boot_serial_force_puts("[pci] ");
+                __boot_serial_force_putu32((uint32_t)b);
+                __boot_serial_force_puts(":");
+                __boot_serial_force_putu32((uint32_t)s);
+                __boot_serial_force_puts(".");
+                __boot_serial_force_putu32((uint32_t)f);
+                __boot_serial_force_puts(" vid=");
+                __boot_serial_force_puthex64((uint64_t)vid);
+                __boot_serial_force_puts(" did=");
+                __boot_serial_force_puthex64((uint64_t)did);
+                __boot_serial_force_puts(" class=");
+                __boot_serial_force_puthex64((uint64_t)((cls >> 24) & 0xFFu));
+                __boot_serial_force_puts(" sub=");
+                __boot_serial_force_puthex64((uint64_t)((cls >> 16) & 0xFFu));
+                __boot_serial_force_puts(" if=");
+                __boot_serial_force_puthex64((uint64_t)((cls >> 8) & 0xFFu));
+                __boot_serial_force_puts(" hdr=");
+                __boot_serial_force_puthex64((uint64_t)g_pci_devices[g_pci_device_count].header_type);
+                __boot_serial_force_puts(" bar0=");
+                __boot_serial_force_puthex64((uint64_t)g_pci_devices[g_pci_device_count].bar[0]);
+                __boot_serial_force_puts(" bar1=");
+                __boot_serial_force_puthex64((uint64_t)g_pci_devices[g_pci_device_count].bar[1]);
+                __boot_serial_force_puts(" bar2=");
+                __boot_serial_force_puthex64((uint64_t)g_pci_devices[g_pci_device_count].bar[2]);
+                __boot_serial_force_puts("\n");
                 ++g_pci_device_count;
+                if (f == 0 && (g_pci_devices[g_pci_device_count - 1].header_type & 0x80u) == 0) break;
             }
         }
     }
@@ -590,23 +640,35 @@ static void gpu_update_status_from_pci(void) {
         if (d->class_code != 0x03u) continue;
         g_gpu_hw_present = true;
         if (d->vendor_id == 0x80EEu) {
-            name = "VirtualBox VMSVGA framebuffer + dirty blit";
+            name = "VirtualBox VMSVGA detected";
             break;
         }
         if (d->vendor_id == 0x1234u) {
-            name = "Bochs/QEMU VGA framebuffer + dirty blit";
+            name = "Bochs/QEMU VGA detected";
             break;
         }
         if (d->vendor_id == 0x1AF4u) {
-            name = "virtio-gpu detected, framebuffer blit active";
+            name = "virtio-gpu detected";
             break;
         }
-        name = "PCI display framebuffer + dirty blit";
+        if (d->vendor_id == 0x8086u) {
+            name = "Intel physical GPU detected";
+            break;
+        }
+        if (d->vendor_id == 0x1002u || d->vendor_id == 0x1022u) {
+            name = "AMD physical GPU detected";
+            break;
+        }
+        if (d->vendor_id == 0x10DEu) {
+            name = "NVIDIA physical GPU detected";
+            break;
+        }
+        name = "PCI display device detected";
     }
 
     if (g_use_backbuffer && g_fb_fast_bgra) {
         g_gpu_accel_enabled = true;
-        g_gpu_accel_kind = name ? name : "linear BGRA framebuffer + dirty blit";
+        g_gpu_accel_kind = name ? name : "linear BGRA framebuffer";
     } else if (g_use_backbuffer) {
         g_gpu_accel_enabled = false;
         g_gpu_accel_kind = name ? "generic framebuffer, slow pixel conversion" :
@@ -924,6 +986,14 @@ static volatile uint32_t g_irq_counts[16];
 static volatile bool     g_idt_ready = false;
 static bool              g_panic_active = false;
 
+uint64_t ridux_kernel_timer_ticks(void) {
+    return g_pit_ticks;
+}
+
+uint32_t ridux_kernel_timer_hz(void) {
+    return g_pit_hz ? g_pit_hz : 100u;
+}
+
 static void kbd_ring_push(uint8_t b) {
     uint32_t next = (g_kbd_head + 1u) & (INPUT_RING_SIZE - 1u);
     if (next == g_kbd_tail) return; /* drop on overflow */
@@ -986,6 +1056,352 @@ static void panic(const char *title, const char *detail) {
     for (;;) __asm__ __volatile__("cli; hlt");
 }
 
+static bool user_qword_ok(task_t *t, uint64_t addr, uint64_t *out) {
+    if (!t || !t->addr_space || !out) return false;
+    if (addr >= 0x0000800000000000ULL || addr + 7u < addr) return false;
+    if (!(paging_get_entry(t->addr_space, addr) & PAGE_PRESENT)) return false;
+    if (!(paging_get_entry(t->addr_space, addr + 7u) & PAGE_PRESENT)) return false;
+    *out = *(uint64_t *)(uintptr_t)addr;
+    return true;
+}
+
+static bool user_qword_fault_in_ok(task_t *t, uint64_t addr, uint64_t *out) {
+    if (user_qword_ok(t, addr, out)) return true;
+    if (!t || t != task_current()) return false;
+    (void)compat3_handle_page_fault(addr, 0);
+    if (((addr + 7u) & ~(uint64_t)(PAGE_SIZE - 1u)) != (addr & ~(uint64_t)(PAGE_SIZE - 1u))) {
+        (void)compat3_handle_page_fault(addr + 7u, 0);
+    }
+    return user_qword_ok(t, addr, out);
+}
+
+static bool user_qword_put_ok(task_t *t, uint64_t addr, uint64_t val) {
+    if (!t || !t->addr_space) return false;
+    if (addr >= 0x0000800000000000ULL || addr + 7u < addr) return false;
+    if (!(paging_get_entry(t->addr_space, addr) & PAGE_PRESENT)) return false;
+    if (!(paging_get_entry(t->addr_space, addr + 7u) & PAGE_PRESENT)) return false;
+    *(uint64_t *)(uintptr_t)addr = val;
+    return true;
+}
+
+static bool wayfire_ld_rebuild_linfo(task_t *cur, uint64_t frame_base,
+                                     uint32_t vec, uint64_t fault_rip,
+                                     uint64_t cr2) {
+    enum {
+        DT_NULL = 0,
+        DT_NUM = 38,
+        DT_VALRNGLO = 0x6ffffd00,
+        DT_VALRNGHI = 0x6ffffdff,
+        DT_VALNUM = 12,
+        DT_ADDRRNGLO = 0x6ffffe00,
+        DT_ADDRRNGHI = 0x6ffffeff,
+        DT_ADDRNUM = 11,
+        DT_VERNEEDNUM = 0x6fffffff,
+        DT_VERSIONTAGNUM = 16,
+        DT_AUXILIARY = 0x7ffffffd,
+        DT_FILTER = 0x7fffffff,
+        DT_EXTRANUM = 3,
+        LINFO_OFF = 0x40
+    };
+    uint64_t lmap, l_ld, tag, val;
+    uint64_t linfo_base;
+    uint64_t loader_off;
+    uint32_t filled = 0;
+    uint32_t i;
+    if (vec != 14u || cr2 != 0x8u || !cur || !frame_base) return false;
+    if (!cur->name[0] || !k_contains(cur->name, "wayfire")) return false;
+    loader_off = (cur->aux_at_base && fault_rip >= cur->aux_at_base) ?
+                 (fault_rip - cur->aux_at_base) : fault_rip;
+    if (loader_off != 0xeba3u && loader_off != 0xec74u &&
+        fault_rip != 0x00000000404d3ba3ULL && fault_rip != 0x00000000404d3c74ULL) {
+        return false;
+    }
+    lmap = *(uint64_t *)(uintptr_t)(frame_base + 0u); /* r15 */
+    __boot_serial_force_puts("[wayfire-ld-fix-probe!] rip=");
+    __boot_serial_force_puthex64(fault_rip);
+    __boot_serial_force_puts(" off=");
+    __boot_serial_force_puthex64(loader_off);
+    __boot_serial_force_puts(" lmap=");
+    __boot_serial_force_puthex64(lmap);
+    __boot_serial_force_puts("\n");
+    if (!user_qword_fault_in_ok(cur, lmap + 0x10u, &l_ld) || !l_ld) {
+        __boot_serial_force_puts("[wayfire-ld-fix-miss!] link_map ld not present lmap=");
+        __boot_serial_force_puthex64(lmap);
+        __boot_serial_force_puts("\n");
+        return false;
+    }
+    linfo_base = lmap + LINFO_OFF;
+    for (i = 0; i < 512u; ++i) {
+        uint64_t dyn = l_ld + ((uint64_t)i * 16u);
+        uint64_t idx = 0xffffffffffffffffULL;
+        if (!user_qword_fault_in_ok(cur, dyn, &tag)) {
+            __boot_serial_force_puts("[wayfire-ld-fix-miss!] dynamic tag not present ld=");
+            __boot_serial_force_puthex64(l_ld);
+            __boot_serial_force_puts(" dyn=");
+            __boot_serial_force_puthex64(dyn);
+            __boot_serial_force_puts("\n");
+            return false;
+        }
+        if (!user_qword_fault_in_ok(cur, dyn + 8u, &val)) {
+            __boot_serial_force_puts("[wayfire-ld-fix-miss!] dynamic val not present ld=");
+            __boot_serial_force_puthex64(l_ld);
+            __boot_serial_force_puts(" dyn=");
+            __boot_serial_force_puthex64(dyn);
+            __boot_serial_force_puts("\n");
+            return false;
+        }
+        if (tag == DT_NULL) break;
+        if (tag < DT_NUM) {
+            idx = tag;
+        } else if (tag >= DT_VALRNGLO && tag <= DT_VALRNGHI) {
+            idx = (uint64_t)DT_NUM + DT_VERSIONTAGNUM + DT_EXTRANUM +
+                  (uint64_t)(DT_VALRNGHI - tag);
+        } else if (tag >= DT_ADDRRNGLO && tag <= DT_ADDRRNGHI) {
+            idx = (uint64_t)DT_NUM + DT_VERSIONTAGNUM + DT_EXTRANUM +
+                  DT_VALNUM + (uint64_t)(DT_ADDRRNGHI - tag);
+        } else if (tag >= 0x6ffffff0ULL && tag <= DT_VERNEEDNUM) {
+            idx = (uint64_t)DT_NUM + (uint64_t)(DT_VERNEEDNUM - tag);
+        } else if (tag == DT_AUXILIARY || tag == DT_FILTER) {
+            idx = (uint64_t)DT_NUM + DT_VERSIONTAGNUM +
+                  (tag == DT_AUXILIARY ? 1u : 0u);
+        }
+        if (idx != 0xffffffffffffffffULL && idx < 128u) {
+            if (user_qword_put_ok(cur, linfo_base + idx * 8u, dyn)) {
+                ++filled;
+            }
+        }
+    }
+    if (filled) {
+        __boot_serial_force_puts("[wayfire-ld-fix!] rebuilt l_info entries=");
+        __boot_serial_force_putu32(filled);
+        __boot_serial_force_puts(" lmap=");
+        __boot_serial_force_puthex64(lmap);
+        __boot_serial_force_puts(" ld=");
+        __boot_serial_force_puthex64(l_ld);
+        __boot_serial_force_puts(" off=");
+        __boot_serial_force_puthex64(loader_off);
+        __boot_serial_force_puts("\n");
+        return true;
+    }
+    return false;
+}
+
+static bool chrome_task_is_runtime(task_t *cur) {
+    if (!cur || !cur->name[0]) return false;
+    return k_contains(cur->name, "Chrome_ChildIOThread") ||
+           k_contains(cur->name, "Chrome_IOThread") ||
+           k_contains(cur->name, "NetworkService") ||
+           k_contains(cur->name, "chrome");
+}
+
+static bool glibc_secure_getenv_fix(task_t *cur, uint64_t frame_base,
+                                    uint64_t fault_rip, uint64_t cr2) {
+    static const uint8_t secure_getenv_fault_bytes[] = {
+        0x8b, 0x00, 0x85, 0xc0, 0x75, 0x0b,
+        0xe9, 0x7e, 0xdd, 0xff, 0xff, 0x66
+    };
+    const uint8_t *ip;
+    int32_t rel;
+    uint64_t resume;
+
+    if (!cur || !frame_base || cr2 != 0) return false;
+    if (!cur->name[0] || !k_contains(cur->name, "ridux-vulkan-probe")) return false;
+    if (!cur->addr_space || fault_rip >= 0x0000800000000000ULL) return false;
+    if (!(paging_get_entry(cur->addr_space, fault_rip) & PAGE_PRESENT)) return false;
+    if (!(paging_get_entry(cur->addr_space,
+                           fault_rip + sizeof(secure_getenv_fault_bytes) - 1u) & PAGE_PRESENT)) {
+        return false;
+    }
+
+    ip = (const uint8_t *)(uintptr_t)fault_rip;
+    if (k_memcmp_bytes(ip, secure_getenv_fault_bytes,
+                       sizeof(secure_getenv_fault_bytes)) != 0) {
+        return false;
+    }
+
+    rel = (int32_t)((uint32_t)ip[7] |
+                    ((uint32_t)ip[8] << 8) |
+                    ((uint32_t)ip[9] << 16) |
+                    ((uint32_t)ip[10] << 24));
+    resume = (uint64_t)((int64_t)(fault_rip + 11u) + (int64_t)rel);
+    if (resume >= 0x0000800000000000ULL) return false;
+    if (!(paging_get_entry(cur->addr_space, resume) & PAGE_PRESENT)) return false;
+
+    *(uint64_t *)(uintptr_t)(frame_base + 136u) = resume;
+    __boot_serial_force_puts("[glibc-secure-getenv-fix] pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    __boot_serial_force_puts(" rip=");
+    __boot_serial_force_puthex64(fault_rip);
+    __boot_serial_force_puts(" resume=");
+    __boot_serial_force_puthex64(resume);
+    __boot_serial_force_puts("\n");
+    return true;
+}
+
+static bool chrome_finish_partition_frame(task_t *cur, uint64_t frame_base,
+                                          uint64_t outer_rbp,
+                                          uint64_t fault_rip,
+                                          const char *tag) {
+    uint64_t saved_r15, saved_r14, saved_r13, saved_r12, saved_rbx;
+    uint64_t saved_rbp, ret;
+    if (!frame_base) return false;
+    if (!user_qword_ok(cur, outer_rbp - 8u, &saved_r15)) return false;
+    if (!user_qword_ok(cur, outer_rbp - 16u, &saved_r14)) return false;
+    if (!user_qword_ok(cur, outer_rbp - 24u, &saved_r13)) return false;
+    if (!user_qword_ok(cur, outer_rbp - 32u, &saved_r12)) return false;
+    if (!user_qword_ok(cur, outer_rbp - 40u, &saved_rbx)) return false;
+    if (!user_qword_ok(cur, outer_rbp + 0u, &saved_rbp)) return false;
+    if (!user_qword_ok(cur, outer_rbp + 8u, &ret)) return false;
+    if (ret < 0x0000000040000000ULL || ret >= 0x0000000060000000ULL) return false;
+
+    *(uint64_t *)(uintptr_t)(frame_base + 0u) = saved_r15;
+    *(uint64_t *)(uintptr_t)(frame_base + 8u) = saved_r14;
+    *(uint64_t *)(uintptr_t)(frame_base + 16u) = saved_r13;
+    *(uint64_t *)(uintptr_t)(frame_base + 24u) = saved_r12;
+    *(uint64_t *)(uintptr_t)(frame_base + 64u) = saved_rbp;
+    *(uint64_t *)(uintptr_t)(frame_base + 104u) = saved_rbx;
+    *(uint64_t *)(uintptr_t)(frame_base + 112u) = 0;
+    *(uint64_t *)(uintptr_t)(frame_base + 136u) = ret;
+    *(uint64_t *)(uintptr_t)(frame_base + 160u) = outer_rbp + 16u;
+
+    __boot_serial_force_puts("[chrome-pa-skip!] ");
+    __boot_serial_force_puts(tag ? tag : "free");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    __boot_serial_force_puts(" rip=");
+    __boot_serial_force_puthex64(fault_rip);
+    __boot_serial_force_puts(" ret=");
+    __boot_serial_force_puthex64(ret);
+    __boot_serial_force_puts("\n");
+    return true;
+}
+
+static bool chrome_return_current_frame(task_t *cur, uint64_t frame_base,
+                                        uint64_t fault_rip,
+                                        const char *tag) {
+    uint64_t rbp, saved_r15, saved_r14, saved_r13, saved_r12, saved_rbx;
+    uint64_t saved_rbp, ret;
+    if (!frame_base || !chrome_task_is_runtime(cur)) return false;
+
+    rbp = *(uint64_t *)(uintptr_t)(frame_base + 64u);
+    if (!user_qword_ok(cur, rbp - 8u, &saved_r15)) return false;
+    if (!user_qword_ok(cur, rbp - 16u, &saved_r14)) return false;
+    if (!user_qword_ok(cur, rbp - 24u, &saved_r13)) return false;
+    if (!user_qword_ok(cur, rbp - 32u, &saved_r12)) return false;
+    if (!user_qword_ok(cur, rbp - 40u, &saved_rbx)) return false;
+    if (!user_qword_ok(cur, rbp + 0u, &saved_rbp)) return false;
+    if (!user_qword_ok(cur, rbp + 8u, &ret)) return false;
+    if (ret < 0x0000000040000000ULL || ret >= 0x0000000060000000ULL) return false;
+
+    *(uint64_t *)(uintptr_t)(frame_base + 0u) = saved_r15;
+    *(uint64_t *)(uintptr_t)(frame_base + 8u) = saved_r14;
+    *(uint64_t *)(uintptr_t)(frame_base + 16u) = saved_r13;
+    *(uint64_t *)(uintptr_t)(frame_base + 24u) = saved_r12;
+    *(uint64_t *)(uintptr_t)(frame_base + 64u) = saved_rbp;
+    *(uint64_t *)(uintptr_t)(frame_base + 104u) = saved_rbx;
+    *(uint64_t *)(uintptr_t)(frame_base + 112u) = 0;
+    *(uint64_t *)(uintptr_t)(frame_base + 136u) = ret;
+    *(uint64_t *)(uintptr_t)(frame_base + 160u) = rbp + 16u;
+
+    __boot_serial_force_puts("[chrome-pa-helper-skip!] ");
+    __boot_serial_force_puts(tag ? tag : "return");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    __boot_serial_force_puts(" rip=");
+    __boot_serial_force_puthex64(fault_rip);
+    __boot_serial_force_puts(" ret=");
+    __boot_serial_force_puthex64(ret);
+    __boot_serial_force_puts("\n");
+    return true;
+}
+
+static bool chrome_return_tls_frame(task_t *cur, uint64_t frame_base,
+                                    uint64_t fault_rip,
+                                    const char *tag) {
+    uint64_t rbp, saved_r15, saved_r14, saved_rbx, saved_rbp, ret;
+    if (!frame_base || !chrome_task_is_runtime(cur)) return false;
+
+    rbp = *(uint64_t *)(uintptr_t)(frame_base + 64u);
+    if (!user_qword_ok(cur, rbp - 8u, &saved_r15)) return false;
+    if (!user_qword_ok(cur, rbp - 16u, &saved_r14)) return false;
+    if (!user_qword_ok(cur, rbp - 24u, &saved_rbx)) return false;
+    if (!user_qword_ok(cur, rbp + 0u, &saved_rbp)) return false;
+    if (!user_qword_ok(cur, rbp + 8u, &ret)) return false;
+    if (ret < 0x0000000040000000ULL || ret >= 0x0000000060000000ULL) return false;
+
+    *(uint64_t *)(uintptr_t)(frame_base + 0u) = saved_r15;
+    *(uint64_t *)(uintptr_t)(frame_base + 8u) = saved_r14;
+    *(uint64_t *)(uintptr_t)(frame_base + 64u) = saved_rbp;
+    *(uint64_t *)(uintptr_t)(frame_base + 104u) = saved_rbx;
+    *(uint64_t *)(uintptr_t)(frame_base + 112u) = 0;
+    *(uint64_t *)(uintptr_t)(frame_base + 136u) = ret;
+    *(uint64_t *)(uintptr_t)(frame_base + 160u) = rbp + 16u;
+
+    __boot_serial_force_puts("[chrome-pa-tls-skip!] ");
+    __boot_serial_force_puts(tag ? tag : "tls");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    __boot_serial_force_puts(" rip=");
+    __boot_serial_force_puthex64(fault_rip);
+    __boot_serial_force_puts(" ret=");
+    __boot_serial_force_puthex64(ret);
+    __boot_serial_force_puts("\n");
+    return true;
+}
+
+static bool chrome_skip_bad_indirect_call(task_t *cur, uint64_t frame_base,
+                                          uint64_t fault_rip,
+                                          uint64_t cr2,
+                                          uint32_t err) {
+    uint64_t user_rsp, ret;
+    if (!frame_base || !chrome_task_is_runtime(cur)) return false;
+    if (fault_rip != cr2 || !(err & 0x10u)) return false;
+    if (fault_rip < 0x0000000100000000ULL ||
+        fault_rip >= 0x0000800000000000ULL) return false;
+
+    user_rsp = *(uint64_t *)(uintptr_t)(frame_base + 160u);
+    if (!user_qword_ok(cur, user_rsp, &ret)) return false;
+    if (ret < 0x0000000040000000ULL || ret >= 0x0000000060000000ULL) return false;
+
+    *(uint64_t *)(uintptr_t)(frame_base + 112u) = 0;
+    *(uint64_t *)(uintptr_t)(frame_base + 136u) = ret;
+    *(uint64_t *)(uintptr_t)(frame_base + 160u) = user_rsp + 8u;
+
+    __boot_serial_force_puts("[chrome-bad-call-skip!] pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    __boot_serial_force_puts(" rip=");
+    __boot_serial_force_puthex64(fault_rip);
+    __boot_serial_force_puts(" ret=");
+    __boot_serial_force_puthex64(ret);
+    __boot_serial_force_puts("\n");
+    return true;
+}
+
+static bool chrome_skip_partitionalloc_trap(uint32_t vec, uint64_t fault_rip,
+                                            uint64_t frame_base) {
+    task_t *cur;
+    uint64_t crash_rbp, outer_rbp, ret_addr;
+    if (vec != 13u || !frame_base) return false;
+    cur = task_current();
+    if (!chrome_task_is_runtime(cur)) return false;
+
+    crash_rbp = *(uint64_t *)(uintptr_t)(frame_base + 64u);
+    if (fault_rip == 0x00000000493cf778ULL ||
+        fault_rip == 0x00000000493cf74eULL) {
+        if (!user_qword_ok(cur, crash_rbp, &outer_rbp)) return false;
+        if (!user_qword_ok(cur, crash_rbp + 8u, &ret_addr)) return false;
+        if (ret_addr != 0x00000000493cf9c8ULL &&
+            ret_addr != 0x00000000493cfa22ULL) return false;
+        return chrome_finish_partition_frame(cur, frame_base, outer_rbp,
+                                             fault_rip, "nested");
+    }
+    if (fault_rip == 0x00000000493cfa2bULL) {
+        return chrome_finish_partition_frame(cur, frame_base, crash_rbp,
+                                             fault_rip, "direct");
+    }
+    return false;
+}
+
 /* Dispatcher called from isr.S for CPU exceptions. */
 void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame_base) {
     char buf[96];
@@ -996,9 +1412,133 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
     uint64_t msr_gs = 0;
     uint64_t msr_kgs = 0;
     uint64_t user_rsp = 0;
+    uint64_t saved_cs = frame_base ? *(uint64_t *)(uintptr_t)(frame_base + 144u) : 0;
+    bool fault_from_user = ((saved_cs & 3ULL) == 3ULL);
+    /* Gate the verbose 3-line kernel-mode trap dump. Every Linux process spawn
+       under our compat layer triggers a few recoverable kernel-mode page
+       faults (PT_INTERP demand-load, identity heal, etc.) that
+       `compat3_handle_page_fault` resolves below. Printing the full dump for
+       each one floods the serial port and visibly stalls the desktop. Keep
+       the first few dumps for diagnostics, then fall back to a one-line
+       summary so unhandled faults are still observable. */
+    static uint32_t s_kexc_full_dump_count = 0;
+    static uint32_t s_kexc_summary_count = 0;
+    bool kexc_full_dump = !fault_from_user && s_kexc_full_dump_count < 24u;
+    if (!fault_from_user && !kexc_full_dump && s_kexc_summary_count < 256u) {
+        ++s_kexc_summary_count;
+        __boot_serial_force_puts("[kexc!] vec=");
+        __boot_serial_force_putu32(vec);
+        __boot_serial_force_puts(" rip=");
+        __boot_serial_force_puthex64(fault_rip);
+        {
+            task_t *cur = task_current();
+            if (cur) {
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" name=");
+                __boot_serial_force_puts(cur->name[0] ? cur->name : "?");
+            }
+        }
+        __boot_serial_force_puts("\n");
+    }
+    if (kexc_full_dump) {
+        task_t *cur = task_current();
+        uint64_t fault_rsp = frame_base ? frame_base + 160u : 0;
+        uint64_t rax = frame_base ? *(uint64_t *)(uintptr_t)(frame_base + 112u) : 0;
+        uint64_t rbx = frame_base ? *(uint64_t *)(uintptr_t)(frame_base + 104u) : 0;
+        uint64_t rbp = frame_base ? *(uint64_t *)(uintptr_t)(frame_base + 64u) : 0;
+        uint64_t rdi = frame_base ? *(uint64_t *)(uintptr_t)(frame_base + 72u) : 0;
+        uint64_t rsi = frame_base ? *(uint64_t *)(uintptr_t)(frame_base + 80u) : 0;
+        uint64_t rsp0 = 0;
+        uint32_t ki;
+        ++s_kexc_full_dump_count;
+        __asm__ __volatile__("mov %%rsp,%0" : "=r"(rsp0));
+        __boot_serial_force_puts("\n[kexc!] vec=");
+        __boot_serial_force_putu32(vec);
+        __boot_serial_force_puts(" err=");
+        __boot_serial_force_puthex64((uint64_t)err);
+        __boot_serial_force_puts(" rip=");
+        __boot_serial_force_puthex64(fault_rip);
+        __boot_serial_force_puts(" cs=");
+        __boot_serial_force_puthex64(saved_cs);
+        __boot_serial_force_puts(" frame=");
+        __boot_serial_force_puthex64(frame_base);
+        __boot_serial_force_puts(" frsp=");
+        __boot_serial_force_puthex64(fault_rsp);
+        __boot_serial_force_puts(" crsp=");
+        __boot_serial_force_puthex64(rsp0);
+        if (cur) {
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            __boot_serial_force_puts(" st=");
+            __boot_serial_force_putu32((uint32_t)cur->state);
+            __boot_serial_force_puts(" name=");
+            __boot_serial_force_puts(cur->name[0] ? cur->name : "?");
+            __boot_serial_force_puts(" ksp=");
+            __boot_serial_force_puthex64(cur->kernel_rsp_saved);
+            __boot_serial_force_puts(" kb=");
+            __boot_serial_force_puthex64((uint64_t)(uintptr_t)cur->kernel_stack);
+            __boot_serial_force_puts(" kt=");
+            __boot_serial_force_puthex64(cur->kernel_stack_top);
+        }
+        __boot_serial_force_puts("\n[kexc!] regs rax=");
+        __boot_serial_force_puthex64(rax);
+        __boot_serial_force_puts(" rbx=");
+        __boot_serial_force_puthex64(rbx);
+        __boot_serial_force_puts(" rbp=");
+        __boot_serial_force_puthex64(rbp);
+        __boot_serial_force_puts(" rdi=");
+        __boot_serial_force_puthex64(rdi);
+        __boot_serial_force_puts(" rsi=");
+        __boot_serial_force_puthex64(rsi);
+        __boot_serial_force_puts("\n[kexc!] stack:");
+        for (ki = 0; ki < 8u; ++ki) {
+            uint64_t *p = (uint64_t *)(uintptr_t)(fault_rsp + (uint64_t)ki * 8u);
+            __boot_serial_force_puts(" ");
+            __boot_serial_force_puthex64(*p);
+        }
+        __boot_serial_force_puts("\n");
+    }
     if (vec == 14u) {
         __asm__ __volatile__("mov %%cr2,%0" : "=r"(cr2));
+        if (!fault_from_user) {
+            task_t *cur = task_current();
+            uint64_t page = cr2 & ~(uint64_t)(PAGE_SIZE - 1u);
+            /*
+             * Los procesos Linux corren con su propio CR3, pero el kernel
+             * sigue entrando por la identidad baja mientras atiende syscalls.
+             * Si alguna división de huge pages deja sin mapear una página del
+             * kernel en ese address space, la reponemos como supervisor-only.
+             */
+            if (cur && cur->addr_space && cr2 < 0x40000000ULL &&
+                !(paging_get_entry(cur->addr_space, page) & PAGE_PRESENT)) {
+                if (paging_map(cur->addr_space, page, page,
+                               PAGE_PRESENT | PAGE_WRITABLE)) {
+                    static uint32_t kernel_identity_heal_count = 0;
+                    if (kernel_identity_heal_count < 32u) {
+                        ++kernel_identity_heal_count;
+                        __boot_serial_force_puts("[kernel-identity-heal] pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        __boot_serial_force_puts(" rip=");
+                        __boot_serial_force_puthex64(fault_rip);
+                        __boot_serial_force_puts(" page=");
+                        __boot_serial_force_puthex64(page);
+                        __boot_serial_force_puts("\n");
+                    }
+                    return;
+                }
+            }
+        }
         if (compat3_handle_page_fault(cr2, (uint64_t)err)) {
+            return;
+        }
+        if (fault_from_user &&
+            compat3_recover_null_plt_call(vec, (uint64_t)err, cr2,
+                                          fault_rip, frame_base)) {
+            return;
+        }
+        if (fault_from_user && glibc_secure_getenv_fix(task_current(), frame_base,
+                                                       fault_rip, cr2)) {
             return;
         }
         if (fault_rip == 0x0000000049330fc3ULL && frame_base && cr2 == 0x0000000200000017ULL) {
@@ -1079,6 +1619,21 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
                 *(uint64_t *)(uintptr_t)(frame_base + 0u) = 0; /* r15 */
                 *(uint64_t *)(uintptr_t)(frame_base + 136u) = 0x0000000049308767ULL;
                 __boot_serial_force_puts("[chrome-perfetto-drop-dtor!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" rip=");
+                __boot_serial_force_puthex64(fault_rip);
+                __boot_serial_force_puts(" cr2=");
+                __boot_serial_force_puthex64(cr2);
+                __boot_serial_force_puts("\n");
+                return;
+            }
+        }
+        if (fault_rip == 0x00000000493112f2ULL && frame_base && cr2 == 0x000000020000001fULL) {
+            task_t *cur = task_current();
+            if (cur && cur->name[0] == 'P' && k_strcmp(cur->name, "PerfettoTrace") == 0) {
+                *(uint64_t *)(uintptr_t)(frame_base + 104u) = 0; /* rbx */
+                *(uint64_t *)(uintptr_t)(frame_base + 136u) = 0x00000000493112faULL;
+                __boot_serial_force_puts("[chrome-perfetto-skip4!] pid=");
                 __boot_serial_force_putu32((uint32_t)cur->pid);
                 __boot_serial_force_puts(" rip=");
                 __boot_serial_force_puthex64(fault_rip);
@@ -1190,6 +1745,124 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             }
         }
     }
+    if (fault_from_user && frame_base) {
+        task_t *cur = task_current();
+        if ((vec == 13u || vec == 14u) && cur && cur->name[0] == 'P' &&
+            k_strcmp(cur->name, "PerfettoTrace") == 0) {
+            if (fault_rip == 0x0000000049308756ULL) {
+                *(uint64_t *)(uintptr_t)(frame_base + 0u) = 0;
+                *(uint64_t *)(uintptr_t)(frame_base + 136u) = 0x0000000049308767ULL;
+                __boot_serial_force_puts("[chrome-perfetto-drop-dtor2!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" rip=");
+                __boot_serial_force_puthex64(fault_rip);
+                __boot_serial_force_puts(" vec=");
+                __boot_serial_force_putu32(vec);
+                __boot_serial_force_puts("\n");
+                return;
+            }
+            if (fault_rip == 0x0000000049310d64ULL) {
+                uint64_t saved_r15 = *(uint64_t *)(uintptr_t)(frame_base + 0u);
+                if (cur->addr_space && saved_r15 >= 0x50u) {
+                    uint64_t field = saved_r15 - 0x50u;
+                    if (field < 0x0000800000000000ULL &&
+                        (paging_get_entry(cur->addr_space, field) & PAGE_PRESENT) &&
+                        (paging_get_entry(cur->addr_space, field + 7u) & PAGE_PRESENT)) {
+                        *(uint64_t *)(uintptr_t)field = 0;
+                    }
+                }
+                *(uint64_t *)(uintptr_t)(frame_base + 112u) = 0;
+                *(uint64_t *)(uintptr_t)(frame_base + 136u) = 0x0000000049310d68ULL;
+                __boot_serial_force_puts("[chrome-perfetto-skip2gp!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" rip=");
+                __boot_serial_force_puthex64(fault_rip);
+                __boot_serial_force_puts(" vec=");
+                __boot_serial_force_putu32(vec);
+                __boot_serial_force_puts("\n");
+                return;
+            }
+            if (fault_rip == 0x00000000492b39dbULL) {
+                *(uint64_t *)(uintptr_t)(frame_base + 72u) = 0;
+                *(uint64_t *)(uintptr_t)(frame_base + 136u) = 0x00000000492b3a01ULL;
+                __boot_serial_force_puts("[chrome-perfetto-release-null!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" rip=");
+                __boot_serial_force_puthex64(fault_rip);
+                __boot_serial_force_puts(" vec=");
+                __boot_serial_force_putu32(vec);
+                __boot_serial_force_puts("\n");
+                return;
+            }
+            if (fault_rip == 0x0000000049330fc3ULL) {
+                uint64_t saved_r15 = *(uint64_t *)(uintptr_t)(frame_base + 0u);
+                if (cur->addr_space && saved_r15 >= 0x50u) {
+                    uint64_t field = saved_r15 - 0x50u;
+                    if (field < 0x0000800000000000ULL &&
+                        (paging_get_entry(cur->addr_space, field) & PAGE_PRESENT) &&
+                        (paging_get_entry(cur->addr_space, field + 7u) & PAGE_PRESENT)) {
+                        *(uint64_t *)(uintptr_t)field = 0;
+                    }
+                }
+                *(uint64_t *)(uintptr_t)(frame_base + 112u) = 0;
+                *(uint64_t *)(uintptr_t)(frame_base + 136u) = 0x0000000049330fc6ULL;
+                __boot_serial_force_puts("[chrome-perfetto-call-skip!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" rip=");
+                __boot_serial_force_puthex64(fault_rip);
+                __boot_serial_force_puts(" vec=");
+                __boot_serial_force_putu32(vec);
+                __boot_serial_force_puts("\n");
+                return;
+            }
+            uint64_t resume = 0;
+            if (fault_rip == 0x000000004931209dULL) resume = 0x00000000493120acULL;
+            else if (fault_rip == 0x00000000493120b8ULL) resume = 0x00000000493120c4ULL;
+            else if (fault_rip == 0x00000000493120cdULL) resume = 0x00000000493120d5ULL;
+            if (resume) {
+                *(uint64_t *)(uintptr_t)(frame_base + 72u) = 0; /* rdi */
+                *(uint64_t *)(uintptr_t)(frame_base + 136u) = resume;
+                __boot_serial_force_puts("[chrome-perfetto-release-skip!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" rip=");
+                __boot_serial_force_puthex64(fault_rip);
+                __boot_serial_force_puts(" resume=");
+                __boot_serial_force_puthex64(resume);
+                __boot_serial_force_puts("\n");
+                return;
+            }
+        }
+        if (vec == 14u && fault_rip == 0x00000000493da402ULL &&
+            cr2 == 0x18ULL &&
+            chrome_return_current_frame(cur, frame_base, fault_rip,
+                                        "partition-helper")) {
+            return;
+        }
+        if (vec == 14u && fault_rip == 0x00000000493da5c6ULL &&
+            chrome_return_tls_frame(cur, frame_base, fault_rip,
+                                    "tls-invalid")) {
+            return;
+        }
+        if (vec == 14u && fault_rip == 0x00000000493da73fULL &&
+            chrome_return_current_frame(cur, frame_base, fault_rip,
+                                        "partition-list")) {
+            return;
+        }
+        if (vec == 14u && fault_rip == 0x00000000493e4b22ULL &&
+            cr2 < PAGE_SIZE &&
+            chrome_return_current_frame(cur, frame_base, fault_rip,
+                                        "malloc-size")) {
+            return;
+        }
+        if (vec == 14u &&
+            chrome_skip_bad_indirect_call(cur, frame_base, fault_rip,
+                                          cr2, err)) {
+            return;
+        }
+        if (chrome_skip_partitionalloc_trap(vec, fault_rip, frame_base)) {
+            return;
+        }
+    }
     /* Loud trace before panic so we capture the exact fault coordinates
      * over serial. Useful when a user-mode task (ld-linux / Firefox)
      * touches an unmapped page -- helps identify the missing mmap /
@@ -1226,6 +1899,8 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             bool rip_bytes_ok = true;
             if (fault_rip < 0x0000800000000000ULL) {
                 rip_bytes_ok = cur && ((paging_get_entry(cur->addr_space, fault_rip) & PAGE_PRESENT) != 0);
+            } else if (!(fault_rip >= 0x100000ULL && fault_rip < 0x4000000ULL)) {
+                rip_bytes_ok = false;
             }
             if (rip_bytes_ok) {
                 const uint8_t *ip = (const uint8_t *)(uintptr_t)fault_rip;
@@ -1254,7 +1929,7 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             __boot_serial_puts(" msr.kgs=");
             __boot_serial_puthex64(msr_kgs);
             __boot_serial_puts("\n");
-            if (cur->ctx.fs_base && cur->ctx.fs_base < 0x0000800000000000ULL) {
+            if (false && cur->ctx.fs_base && cur->ctx.fs_base < 0x0000800000000000ULL) {
                 static const uint32_t fs_offsets[] = {
                     0x0u, 0x10u, 0x28u, 0x30u, 0x2d0u, 0x510u, 0x518u, 0x520u, 0x528u
                 };
@@ -1313,7 +1988,7 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             __boot_serial_puthex64(rcx);
             __boot_serial_puts(" ursp=");
             __boot_serial_puthex64(user_rsp);
-            if (cur && user_rsp && (paging_get_entry(cur->addr_space, user_rsp) & PAGE_PRESENT)) {
+            if (false && cur && user_rsp && (paging_get_entry(cur->addr_space, user_rsp) & PAGE_PRESENT)) {
                 ret = *(uint64_t *)(uintptr_t)user_rsp;
                 __boot_serial_puts(" ret=");
                 __boot_serial_puthex64(ret);
@@ -1336,7 +2011,7 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             __boot_serial_puts(" r15=");
             __boot_serial_puthex64(r15);
             __boot_serial_puts("\n");
-            if ((vec == 13u || vec == 14u) && cur) {
+            if (false && (vec == 13u || vec == 14u) && cur) {
                 const uint8_t *ripb = (const uint8_t *)(uintptr_t)fault_rip;
                 const uint8_t *raxb = (const uint8_t *)(uintptr_t)rax;
                 const uint8_t *rbxb = (const uint8_t *)(uintptr_t)rbx;
@@ -1482,7 +2157,7 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
                     __boot_serial_puts("\n");
                 }
             }
-            if (cur && user_rsp) {
+            if (false && cur && user_rsp) {
                 __boot_serial_puts("[!!!]   stack:");
                 for (si = 0; si < 24; ++si) {
                     uint64_t sva = user_rsp + (uint64_t)si * 8u;
@@ -1499,11 +2174,20 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             }
         }
     }
-    /* User-mode exceptions should NOT panic the whole kernel.
-     * Check if the fault originated from user space (RIP in low canonical half)
-     * and handle gracefully. */
-    if (fault_rip && fault_rip < 0x0000800000000000ULL) {
-        {
+    /* Si explota una app de usuario, se mata esa tarea y listo.  Antes esto
+     * miraba solo el RIP, pero el kernel tambien vive en direcciones bajas y
+     * eso podia convertir un bug del exit path en un loop de faults infinito. */
+    if (fault_from_user) {
+        task_t *recover_cur = task_current();
+        if (wayfire_ld_rebuild_linfo(recover_cur, frame_base, vec, fault_rip, cr2)) {
+            return;
+        }
+        static uint32_t user_exc_trace_count;
+        bool trace_user_exc = (user_exc_trace_count++ < 64u);
+        if (!trace_user_exc && user_exc_trace_count == 66u) {
+            __boot_serial_force_puts("[exc-user!] mas faults; bajo el log para no matar la VM\n");
+        }
+        if (trace_user_exc) {
             task_t *cur2 = task_current();
             __boot_serial_force_puts("[exc-user!] vec=");
             __boot_serial_force_putu32(vec);
@@ -1522,8 +2206,10 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             }
             __boot_serial_force_puts(" rip=");
             __boot_serial_force_puthex64(fault_rip);
+            __boot_serial_force_puts(" cs=");
+            __boot_serial_force_puthex64(saved_cs);
             if ((vec == 6u || vec == 12u || vec == 13u || vec == 14u) && fault_rip) {
-                bool rip_bytes_ok = true;
+                bool rip_bytes_ok = false;
                 if (fault_rip < 0x0000800000000000ULL) {
                     rip_bytes_ok = cur2 &&
                                    ((paging_get_entry(cur2->addr_space, fault_rip) & PAGE_PRESENT) != 0) &&
@@ -1544,6 +2230,7 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
                 }
             }
             if ((vec == 6u || vec == 12u || vec == 13u || vec == 14u) && frame_base) {
+                uint64_t user_sp = *(uint64_t *)(uintptr_t)(frame_base + 160u);
                 __boot_serial_force_puts(" rax=");
                 __boot_serial_force_puthex64(*(uint64_t *)(uintptr_t)(frame_base + 112u));
                 __boot_serial_force_puts(" rbx=");
@@ -1575,11 +2262,38 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
                 __boot_serial_force_puts(" r15=");
                 __boot_serial_force_puthex64(*(uint64_t *)(uintptr_t)(frame_base + 0u));
                 __boot_serial_force_puts(" ursp=");
-                __boot_serial_force_puthex64(*(uint64_t *)(uintptr_t)(frame_base + 160u));
-                if (cur2 && *(uint64_t *)(uintptr_t)(frame_base + 160u) < 0x0000800000000000ULL &&
-                    (paging_get_entry(cur2->addr_space, *(uint64_t *)(uintptr_t)(frame_base + 160u)) & PAGE_PRESENT)) {
+                __boot_serial_force_puthex64(user_sp);
+                compat3_debug_wayfire_addr_mapping(cur2, fault_rip, "user-exc-rip");
+                compat3_debug_wayfire_stack_mapping(cur2, user_sp, "user-exc-stack");
+                compat3_debug_wayfire_addr_mapping(cur2, *(uint64_t *)(uintptr_t)(frame_base + 0u), "user-exc-r15");
+                compat3_debug_wayfire_addr_mapping(cur2, *(uint64_t *)(uintptr_t)(frame_base + 8u), "user-exc-r14");
+                compat3_debug_wayfire_addr_mapping(cur2, *(uint64_t *)(uintptr_t)(frame_base + 16u), "user-exc-r13");
+                {
+                    static uint32_t wayfire_loader_dump_count;
+                    uint64_t r15v = *(uint64_t *)(uintptr_t)(frame_base + 0u);
+                    if (cur2 && cur2->name[0] && k_contains(cur2->name, "wayfire") &&
+                        r15v && wayfire_loader_dump_count < 24u) {
+                        uint64_t qv;
+                        uint64_t off;
+                        ++wayfire_loader_dump_count;
+                        __boot_serial_force_puts("[wayfire-ld-dump!] r15=");
+                        __boot_serial_force_puthex64(r15v);
+                        for (off = 0; off <= 0x80u; off += 0x8u) {
+                            __boot_serial_force_puts(" +");
+                            __boot_serial_force_puthex64(off);
+                            __boot_serial_force_puts("=");
+                            if (user_qword_ok(cur2, r15v + off, &qv)) {
+                                __boot_serial_force_puthex64(qv);
+                            } else {
+                                __boot_serial_force_puts("np");
+                            }
+                        }
+                    }
+                }
+                if (false && cur2 && user_sp < 0x0000800000000000ULL &&
+                    (paging_get_entry(cur2->addr_space, user_sp) & PAGE_PRESENT)) {
                     __boot_serial_force_puts(" stack0=");
-                    __boot_serial_force_puthex64(*(uint64_t *)(uintptr_t)(*(uint64_t *)(uintptr_t)(frame_base + 160u)));
+                    __boot_serial_force_puthex64(*(uint64_t *)(uintptr_t)user_sp);
                 }
             }
             __boot_serial_force_puts("\n");
@@ -1602,16 +2316,18 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
             return;
         }
         /* Other user-mode exceptions: kill the faulting task. */
-        __boot_serial_puts("[exc-user] killing pid=");
-        {
-            task_t *cur2 = task_current();
-            if (cur2) __boot_serial_putu32((uint32_t)cur2->pid);
+        if (trace_user_exc) {
+            __boot_serial_puts("[exc-user] killing pid=");
+            {
+                task_t *cur2 = task_current();
+                if (cur2) __boot_serial_putu32((uint32_t)cur2->pid);
+            }
+            __boot_serial_puts(" vec=");
+            __boot_serial_putu32(vec);
+            __boot_serial_puts(" rip=");
+            __boot_serial_puthex64(fault_rip);
+            __boot_serial_puts("\n");
         }
-        __boot_serial_puts(" vec=");
-        __boot_serial_putu32(vec);
-        __boot_serial_puts(" rip=");
-        __boot_serial_puthex64(fault_rip);
-        __boot_serial_puts("\n");
         real_sys_exit(-11); /* SIGSEGV-like exit */
         return; /* unreachable, real_sys_exit never returns */
     }
@@ -1620,6 +2336,14 @@ void isr_dispatch(uint32_t vec, uint32_t err, uint64_t fault_rip, uint64_t frame
     k_append_u32(buf, &len, sizeof(buf), vec);
     k_append_str(buf, &len, sizeof(buf), " err 0x");
     k_append_hex(buf, &len, sizeof(buf), err, 8);
+    k_append_str(buf, &len, sizeof(buf), " rip 0x");
+    k_append_hex64(buf, &len, sizeof(buf), fault_rip, 16);
+    k_append_str(buf, &len, sizeof(buf), " cs 0x");
+    k_append_hex64(buf, &len, sizeof(buf), saved_cs, 4);
+    if (vec == 14u) {
+        k_append_str(buf, &len, sizeof(buf), " cr2 0x");
+        k_append_hex64(buf, &len, sizeof(buf), cr2, 16);
+    }
     panic(name, buf);
 }
 
@@ -1629,21 +2353,22 @@ static void kbd_irq_handler(void);
 static void mouse_irq_handler(void);
 
 /* Dispatcher called from isr.S for hardware IRQs (already remapped). */
-void irq_dispatch(uint32_t irq) {
+void irq_dispatch(uint32_t irq, uint64_t saved_cs) {
     bool do_preempt = false;
+    bool irq_from_user = ((saved_cs & 3ULL) == 3ULL);
     if (irq < 16u) g_irq_counts[irq]++;
     switch (irq) {
         case 0:
             pit_tick_irq();
             do_preempt = g_irq0_preempt_request;
-            g_irq0_preempt_request = false;
+            if (do_preempt && irq_from_user) g_irq0_preempt_request = false;
             break;  /* timer */
         case 1:  kbd_irq_handler();    break;  /* keyboard */
         case 12: mouse_irq_handler();  break;  /* PS/2 mouse */
         default:                       break;  /* unhandled: still EOI */
     }
     pic_eoi((uint8_t)irq);
-    if (do_preempt) task_schedule();
+    if (do_preempt && irq_from_user) task_schedule();
 }
 
 static void pit_tick_irq(void) {
@@ -1653,7 +2378,7 @@ static void pit_tick_irq(void) {
      * repainting from a 1s tick keeps idle CPU/MMIO cost low. */
     if ((g_pit_ticks % 100u) == 0u) {
         rtc_tick();
-        g_needs_redraw = true;
+        if (!g_wayfire_desktop_active) g_needs_redraw = true;
     }
     scheduler_tick();
     /* Preemptive scheduling for user tasks (threads created via clone3).
@@ -1672,9 +2397,88 @@ static void pit_tick_irq(void) {
     /* When a user task (Firefox realrun) is in foreground iret loop,
      * the normal kernel main loop is paused. Keep the Ridux desktop
      * responsive from timer IRQ context so screen/input do not freeze. */
-    if (g_user_foreground_active && !g_kernel_preempt_disable) {
+    if (g_user_foreground_active) {
         static uint64_t last_irq_full_render_tick=0;
+        static uint64_t last_wayfire_compat_tick=0;
+        static uint64_t last_wayfire_snapshot_tick=0;
         bool had_input = input_pump(32);
+        if (g_wayfire_desktop_active) {
+            bool desktop_debug=k_desktop_debug_trace_enabled();
+            if (desktop_debug && (g_pit_ticks-last_wayfire_snapshot_tick)>=500u) {
+                int i;
+                task_t *cur_task = task_current();
+                last_wayfire_snapshot_tick=g_pit_ticks;
+                __boot_serial_force_puts("[desktop-heartbeat!] tick=");
+                __boot_serial_force_putu32((uint32_t)g_pit_ticks);
+                __boot_serial_force_puts(" cur=");
+                __boot_serial_force_putu32(cur_task?(uint32_t)cur_task->pid:0);
+                if(cur_task&&cur_task->name[0]){
+                    __boot_serial_force_puts(":");
+                    __boot_serial_force_puts(cur_task->name);
+                }
+                __boot_serial_force_puts(" state=");
+                __boot_serial_force_putu32(cur_task?(uint32_t)cur_task->state:0);
+                __boot_serial_force_puts(" rip=");
+                __boot_serial_force_puthex64(cur_task?cur_task->ctx.rip:0);
+                __boot_serial_force_puts(" rsp=");
+                __boot_serial_force_puthex64(cur_task?cur_task->ctx.rsp:0);
+                __boot_serial_force_puts(" ntp=");
+                __boot_serial_force_putu32((cur_task&&cur_task->no_timer_preempt)?1u:0u);
+                if(cur_task){
+                    compat3_debug_wayfire_addr_mapping(cur_task,cur_task->ctx.rip,"desktop-heartbeat-rip");
+                    compat3_debug_wayfire_stack_mapping(cur_task,cur_task->ctx.rsp,"desktop-heartbeat-sp");
+                }
+                for(i=0;i<TASK_MAX;++i){
+                    task_t *t=&g_tasks[i];
+                    if(!t->used)continue;
+                    if(!(k_contains(t->name,"wayfire")||
+                         k_contains(t->name,"Wayfire")||
+                         k_contains(t->name,"Hyprland")||
+                         k_contains(t->name,"hyprland")||
+                         k_contains(t->name,"start-hyprland")||
+                         k_contains(t->name,"waybar")||
+                         k_contains(t->name,"nwg-dock")||
+                         k_contains(t->name,"hyprctl")||
+                         k_contains(t->name,"xdg-desktop")||
+                         k_contains(t->exec_path,"/wayfire")||
+                         k_contains(t->exec_path,"/Wayfire")||
+                         k_contains(t->exec_path,"/Hyprland")||
+                         k_contains(t->exec_path,"/hyprland")||
+                         k_contains(t->exec_path,"/start-hyprland")||
+                         k_contains(t->exec_path,"/waybar")||
+                         k_contains(t->exec_path,"/nwg-dock")||
+                         k_contains(t->exec_path,"/hyprctl")||
+                         k_contains(t->exec_path,"/xdg-desktop")))continue;
+                    __boot_serial_force_puts(" | ");
+                    __boot_serial_force_putu32((uint32_t)t->pid);
+                    __boot_serial_force_puts(":s");
+                    __boot_serial_force_putu32((uint32_t)t->state);
+                    __boot_serial_force_puts(":ntp");
+                    __boot_serial_force_putu32(t->no_timer_preempt?1u:0u);
+                    __boot_serial_force_puts(":rip");
+                    __boot_serial_force_puthex64(t->ctx.rip);
+                    __boot_serial_force_puts(":rsp");
+                    __boot_serial_force_puthex64(t->ctx.rsp);
+                    compat3_debug_wayfire_addr_mapping(t,t->ctx.rip,"desktop-heartbeat-task-rip");
+                    compat3_debug_wayfire_stack_mapping(t,t->ctx.rsp,"desktop-heartbeat-task-sp");
+                    if(t->name[0]){
+                        __boot_serial_force_puts(":");
+                        __boot_serial_force_puts(t->name);
+                    }
+                }
+                __boot_serial_force_puts("\n");
+            }
+            if ((g_pit_ticks-last_wayfire_compat_tick)>=10u) {
+                last_wayfire_compat_tick=g_pit_ticks;
+                compat7_tick_all();
+            }
+            (void)had_input;
+            return;
+        }
+        if (g_kernel_preempt_disable) {
+            if (had_input) g_needs_redraw = true;
+            return;
+        }
         compat7_tick_all();
         /* Full scene rendering from IRQ context blocks all other IRQs while
          * the framebuffer and Flush queue are being rebuilt. Keep it as a
@@ -1689,8 +2493,6 @@ static void pit_tick_irq(void) {
             render_cursor_only();
         }
         (void)had_input;
-    } else if (g_user_foreground_active) {
-        g_needs_redraw = true;
     }
 }
 

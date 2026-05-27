@@ -67,6 +67,15 @@ static void shell_reset_history(void) {
 
 /* Forward declaration for boot autorun helper. */
 static void shell_execute_command(const char *command);
+extern void ridux_drm_cursor_move(int32_t x, int32_t y);
+extern bool kvfs_exists(const char *path);
+
+static bool shell_input_debug_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = kvfs_exists("/etc/ridux-input-debug.enable") ? 1 : 0;
+    return cached != 0;
+}
 
 static void shell_boot_message(void) {
     char line[96];
@@ -93,6 +102,14 @@ static void shell_boot_message(void) {
     shell_push_line(line);
 }
 
+static const char *shell_autoboot_command_start(char *cmd) {
+    unsigned char *p = (unsigned char *)cmd;
+    if (p[0] == 0xEFu && p[1] == 0xBBu && p[2] == 0xBFu) p += 3;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == 0 || *p == '#') return 0;
+    return (const char *)p;
+}
+
 static void shell_run_autoboot_commands(void) {
     const uint8_t *data = 0;
     uint32_t size = 0;
@@ -108,13 +125,14 @@ static void shell_run_autoboot_commands(void) {
         if (c == '\r') continue;
         if (c == '\n') {
             cmd[len] = 0;
-            if (len > 0 && cmd[0] != '#') {
+            const char *run = shell_autoboot_command_start(cmd);
+            if (run) {
                 size_t kl = 0;
                 kline[0] = 0;
                 k_append_str(kline, &kl, sizeof(kline), "[autorun] ");
-                k_append_str(kline, &kl, sizeof(kline), cmd);
+                k_append_str(kline, &kl, sizeof(kline), run);
                 klog(kline);
-                shell_execute_command(cmd);
+                shell_execute_command(run);
             }
             len = 0;
             cmd[0] = 0;
@@ -125,13 +143,14 @@ static void shell_run_autoboot_commands(void) {
             cmd[len] = 0;
         }
     }
-    if (len > 0 && cmd[0] != '#') {
+    const char *run = shell_autoboot_command_start(cmd);
+    if (run) {
         size_t kl = 0;
         kline[0] = 0;
         k_append_str(kline, &kl, sizeof(kline), "[autorun] ");
-        k_append_str(kline, &kl, sizeof(kline), cmd);
+        k_append_str(kline, &kl, sizeof(kline), run);
         klog(kline);
-        shell_execute_command(cmd);
+        shell_execute_command(run);
     }
 }
 
@@ -151,7 +170,7 @@ static void shell_cmd_help(void) {
     shell_push_line("wm list|focus|move|drag|next|max|min|close");
     shell_push_line("elf load|run|list <path>");
     shell_push_line("apps | open <n> | close <n> | firefox | chrome | chromium");
-    shell_push_line("browser-real <firefox|chromium> (Linux ABI nativo)");
+    shell_push_line("wl | x11 | browser-real <firefox|chromium> (Linux ABI nativo)");
     shell_push_line("browser-vm <firefox|chromium> (fallback/oraculo seL4)");
     shell_push_line("-- net --");
     shell_push_line("ifconfig | ping <ip> | arp | dns <host>");
@@ -722,6 +741,12 @@ static void shell_cmd_gpu(void) {
     shell_push_line(line);
 
     len = 0; line[0] = 0;
+    k_append_str(line, &len, sizeof(line), "present: ");
+    k_append_str(line, &len, sizeof(line), ridux_gpu_present_backend());
+    k_append_str(line, &len, sizeof(line), ridux_gpu_real_present_available() ? " | real GPU activo" : " | CPU fallback");
+    shell_push_line(line);
+
+    len = 0; line[0] = 0;
     k_append_str(line, &len, sizeof(line), "fb: ");
     k_append_u32(line, &len, sizeof(line), g_fb.width);
     k_append_ch(line, &len, sizeof(line), 'x');
@@ -1134,7 +1159,19 @@ static void shell_push_multiline_text(const char *text) {
     }
 }
 
-static bool shell_try_browser_realrun_candidates(const char *const *paths, int count, const char *not_found_msg) {
+static void shell_join_args_from(int argc, char *argv[], int first, char *out, size_t cap) {
+    size_t n = 0;
+    int i;
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    for (i = first; i < argc; ++i) {
+        if (!argv[i] || !*argv[i]) continue;
+        if (n > 0) k_append_str(out, &n, cap, " ");
+        k_append_str(out, &n, cap, argv[i]);
+    }
+}
+
+static bool shell_try_browser_realrun_candidates(const char *const *paths, int count, const char *extra_args, const char *not_found_msg) {
     int i;
     for (i = 0; i < count; ++i) {
         char compat_out[2048];
@@ -1146,6 +1183,10 @@ static bool shell_try_browser_realrun_candidates(const char *const *paths, int c
         compat_args[0] = 0;
         k_append_str(compat_args, &ca_len, sizeof(compat_args), "run ");
         k_append_str(compat_args, &ca_len, sizeof(compat_args), paths[i]);
+        if (extra_args && *extra_args) {
+            k_append_str(compat_args, &ca_len, sizeof(compat_args), " ");
+            k_append_str(compat_args, &ca_len, sizeof(compat_args), extra_args);
+        }
 
         __boot_serial_puts("[shell-browser-realrun] path=");
         __boot_serial_puts(paths[i]);
@@ -1201,7 +1242,7 @@ static void shell_cmd_browser_vm(const char *engine) {
     __boot_serial_puts("\n");
 }
 
-static void shell_cmd_browser_real(const char *engine) {
+static void shell_cmd_browser_real(const char *engine, const char *extra_args) {
     const char *target = (engine && *engine) ? engine : "chromium";
     bool started;
 
@@ -1212,8 +1253,8 @@ static void shell_cmd_browser_real(const char *engine) {
 
     if (k_strcasecmp_ascii(target, "firefox") == 0) {
         const char *const firefox_paths[] = {
-            "/opt/firefox/firefox-bin",
             "/opt/firefox/firefox",
+            "/opt/firefox/firefox-bin",
             "/usr/lib/firefox-esr/firefox-esr",
             "/usr/lib/firefox/firefox"
         };
@@ -1221,6 +1262,7 @@ static void shell_cmd_browser_real(const char *engine) {
         started = shell_try_browser_realrun_candidates(
             firefox_paths,
             (int)(sizeof(firefox_paths) / sizeof(firefox_paths[0])),
+            extra_args,
             "browser-real: no se encontro Firefox real en RiduxFS.");
     } else {
         const char *const chrome_paths[] = {
@@ -1234,11 +1276,87 @@ static void shell_cmd_browser_real(const char *engine) {
         started = shell_try_browser_realrun_candidates(
             chrome_paths,
             (int)(sizeof(chrome_paths) / sizeof(chrome_paths[0])),
+            extra_args,
             "browser-real: no se encontro Chromium real en RiduxFS.");
     }
     if (started) {
         shell_push_line("browser-real: task lanzada (ver serial log).");
         shell_push_line("tip: para el bridge virtual usa URLs http://...");
+        wm_minimize_app_windows(APP_TERMINAL);
+        wm_minimize_app_windows(APP_KERNEL_CONSOLE);
+        g_start_open = false;
+        g_quick_open = false;
+        g_needs_redraw = true;
+    }
+}
+
+static void shell_cmd_plasma(int argc, char *argv[]) {
+    char compat_out[2048];
+    char compat_args[320];
+    size_t ca_len = 0;
+    int i;
+    bool started;
+
+    compat_args[0] = 0;
+    if (argc <= 1) {
+        k_append_str(compat_args, &ca_len, sizeof(compat_args), "run");
+    } else {
+        for (i = 1; i < argc; ++i) {
+            if (i > 1) k_append_ch(compat_args, &ca_len, sizeof(compat_args), ' ');
+            k_append_str(compat_args, &ca_len, sizeof(compat_args), argv[i]);
+        }
+    }
+
+    if (!compat_shell_dispatch("plasma", compat_args, compat_out, (int)sizeof(compat_out))) {
+        shell_push_line("plasma: compat command missing");
+        return;
+    }
+
+    shell_push_multiline_text(compat_out);
+    started = k_contains(compat_out, "estado: Plasma staged") ||
+              k_contains(compat_out, "estado: task staged") ||
+              k_contains(compat_out, "staged pid=");
+    if (started) {
+        wm_minimize_app_windows(APP_TERMINAL);
+        wm_minimize_app_windows(APP_KERNEL_CONSOLE);
+        g_start_open = false;
+        g_quick_open = false;
+        g_needs_redraw = true;
+    }
+}
+
+static void shell_cmd_wayfire(int argc, char *argv[]) {
+    char compat_out[2048];
+    char compat_args[320];
+    size_t ca_len = 0;
+    int i;
+    bool started;
+
+    compat_args[0] = 0;
+    if (argc <= 1) {
+        k_append_str(compat_args, &ca_len, sizeof(compat_args), "run");
+    } else {
+        for (i = 1; i < argc; ++i) {
+            if (i > 1) k_append_ch(compat_args, &ca_len, sizeof(compat_args), ' ');
+            k_append_str(compat_args, &ca_len, sizeof(compat_args), argv[i]);
+        }
+    }
+
+    if (!compat_shell_dispatch("wayfire", compat_args, compat_out, (int)sizeof(compat_out))) {
+        shell_push_line("wayfire: compat command missing");
+        return;
+    }
+
+    shell_push_multiline_text(compat_out);
+    started = k_contains(compat_out, "estado: Wayfire staged") ||
+              k_contains(compat_out, "estado: task staged") ||
+              k_contains(compat_out, "staged pid=");
+    if (started) {
+        wm_minimize_app_windows(APP_TERMINAL);
+        wm_minimize_app_windows(APP_KERNEL_CONSOLE);
+        g_start_open = false;
+        g_quick_open = false;
+        g_needs_redraw = true;
     }
 }
 
@@ -1262,11 +1380,27 @@ static bool shell_dispatch_argv(int argc, char *argv[]) {
     else if (k_strcmp(argv[0], "open")    == 0) { if (argc < 2) shell_push_line("open <name>"); else shell_cmd_app_visible(argv[1], true); }
     else if (k_strcmp(argv[0], "close")   == 0) { if (argc < 2) shell_push_line("close <name>"); else shell_cmd_app_visible(argv[1], false); }
     else if (k_strcmp(argv[0], "browser-vm") == 0) shell_cmd_browser_vm(argc >= 2 ? argv[1] : "chromium");
-    else if (k_strcmp(argv[0], "browser-real") == 0) shell_cmd_browser_real(argc >= 2 ? argv[1] : "chromium");
-    else if (k_strcmp(argv[0], "firefox") == 0) shell_cmd_browser_real("firefox");
+    else if (k_strcmp(argv[0], "wayfire") == 0 ||
+             k_strcmp(argv[0], "wf") == 0) shell_cmd_wayfire(argc, argv);
+    else if (k_strcmp(argv[0], "plasma") == 0 ||
+             k_strcmp(argv[0], "kde") == 0) shell_cmd_plasma(argc, argv);
+    else if (k_strcmp(argv[0], "browser-real") == 0) {
+        char extra[256];
+        shell_join_args_from(argc, argv, 2, extra, sizeof(extra));
+        shell_cmd_browser_real(argc >= 2 ? argv[1] : "chromium", extra);
+    }
+    else if (k_strcmp(argv[0], "firefox") == 0) {
+        char extra[256];
+        shell_join_args_from(argc, argv, 1, extra, sizeof(extra));
+        shell_cmd_browser_real("firefox", extra);
+    }
     else if (k_strcmp(argv[0], "chrome")  == 0 ||
              k_strcmp(argv[0], "chromium")== 0 ||
-             k_strcmp(argv[0], "google-chrome")== 0) shell_cmd_browser_real("chromium");
+             k_strcmp(argv[0], "google-chrome")== 0) {
+        char extra[256];
+        shell_join_args_from(argc, argv, 1, extra, sizeof(extra));
+        shell_cmd_browser_real("chromium", extra);
+    }
     else if (k_strcmp(argv[0], "start")   == 0) { g_start_open = !g_start_open; shell_push_line(g_start_open ? "start: open" : "start: close"); }
     else if (k_strcmp(argv[0], "quick")   == 0) { g_quick_open = !g_quick_open; shell_push_line(g_quick_open ? "quick: open" : "quick: close"); }
     else if (k_strcmp(argv[0], "ls")      == 0) shell_cmd_ls(argc >= 2 ? argv[1] : "/");
@@ -1538,7 +1672,7 @@ static void shell_history_set_input(int cursor) {
  * list when the cursor is still on the first token. */
 static const char *g_cmd_names[] = {
     "help","clear","about","uname","flush","theme","apps","open","close",
-    "browser-vm","browser-real","firefox","chrome","chromium","google-chrome","start","quick","ls","cat","touch","rm","echo","grep","head","tail",
+    "browser-vm","browser-real","wayfire","wf","plasma","kde","firefox","chrome","chromium","google-chrome","start","quick","ls","cat","touch","rm","echo","grep","head","tail",
     "wc","find","hexdump","cp","mv","mkdir","ps","spawn","kill","pstree",
     "top","uptime","free","df","mem","kernlog","dmesg","irqs","heap",
     "date","sleep","whoami","hostname","pwd","env","wm","elf","drivers",
@@ -1671,8 +1805,28 @@ static uint8_t ps2_scancode_to_x11_keycode(uint8_t sc, bool extended) {
     }
 }
 
-static uint32_t ps2_scancode_to_wl_key(uint8_t sc) {
+static uint32_t ps2_scancode_to_wl_key(uint8_t sc, bool extended) {
     uint8_t base = (uint8_t)(sc & 0x7Fu);
+    if (extended) {
+        switch (base) {
+            case 0x1C: return 96;  /* KEY_KPENTER */
+            case 0x1D: return 97;  /* KEY_RIGHTCTRL */
+            case 0x38: return 100; /* KEY_RIGHTALT */
+            case 0x47: return 102; /* KEY_HOME */
+            case 0x48: return 103; /* KEY_UP */
+            case 0x49: return 104; /* KEY_PAGEUP */
+            case 0x4B: return 105; /* KEY_LEFT */
+            case 0x4D: return 106; /* KEY_RIGHT */
+            case 0x4F: return 107; /* KEY_END */
+            case 0x50: return 108; /* KEY_DOWN */
+            case 0x51: return 109; /* KEY_PAGEDOWN */
+            case 0x52: return 110; /* KEY_INSERT */
+            case 0x53: return 111; /* KEY_DELETE */
+            case 0x5B: return 125; /* KEY_LEFTMETA */
+            case 0x5C: return 126; /* KEY_RIGHTMETA */
+            default: break;
+        }
+    }
     /* Wayland wants Linux evdev key numbers. For the set-1 keys we handle
      * here, those line up with the raw PS/2 make code (A=30, Enter=28).
      * Subtracting one made Firefox receive the neighbor key. */
@@ -1691,9 +1845,11 @@ static void keyboard_handle_extended(uint8_t sc) {
     bool release = (sc & 0x80u) != 0u;
     uint8_t base = (uint8_t)(sc & 0x7Fu);
     uint8_t xkc = ps2_scancode_to_x11_keycode(sc, true);
+    evdev_push_key((uint16_t)ps2_scancode_to_wl_key(sc, true), release ? 0 : 1);
+    if (g_wayfire_desktop_active) return;
     if (release) {
         if (x11_dispatch_key_event(xkc, false)) return;
-        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc), 0);
+        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc, true), 0);
         return;
     }
     /* Super key (left GUI) - 0x5B extended. Toggle start. */
@@ -1703,7 +1859,7 @@ static void keyboard_handle_extended(uint8_t sc) {
         return;
     }
     if (x11_dispatch_key_event(xkc, true)) return;
-    if (wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc), 1)) return;
+    if (wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc, true), 1)) return;
     /* Up/Down: shell history when terminal focused, else window move in drag mode. */
     if (base == 0x48 || base == 0x50) {
         if (terminal_focused() && !g_wm_drag_mode) {
@@ -1741,6 +1897,17 @@ static void keyboard_handle_extended(uint8_t sc) {
     }
 }
 
+static int ring3_desktop_key_target(void) {
+    int i;
+    for (i = g_window_count - 1; i >= 0; --i) {
+        window_t *w = &g_windows[i];
+        if (!w->used || !w->visible || w->minimized) continue;
+        if (w->app_id != APP_RING3_BACKED) continue;
+        if (w->flags & WINF_DESKTOP) return i;
+    }
+    return -1;
+}
+
 static void keyboard_handle_scancode(uint8_t sc) {
     char ch = 0;
     bool release;
@@ -1758,29 +1925,56 @@ static void keyboard_handle_scancode(uint8_t sc) {
     release = (sc & 0x80u) != 0u;
     base = (uint8_t)(sc & 0x7Fu);
     xkc = ps2_scancode_to_x11_keycode(sc, false);
+    evdev_push_key((uint16_t)base, release ? 0 : 1);
+    {
+        static uint32_t kbd_trace_count;
+        if (shell_input_debug_trace_enabled() && kbd_trace_count < 96u) {
+            ++kbd_trace_count;
+            __boot_serial_force_puts("[kbd!] sc=");
+            __boot_serial_force_putu32((uint32_t)sc);
+            __boot_serial_force_puts(" base=");
+            __boot_serial_force_putu32((uint32_t)base);
+            __boot_serial_force_puts(" xkc=");
+            __boot_serial_force_putu32((uint32_t)xkc);
+            __boot_serial_force_puts(release ? " up" : " down");
+            __boot_serial_force_puts(" focus=");
+            __boot_serial_force_putu32((uint32_t)((g_window_focus >= 0) ? g_window_focus : -1));
+            __boot_serial_force_puts("\n");
+        }
+    }
 
     if (base == 0x2A || base == 0x36) {
         g_shift_down = !release;
+        if (g_wayfire_desktop_active) return;
         if (x11_dispatch_key_event(xkc, !release)) return;
-        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc), release ? 0u : 1u);
+        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc, false), release ? 0u : 1u);
         return;
     }
     if (base == 0x1D) {
         g_ctrl_down = !release;
+        if (g_wayfire_desktop_active) return;
         if (x11_dispatch_key_event(xkc, !release)) return;
-        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc), release ? 0u : 1u);
+        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc, false), release ? 0u : 1u);
         return;
     }
+    if (g_wayfire_desktop_active) return;
     if (release) {
         if (x11_dispatch_key_event(xkc, false)) return;
-        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc), 0);
+        (void)wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc, false), 0);
         return;
     }
 
-    if (x11_dispatch_key_event(xkc, true)) return;
-    if (wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc), 1)) return;
-
     ch = g_shift_down ? keymap_shift[base] : keymap_unshift[base];
+
+    if (g_ctrl_down && wm_has_visible_ring3_desktop()) {
+        int desk = ring3_desktop_key_target();
+        if (desk >= 0) {
+            r3wm_post_key(desk, RIDUX_EVENT_KEY_DOWN,
+                          (uint32_t)(ch ? ch : 0), (uint32_t)base);
+            g_needs_redraw = true;
+        }
+        return;
+    }
     if (g_window_focus >= 0 && g_window_focus < g_window_count &&
         g_windows[g_window_focus].app_id == APP_RING3_BACKED) {
         r3wm_post_key(g_window_focus, RIDUX_EVENT_KEY_DOWN,
@@ -1788,6 +1982,30 @@ static void keyboard_handle_scancode(uint8_t sc) {
         g_needs_redraw = true;
         return;
     }
+
+    if (g_window_focus < 0 && wm_has_visible_ring3_desktop()) {
+        int desk = ring3_desktop_key_target();
+        if (desk >= 0) {
+            r3wm_post_key(desk, RIDUX_EVENT_KEY_DOWN,
+                          (uint32_t)(ch ? ch : 0), (uint32_t)base);
+            g_needs_redraw = true;
+        }
+        return;
+    }
+
+    if (x11_dispatch_key_event(xkc, true)) return;
+
+    if (wm_has_visible_ring3_desktop()) {
+        int desk = ring3_desktop_key_target();
+        if (desk >= 0) {
+            r3wm_post_key(desk, RIDUX_EVENT_KEY_DOWN,
+                          (uint32_t)(ch ? ch : 0), (uint32_t)base);
+            g_needs_redraw = true;
+        }
+        return;
+    }
+
+    if (wl7_dispatch_keyboard_event(ps2_scancode_to_wl_key(sc, false), 1)) return;
 
     if (base == 0x0F) {
         /* Tab: complete inside terminal, else switch window. */
@@ -1840,6 +2058,8 @@ static bool hit_in(ui_rect_t r, int x, int y) {
     return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
 }
 
+static bool route_ring3_pointer_event(uint32_t type, uint32_t button);
+
 static int taskbar_dock_hit(int mx, int my) {
     int icon = g_ui.taskbar_icon;
     int gap = dock_gap_px();
@@ -1879,8 +2099,120 @@ static int start_menu_hit(int mx, int my) {
     return -1;
 }
 
+enum {
+    WM_DRAG_NONE = 0,
+    WM_DRAG_MOVE = 1,
+    WM_DRAG_RESIZE = 2,
+    WM_EDGE_LEFT = 1,
+    WM_EDGE_TOP = 2,
+    WM_EDGE_RIGHT = 4,
+    WM_EDGE_BOTTOM = 8
+};
+
+static int wm_resize_edges_at(const window_t *w, int mx, int my) {
+    int margin = 9;
+    int edges = 0;
+    if (!w || w->maximized) return 0;
+    if (w->flags & (WINF_DESKTOP | WINF_BORDERLESS)) return 0;
+    if (mx < w->x || my < w->y || mx >= w->x + w->w || my >= w->y + w->h) return 0;
+    if (mx < w->x + margin) edges |= WM_EDGE_LEFT;
+    if (mx >= w->x + w->w - margin) edges |= WM_EDGE_RIGHT;
+    if (my < w->y + margin) edges |= WM_EDGE_TOP;
+    if (my >= w->y + w->h - margin) edges |= WM_EDGE_BOTTOM;
+    return edges;
+}
+
+static void wm_begin_move(window_t *w, int mx, int my) {
+    if (!w || w->maximized) return;
+    g_mouse_dragging = true;
+    g_mouse_drag_kind = WM_DRAG_MOVE;
+    g_mouse_drag_window_id = w->id;
+    g_mouse_drag_offset_x = mx - w->x;
+    g_mouse_drag_offset_y = my - w->y;
+    g_mouse_resize_edges = 0;
+}
+
+static void wm_begin_resize(window_t *w, int mx, int my, int edges) {
+    if (!w || !edges || w->maximized) return;
+    g_mouse_dragging = true;
+    g_mouse_drag_kind = WM_DRAG_RESIZE;
+    g_mouse_drag_window_id = w->id;
+    g_mouse_resize_edges = edges;
+    g_mouse_drag_start_x = mx;
+    g_mouse_drag_start_y = my;
+    g_mouse_drag_start_win_x = w->x;
+    g_mouse_drag_start_win_y = w->y;
+    g_mouse_drag_start_win_w = w->w;
+    g_mouse_drag_start_win_h = w->h;
+}
+
+static bool handle_window_click(int mx, int my, int button) {
+    int widx = wm_find_window_at(mx, my, false);
+    int wid;
+    window_t *w;
+    int which;
+    int edges;
+    if (widx < 0) return false;
+    w = &g_windows[widx];
+
+    for (which = 0; which < 3; ++which) {
+        ui_rect_t r = window_ctrl_rect(w, which);
+        if (hit_in(r, mx, my)) {
+            if      (which == 0) wm_minimize(w->id);
+            else if (which == 1) wm_maximize_toggle(w->id);
+            else {
+                if (w->app_id == APP_RING3_BACKED) r3wm_post_close(widx);
+                wm_close(w->id);
+            }
+            return true;
+        }
+    }
+
+    wid = w->id;
+    edges = wm_resize_edges_at(w, mx, my);
+    wm_raise_to_top(widx);
+    widx = wm_index_by_id(wid);
+    if (widx < 0) return true;
+    w = &g_windows[widx];
+
+    if (edges) {
+        wm_begin_resize(w, mx, my, edges);
+        return true;
+    }
+    if (my < w->y + WIN_TITLE_H) {
+        wm_begin_move(w, mx, my);
+        return true;
+    }
+    if (w->app_id == APP_RING3_BACKED) {
+        ui_rect_t body = window_body_rect(w);
+        r3wm_post_mouse(widx, RIDUX_EVENT_MOUSE_DOWN,
+                        mx - body.x, my - body.y, (uint32_t)button);
+        return true;
+    }
+    {
+        app_t *ap = app_by_window(w);
+        if (ap && ap->click) {
+            ui_rect_t body = window_body_rect(w);
+            ap->click(w, body, mx, my, button);
+            return true;
+        }
+    }
+    return true;
+}
+
 static void handle_ui_click(int mx, int my, int button) {
     int idx;
+    bool ring3_desktop_active = wm_has_visible_ring3_desktop();
+
+    if (ring3_desktop_active) {
+        /* Con RiduxUI activo, el kernel solo conserva el trabajo de WM:
+         * marcos, mover, cerrar y redimensionar. Dock/launcher/fondo son R3. */
+        if (handle_window_click(mx, my, button)) return;
+        if (x11_dispatch_pointer_event(mx, my, button, true)) return;
+        if (wl7_dispatch_pointer_event(mx, my, (uint32_t)button, 1)) return;
+        (void)route_ring3_pointer_event(RIDUX_EVENT_MOUSE_DOWN, (uint32_t)button);
+        return;
+    }
     /* Start menu priority */
     if (g_start_open) {
         idx = start_menu_hit(mx, my);
@@ -1928,57 +2260,30 @@ static void handle_ui_click(int mx, int my, int button) {
     if (x11_dispatch_pointer_event(mx, my, button, true)) return;
     if (wl7_dispatch_pointer_event(mx, my, (uint32_t)button, 1)) return;
 
-    /* Window control clicks (top-most visible window at that pos) */
-    {
-        int widx = wm_find_window_at(mx, my, false);
-        if (widx >= 0) {
-            window_t *w = &g_windows[widx];
-            int which;
-            bool hit_ctrl = false;
-            for (which = 0; which < 3; ++which) {
-                ui_rect_t r = window_ctrl_rect(w, which);
-                if (hit_in(r, mx, my)) {
-                    if      (which == 0) wm_minimize(w->id);
-                    else if (which == 1) wm_maximize_toggle(w->id);
-                    else {
-                        /* Notify Ring 3 owner before tearing down. */
-                        if (w->app_id == APP_RING3_BACKED) r3wm_post_close(widx);
-                        wm_close(w->id);
-                    }
-                    hit_ctrl = true;
-                    break;
-                }
-            }
-            if (hit_ctrl) return;
+    (void)handle_window_click(mx, my, button);
+}
 
-            /* Otherwise raise + dispatch to app click or start drag */
-            wm_raise_to_top(widx);
-            if (my < w->y + WIN_TITLE_H) {
-                /* title drag start */
-                g_mouse_dragging = true;
-                g_mouse_drag_window_id = w->id;
-                g_mouse_drag_offset_x = mx - w->x;
-                g_mouse_drag_offset_y = my - w->y;
-            } else if (w->app_id == APP_RING3_BACKED) {
-                /* Route body clicks to the Ring 3 owner's event ring. */
-                ui_rect_t body = window_body_rect(w);
-                r3wm_post_mouse(widx, RIDUX_EVENT_MOUSE_DOWN,
-                                mx - body.x, my - body.y, (uint32_t)button);
-            } else {
-                app_t *ap = app_by_window(w);
-                if (ap && ap->click) {
-                    ui_rect_t body = window_body_rect(w);
-                    ap->click(w, body, mx, my, button);
-                }
-            }
-        }
+static int ring3_desktop_window_at(int mx, int my) {
+    int i;
+    for (i = g_window_count - 1; i >= 0; --i) {
+        window_t *w = &g_windows[i];
+        ui_rect_t body;
+        if (!w->used || !w->visible || w->minimized) continue;
+        if (w->app_id != APP_RING3_BACKED) continue;
+        if (!(w->flags & WINF_DESKTOP)) continue;
+        body = window_body_rect(w);
+        if (hit_in(body, mx, my)) return i;
     }
+    return -1;
 }
 
 static bool route_ring3_pointer_event(uint32_t type, uint32_t button) {
     int widx = wm_find_window_at(g_mouse_x, g_mouse_y, false);
     window_t *w;
     ui_rect_t body;
+    if (widx < 0 || g_windows[widx].app_id != APP_RING3_BACKED) {
+        widx = ring3_desktop_window_at(g_mouse_x, g_mouse_y);
+    }
     if (widx < 0) return false;
     w = &g_windows[widx];
     if (w->app_id != APP_RING3_BACKED) return false;
@@ -1986,6 +2291,49 @@ static bool route_ring3_pointer_event(uint32_t type, uint32_t button) {
     if (!hit_in(body, g_mouse_x, g_mouse_y)) return false;
     r3wm_post_mouse(widx, type, g_mouse_x - body.x, g_mouse_y - body.y, button);
     return true;
+}
+
+static void mouse_apply_window_resize(window_t *w) {
+    int min_w = 180;
+    int min_h = WIN_TITLE_H + 110;
+    int dx = g_mouse_x - g_mouse_drag_start_x;
+    int dy = g_mouse_y - g_mouse_drag_start_y;
+    int x = g_mouse_drag_start_win_x;
+    int y = g_mouse_drag_start_win_y;
+    int ww = g_mouse_drag_start_win_w;
+    int hh = g_mouse_drag_start_win_h;
+    int right = g_mouse_drag_start_win_x + g_mouse_drag_start_win_w;
+    int bottom = g_mouse_drag_start_win_y + g_mouse_drag_start_win_h;
+    if (!w) return;
+    if (g_mouse_resize_edges & WM_EDGE_LEFT) {
+        x = g_mouse_drag_start_win_x + dx;
+        ww = right - x;
+        if (ww < min_w) { ww = min_w; x = right - min_w; }
+    }
+    if (g_mouse_resize_edges & WM_EDGE_RIGHT) {
+        ww = g_mouse_drag_start_win_w + dx;
+        if (ww < min_w) ww = min_w;
+    }
+    if (g_mouse_resize_edges & WM_EDGE_TOP) {
+        y = g_mouse_drag_start_win_y + dy;
+        hh = bottom - y;
+        if (hh < min_h) { hh = min_h; y = bottom - min_h; }
+    }
+    if (g_mouse_resize_edges & WM_EDGE_BOTTOM) {
+        hh = g_mouse_drag_start_win_h + dy;
+        if (hh < min_h) hh = min_h;
+    }
+    if (x < 0) { ww += x; x = 0; }
+    if (y < 0) { hh += y; y = 0; }
+    if (x + ww > (int)g_fb.width) ww = (int)g_fb.width - x;
+    if (y + hh > (int)g_fb.height) hh = (int)g_fb.height - y;
+    if (ww < min_w) ww = min_w;
+    if (hh < min_h) hh = min_h;
+    w->x = x;
+    w->y = y;
+    w->w = ww;
+    w->h = hh;
+    wm_clamp(w);
 }
 
 static void mouse_update_drag(int dx, int dy) {
@@ -2001,19 +2349,29 @@ static void mouse_update_drag(int dx, int dy) {
     else if ((uint32_t)g_mouse_y >= g_fb.height) g_mouse_y = (int)g_fb.height - 1;
     if (g_mouse_x != prev_x || g_mouse_y != prev_y) {
         g_cursor_moved = true;
-        (void)x11_dispatch_pointer_event(g_mouse_x, g_mouse_y, 0, false);
-        (void)wl7_dispatch_pointer_event(g_mouse_x, g_mouse_y, 0, 0);
-        (void)route_ring3_pointer_event(RIDUX_EVENT_MOUSE_MOVE, 0);
+        ridux_drm_cursor_move(g_mouse_x, g_mouse_y);
+        if (!g_mouse_dragging) {
+            if (!g_wayfire_desktop_active) {
+                (void)x11_dispatch_pointer_event(g_mouse_x, g_mouse_y, 0, false);
+                (void)wl7_dispatch_pointer_event(g_mouse_x, g_mouse_y, 0, 0);
+                (void)route_ring3_pointer_event(RIDUX_EVENT_MOUSE_MOVE, 0);
+            }
+        }
     }
+    if (g_wayfire_desktop_active) return;
 
     if (!g_mouse_left_down || !g_mouse_dragging) return;
     idx = wm_index_by_id(g_mouse_drag_window_id);
     if (idx < 0) { g_mouse_dragging = false; g_mouse_drag_window_id = -1; return; }
     w = &g_windows[idx];
     if (!w->visible || w->minimized) { g_mouse_dragging = false; return; }
-    w->x = g_mouse_x - g_mouse_drag_offset_x;
-    w->y = g_mouse_y - g_mouse_drag_offset_y;
-    wm_clamp(w);
+    if (g_mouse_drag_kind == WM_DRAG_RESIZE) {
+        mouse_apply_window_resize(w);
+    } else {
+        w->x = g_mouse_x - g_mouse_drag_offset_x;
+        w->y = g_mouse_y - g_mouse_drag_offset_y;
+        wm_clamp(w);
+    }
     /* When dragging a window, the entire scene needs a real repaint
      * (the window contents are moving, not just the cursor). */
     g_needs_redraw = true;
@@ -2036,22 +2394,32 @@ static void mouse_handle_byte(uint8_t data) {
     if (left && !g_mouse_left_down) {
         /* Rising edge: handle UI click */
         g_mouse_left_down = true;
-        handle_ui_click(g_mouse_x, g_mouse_y, 1);
-        g_needs_redraw = true;
+        evdev_push_mouse_key(272, 1);
+        if (!g_wayfire_desktop_active) {
+            handle_ui_click(g_mouse_x, g_mouse_y, 1);
+            g_needs_redraw = true;
+        }
     } else if (!left && g_mouse_left_down) {
-        (void)x11_dispatch_pointer_event(g_mouse_x, g_mouse_y, 1, false);
-        (void)wl7_dispatch_pointer_event(g_mouse_x, g_mouse_y, 1, 0);
-        (void)route_ring3_pointer_event(RIDUX_EVENT_MOUSE_UP, 1);
+        bool was_dragging = g_mouse_dragging;
+        evdev_push_mouse_key(272, 0);
+        if (!g_wayfire_desktop_active && !was_dragging) {
+            (void)x11_dispatch_pointer_event(g_mouse_x, g_mouse_y, 1, false);
+            (void)wl7_dispatch_pointer_event(g_mouse_x, g_mouse_y, 1, 0);
+            (void)route_ring3_pointer_event(RIDUX_EVENT_MOUSE_UP, 1);
+        }
         g_mouse_dragging = false;
         g_mouse_drag_window_id = -1;
+        g_mouse_drag_kind = WM_DRAG_NONE;
+        g_mouse_resize_edges = 0;
         g_mouse_left_down = false;
-        g_needs_redraw = true;
+        if (!g_wayfire_desktop_active) g_needs_redraw = true;
     }
 
     if (right && !g_mouse_right_down) {
         /* Right click: paint erase on Paint app, else ignore */
         int widx = wm_find_window_at(g_mouse_x, g_mouse_y, false);
-        if (widx >= 0) {
+        evdev_push_mouse_key(273, 1);
+        if (!g_wayfire_desktop_active && widx >= 0) {
             window_t *w = &g_windows[widx];
             app_t *ap = app_by_window(w);
             if (ap && ap->click && w->app_id == APP_PAINT) {
@@ -2062,10 +2430,12 @@ static void mouse_handle_byte(uint8_t data) {
         }
         g_mouse_right_down = true;
     } else if (!right && g_mouse_right_down) {
+        evdev_push_mouse_key(273, 0);
         g_mouse_right_down = false;
     }
 
     if (dx || dy) {
+        evdev_push_rel_xy(dx, -dy);
         mouse_update_drag(dx, dy);
     }
 }

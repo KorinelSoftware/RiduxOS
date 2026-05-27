@@ -40,8 +40,9 @@ static vfs_file_t *vfs_alloc(const char *path) {
             g_vfs_files[i].writable = true;
             g_vfs_files[i].ro_data = NULL;
             g_vfs_files[i].ro_size = 0;
+            g_vfs_files[i].rw_data = NULL;
+            g_vfs_files[i].rw_cap = 0;
             g_vfs_files[i].rw_size = 0;
-            g_vfs_files[i].rw_data[0] = 0;
             k_strlcpy(g_vfs_files[i].path, norm, sizeof(g_vfs_files[i].path));
             ++g_vfs_count;
             return &g_vfs_files[i];
@@ -49,13 +50,39 @@ static vfs_file_t *vfs_alloc(const char *path) {
     }
     return NULL;
 }
+static bool vfs_ensure_rw_capacity(vfs_file_t *f, uint32_t need) {
+    char *next;
+    uint32_t cap;
+    if (!f) return false;
+    if (need == 0) need = 1;
+    if (need > VFS_RW_MAX) return false;
+    if (f->rw_data && f->rw_cap >= need) return true;
+    cap = 256u;
+    while (cap < need && cap < VFS_RW_MAX) cap <<= 1;
+    if (cap > VFS_RW_MAX) cap = VFS_RW_MAX;
+    if (cap < need) return false;
+    next = (char *)kmalloc(cap);
+    if (!next) return false;
+    k_memset(next, 0, cap);
+    if (f->rw_data && f->rw_size) {
+        uint32_t n = f->rw_size;
+        if (n >= cap) n = cap - 1u;
+        k_memcpy(next, f->rw_data, n);
+        next[n] = 0;
+    }
+    if (f->rw_data) kfree(f->rw_data);
+    f->rw_data = next;
+    f->rw_cap = cap;
+    return true;
+}
 static bool vfs_promote_writable(vfs_file_t *f) {
     if (!f) return false;
-    if (f->writable) return true;
+    if (f->writable) return f->rw_data != NULL || vfs_ensure_rw_capacity(f, f->rw_size + 1u);
     if (f->ro_size >= VFS_RW_MAX) return false;
+    if (!vfs_ensure_rw_capacity(f, f->ro_size + 1u)) return false;
     if (f->ro_data && f->ro_size) k_memcpy(f->rw_data, f->ro_data, f->ro_size);
     f->rw_size = f->ro_size;
-    if (f->rw_size < VFS_RW_MAX) f->rw_data[f->rw_size] = 0;
+    f->rw_data[f->rw_size] = 0;
     f->writable = true;
     return true;
 }
@@ -71,6 +98,7 @@ static bool vfs_write(const char *p, const char *text) {
     if (!f) return false;
     if (!vfs_promote_writable(f)) return false;
     if (len >= VFS_RW_MAX) len = VFS_RW_MAX - 1;
+    if (!vfs_ensure_rw_capacity(f, (uint32_t)len + 1u)) return false;
     k_memcpy(f->rw_data, text, len);
     f->rw_data[len] = 0;
     f->rw_size = (uint32_t)len;
@@ -82,6 +110,7 @@ static bool vfs_write_bytes(const char *p, const uint8_t *data, uint32_t size) {
     if (!f) return false;
     if (!vfs_promote_writable(f)) return false;
     if (len >= VFS_RW_MAX) len = VFS_RW_MAX - 1;
+    if (!vfs_ensure_rw_capacity(f, len + 1u)) return false;
     if (len && data) k_memcpy(f->rw_data, data, len);
     else if (len) k_memset(f->rw_data, 0, len);
     f->rw_data[len] = 0;
@@ -96,8 +125,10 @@ static bool vfs_remove(const char *p) {
     f->path[0] = 0;
     f->ro_data = NULL;
     f->ro_size = 0;
+    if (f->rw_data) kfree(f->rw_data);
+    f->rw_data = NULL;
+    f->rw_cap = 0;
     f->rw_size = 0;
-    f->rw_data[0] = 0;
     if (g_vfs_count > 0) --g_vfs_count;
     return true;
 }
@@ -121,7 +152,7 @@ static bool vfs_rename(const char *src, const char *dst) {
 static bool vfs_read(const char *p, const uint8_t **data, uint32_t *size) {
     vfs_file_t *f = vfs_find(p);
     if (!f) return false;
-    if (f->writable) { *data = (const uint8_t *)f->rw_data; *size = f->rw_size; }
+    if (f->writable) { *data = (const uint8_t *)(f->rw_data ? f->rw_data : ""); *size = f->rw_size; }
     else             { *data = f->ro_data; *size = f->ro_size; }
     return true;
 }
@@ -241,8 +272,10 @@ static void vfs_mount_initrd(const uint8_t *start, const uint8_t *end) {
                     f->writable = false;
                     f->ro_data = (const uint8_t *)PHYS_TO_DMAP((uint64_t)(uintptr_t)fd);
                     f->ro_size = size;
+                    if (f->rw_data) kfree(f->rw_data);
+                    f->rw_data = NULL;
+                    f->rw_cap = 0;
                     f->rw_size = 0;
-                    f->rw_data[0] = 0;
                 } else {
                     ++g_vfs_mount_dropped_slots;
                 }
@@ -266,6 +299,18 @@ static void vfs_seed_defaults(void) {
               "- open notes\n");
     vfs_write("/etc/motd.txt",
               "Welcome to RiduxOS Unix 0.4 Bloom.\n");
+    vfs_write("/proc/asound/cards",
+              " 0 [Intel          ]: HDA-Intel - HDA Intel\n"
+              "                      HDA Intel at 0xf0000000 irq 30\n");
+    vfs_write("/proc/asound/version",
+              "Advanced Linux Sound Architecture Driver Version k6.1.0.\n");
+    vfs_write("/proc/asound/card0/id", "Intel\n");
+    vfs_write("/dev/snd/controlC0", "");
+    vfs_write("/dev/snd/pcmC0D0p", "");
+    vfs_write("/dev/snd/pcmC0D0c", "");
+    vfs_write("/run/user/1000/pulse/native", "");
+    vfs_write("/etc/pulse/client.conf",
+              "autospawn = no\ndaemon-binary = /bin/true\n");
 }
 /* ELF32 loader + scheduler */
 

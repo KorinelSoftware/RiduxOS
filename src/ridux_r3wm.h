@@ -32,6 +32,7 @@
 #define RIDUX_WIN_MAX_H   1080
 #define RIDUX_WIN_MAX     16
 #define RIDUX_DESKTOP_APP_MAX 24
+#define RIDUX_GPU_BACKEND_MAX 96
 
 /* Window hints. Normal app windows keep the classic Ridux chrome.
  * Desktop/shell surfaces can ask for a quiet borderless layer instead. */
@@ -95,6 +96,12 @@ typedef struct ridux_desktop_state {
     uint32_t quick_open;
     uint32_t hour, minute;
     uint32_t day, month, year;
+    uint32_t gpu_real;
+    uint32_t mesa_ready;
+    uint32_t opengl_ready;
+    uint32_t vulkan_ready;
+    uint32_t physical_gpu_preferred;
+    char     gpu_backend[RIDUX_GPU_BACKEND_MAX];
     uint32_t app_count;
     ridux_desktop_app_state_t apps[RIDUX_DESKTOP_APP_MAX];
 } ridux_desktop_state_t;

@@ -29,6 +29,7 @@ typedef unsigned long       rd_size;
 #define RIDUX_SYS_DESKTOP_STATE   505
 
 #define RIDUX_DESKTOP_APP_MAX 24
+#define RIDUX_GPU_BACKEND_MAX 96
 
 #define RIDUX_WIN_FLAG_BORDERLESS  0x00000001u
 #define RIDUX_WIN_FLAG_DESKTOP     0x00000002u
@@ -76,6 +77,12 @@ typedef struct rd_desktop_state {
     rd_u32 quick_open;
     rd_u32 hour, minute;
     rd_u32 day, month, year;
+    rd_u32 gpu_real;
+    rd_u32 mesa_ready;
+    rd_u32 opengl_ready;
+    rd_u32 vulkan_ready;
+    rd_u32 physical_gpu_preferred;
+    char   gpu_backend[RIDUX_GPU_BACKEND_MAX];
     rd_u32 app_count;
     rd_desktop_app_state_t apps[RIDUX_DESKTOP_APP_MAX];
 } rd_desktop_state_t;
@@ -94,6 +101,8 @@ int  rd_desktop_state(rd_desktop_state_t *out);
 void rd_clear(rd_window_t *win, rd_u32 color);
 void rd_fill_rect(rd_window_t *win, int x, int y, int w, int h, rd_u32 color);
 void rd_pixel(rd_window_t *win, int x, int y, rd_u32 color);
+int  rd_text_width(const char *s);
+int  rd_text_width_scaled(const char *s, int scale);
 void rd_text(rd_window_t *win, int x, int y, const char *s, rd_u32 color);
 void rd_text_scaled(rd_window_t *win, int x, int y, int scale,
                     const char *s, rd_u32 color);

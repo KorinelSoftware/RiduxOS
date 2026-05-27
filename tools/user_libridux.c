@@ -208,6 +208,39 @@ static rd_u8 rd_sample_glyph_hi(const rd_u8 glyph[RIDUX_FONT_HI_H][RIDUX_FONT_HI
     return (rd_u8)cov;
 }
 
+static int rd_glyph_ink_bounds(rd_u8 cc, int *left, int *right) {
+    const rd_u8(*glyph)[RIDUX_FONT_W] = FONT8X16_AA[cc];
+    int x, y;
+    int min_x = RIDUX_FONT_W;
+    int max_x = -1;
+    if (cc == ' ') return 0;
+    for (y = 0; y < RIDUX_FONT_H; ++y) {
+        for (x = 0; x < RIDUX_FONT_W; ++x) {
+            if (glyph[y][x] > 10u) {
+                if (x < min_x) min_x = x;
+                if (x > max_x) max_x = x;
+            }
+        }
+    }
+    if (max_x < min_x) return 0;
+    *left = min_x;
+    *right = max_x;
+    return 1;
+}
+
+static int rd_glyph_advance(rd_u8 cc) {
+    int left = 0;
+    int right = 0;
+    int width;
+    if (cc == ' ') return 4;
+    if (!rd_glyph_ink_bounds(cc, &left, &right)) return 5;
+    width = right - left + 1;
+    width += 1;
+    if (width < 3) width = 3;
+    if (width > RIDUX_FONT_W) width = RIDUX_FONT_W;
+    return width;
+}
+
 static void rd_glyph_aa(rd_window_t *win, int x, int y, int scale, char ch, rd_u32 color) {
     rd_u8 cc = (rd_u8)(unsigned char)ch;
     if (scale <= 1) {
@@ -239,11 +272,31 @@ static void rd_glyph_aa(rd_window_t *win, int x, int y, int scale, char ch, rd_u
     }
 }
 
+int rd_text_width(const char *s) {
+    int w = 0;
+    if (!s) return 0;
+    while (*s) {
+        w += rd_glyph_advance((rd_u8)(unsigned char)*s);
+        ++s;
+    }
+    return w;
+}
+
+int rd_text_width_scaled(const char *s, int scale) {
+    if (scale < 1) scale = 1;
+    return rd_text_width(s) * scale;
+}
+
 void rd_text(rd_window_t *win, int x, int y, const char *s, rd_u32 color) {
     if (!win || !s) return;
     while (*s) {
-        rd_glyph_aa(win, x, y, 1, *s, color);
-        x += RIDUX_FONT_W;
+        int left = 0;
+        int right = 0;
+        rd_u8 cc = (rd_u8)(unsigned char)*s;
+        if (rd_glyph_ink_bounds(cc, &left, &right)) {
+            rd_glyph_aa(win, x - left, y, 1, *s, color);
+        }
+        x += rd_glyph_advance(cc);
         ++s;
     }
 }
@@ -252,8 +305,13 @@ void rd_text_scaled(rd_window_t *win, int x, int y, int scale,
                     const char *s, rd_u32 color) {
     if (!win || !s || scale < 1) return;
     while (*s) {
-        rd_glyph_aa(win, x, y, scale, *s, color);
-        x += RIDUX_FONT_W * scale;
+        int left = 0;
+        int right = 0;
+        rd_u8 cc = (rd_u8)(unsigned char)*s;
+        if (rd_glyph_ink_bounds(cc, &left, &right)) {
+            rd_glyph_aa(win, x - left * scale, y, scale, *s, color);
+        }
+        x += rd_glyph_advance(cc) * scale;
         ++s;
     }
 }

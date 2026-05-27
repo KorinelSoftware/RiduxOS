@@ -26,6 +26,7 @@
 #define MB2_BOOTLOADER_MAGIC 0x36d76289u
 #define MB2_TAG_END          0u
 #define MB2_TAG_MODULE       3u
+#define MB2_TAG_MMAP         6u
 #define MB2_TAG_FRAMEBUFFER  8u
 #define MB2_TAG_ACPI_OLD     14u
 #define MB2_TAG_ACPI_NEW     15u
@@ -39,7 +40,7 @@
 #define SHELL_LINE_LEN     140
 #define SHELL_HISTORY_MAX  16
 
-#define VFS_MAX_FILES 4096
+#define VFS_MAX_FILES 32768
 #define VFS_MAX_PATH  256
 #define VFS_RW_MAX    65536
 #define UI_FILE_BUF_MAX 8192
@@ -97,6 +98,21 @@ typedef struct {
     uint32_t type;
     uint32_t size;
 } mb2_tag_t;
+
+typedef struct {
+    uint64_t addr;
+    uint64_t len;
+    uint32_t type;
+    uint32_t reserved;
+} __attribute__((packed)) mb2_mmap_entry_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint32_t entry_size;
+    uint32_t entry_version;
+    mb2_mmap_entry_t entries[1];
+} __attribute__((packed)) mb2_tag_mmap_t;
 
 typedef struct {
     uint32_t type;
@@ -183,7 +199,8 @@ typedef struct {
     char           path[VFS_MAX_PATH];
     const uint8_t *ro_data;
     uint32_t       ro_size;
-    char           rw_data[VFS_RW_MAX];
+    char          *rw_data;
+    uint32_t       rw_cap;
     uint32_t       rw_size;
 } vfs_file_t;
 
@@ -359,10 +376,12 @@ typedef struct {
     uint8_t  bus, slot, func;
     uint16_t vendor_id;
     uint16_t device_id;
+    uint32_t bar[6];
     uint8_t  class_code;
     uint8_t  subclass;
     uint8_t  prog_if;
     uint8_t  revision;
+    uint8_t  header_type;
 } pci_device_t;
 
 /* Real-time clock reading. */
@@ -449,6 +468,7 @@ static bool     g_needs_redraw;
 /* Set by mouse motion handlers to request a cheap cursor-only repaint.
  * Distinct from g_needs_redraw which forces a full scene composite. */
 static bool     g_cursor_moved;
+static bool     g_wayfire_desktop_active;
 static bool     g_start_open;
 static bool     g_quick_open;
 static bool     g_notif_open;
@@ -457,6 +477,7 @@ static const uint8_t *g_initrd_start;
 static const uint8_t *g_initrd_end;
 static const uint8_t *g_initrd_overlay_start;
 static const uint8_t *g_initrd_overlay_end;
+static uint64_t g_phys_mem_top;
 extern uint8_t __kernel_end[];
 
 static vfs_file_t g_vfs_files[VFS_MAX_FILES];
@@ -498,6 +519,14 @@ static bool     g_mouse_dragging;
 static int      g_mouse_drag_window_id;
 static int      g_mouse_drag_offset_x;
 static int      g_mouse_drag_offset_y;
+static int      g_mouse_drag_kind; /* 1 mover, 2 redimensionar. Simple y sin magia. */
+static int      g_mouse_resize_edges;
+static int      g_mouse_drag_start_x;
+static int      g_mouse_drag_start_y;
+static int      g_mouse_drag_start_win_x;
+static int      g_mouse_drag_start_win_y;
+static int      g_mouse_drag_start_win_w;
+static int      g_mouse_drag_start_win_h;
 
 static driver_t      g_drivers[DRIVER_MAX];
 static int           g_driver_count;

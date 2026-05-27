@@ -10,6 +10,11 @@
 #include "base.h"
 #include "memory_tasks.h"
 #include "linux_syscalls.h"
+#include "user_libc.h"
+
+#ifndef ENOPROTOOPT
+#define ENOPROTOOPT 92
+#endif
 
 /* Forward declarations for compat2 functions not in header */
 extern int sig_send(int pid, int sig);
@@ -18,10 +23,26 @@ extern void *ulibc_dlsym(void *handle, const char *symbol);
 extern void compat4_tls_reset_task(int tidx);
 extern int drm_ioctl_handler(int fd,uint64_t request,void *arg);
 extern int fb_ioctl_handler(int fd,uint64_t request,void *arg);
+extern int drm_resolve_mmap_offset(int fd,uint64_t offset,uint64_t len,
+                                   uint64_t *kernel_ptr,uint64_t *avail,
+                                   uint32_t *handle_out);
+extern void drm_mmap_release_handle(uint32_t handle);
+extern void drm_file_close(int fd);
+extern uint32_t drm_prime_handle_for_fd(int32_t fd);
+extern void drm_remember_prime_fd(int32_t fd,uint32_t handle);
+extern bool drm_vbox_gpu_detected(void);
+extern void drm_virtgpu_pump(void);
+extern void tcp7_tick(void);
+extern uint64_t ridux_kernel_timer_ticks(void);
+extern uint32_t ridux_kernel_timer_hz(void);
 
 static const char *c3_vfs_open_slot_path(int ref);
 static int c3_vfs_open_slot_alloc(const char *path);
+static int c3_copy_user_cstr_current(task_t *cur,const char *src,char *dst,size_t cap,const char *tag);
+static void c3_rseq_forget_task(int tidx);
+static uint32_t g_c3_trusted_kernel_path_depth=0;
 extern bool kvfs_read(const char *path, const uint8_t **data, uint32_t *size);
+extern bool kvfs_exists(const char *path);
 
 /* local helpers (no libc) */
 #define C3_MSG_SCRATCH_SIZE 16384u
@@ -57,6 +78,54 @@ static bool c3_has_token(const char *s,const char *tok){
     }
     return false;
 }
+static bool c3_syscall_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0){
+        cached=(kvfs_exists("/etc/ridux-syscall-debug.enable")||
+                kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    }
+    return cached!=0;
+}
+static bool c3_loader_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0){
+        cached=(kvfs_exists("/etc/ridux-loader-debug.enable")||
+                kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    }
+    return cached!=0;
+}
+static bool c3_drm_ioctl_timing_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0){
+        cached=(kvfs_exists("/etc/ridux-drm-ioctl-trace.enable")||
+                kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    }
+    return cached!=0;
+}
+static bool c3_input_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0){
+        cached=(kvfs_exists("/etc/ridux-input-debug.enable")||
+                kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    }
+    return cached!=0;
+}
+static uint32_t c3_display_refresh_hz(void){
+    static int cached=-1;
+    if(kvfs_exists("/etc/ridux-display-refresh-60.enable"))return 60u;
+    if(cached<0){
+        cached=(kvfs_exists("/etc/ridux-display-refresh-144.enable")||
+                kvfs_exists("/etc/ridux-wayfire-virtio-gpu.enable")||
+                kvfs_exists("/etc/ridux-virtio-gpu.enable"))?144:60;
+    }
+    return cached>0?(uint32_t)cached:60u;
+}
+static bool c3_wayfire_debug_trace_enabled(void);
+static bool c3_dbus_debug_trace_enabled(void);
 static void c3_append_str(char *d,size_t *l,size_t c,const char *s){while(*s&&*l+1<c){d[(*l)++]=*s++;}d[*l]=0;}
 static void c3_append_ch(char *d,size_t *l,size_t c,char ch){if(*l+1<c){d[(*l)++]=ch;d[*l]=0;}}
 static void c3_append_u32(char *d,size_t *l,size_t c,uint32_t v){char t[12];int i=0;if(!v){c3_append_ch(d,l,c,'0');return;}while(v){t[i++]='0'+(char)(v%10);v/=10;}while(--i>=0)c3_append_ch(d,l,c,t[i]);}
@@ -81,12 +150,203 @@ static void c3_force_rc(int64_t rc){
         __boot_serial_force_puthex64((uint64_t)rc);
     }
 }
+static uint32_t c3_wl_rd32(const uint8_t *p){
+    return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+}
+static size_t c3_wl_collect_iov(const iovec_t *iov,size_t iovcnt,uint8_t *out,size_t cap,size_t limit){
+    size_t i,used=0;
+    if(limit<cap)cap=limit;
+    for(i=0;i<iovcnt&&used<cap;++i){
+        size_t n;
+        if(!iov[i].iov_len)continue;
+        if(!iov[i].iov_base)break;
+        n=iov[i].iov_len;
+        if(n>cap-used)n=cap-used;
+        c3_memcpy(out+used,iov[i].iov_base,n);
+        used+=n;
+    }
+    return used;
+}
+static bool c3_wl_print_string_arg(const uint8_t *msg,size_t msz,size_t off){
+    uint32_t len;
+    size_t i;
+    if(off+4>msz)return false;
+    len=c3_wl_rd32(msg+off);
+    if(len==0||len>96||off+4+(size_t)len>msz)return false;
+    for(i=0;i<(size_t)len;++i){
+        uint8_t ch=msg[off+4+i];
+        if(ch==0)break;
+        if(ch<0x20||ch>0x7e)return false;
+    }
+    __boot_serial_force_puts(" str=");
+    for(i=0;i<(size_t)len&&msg[off+4+i];++i){
+        char s[2];
+        s[0]=(char)msg[off+4+i];
+        s[1]=0;
+        __boot_serial_force_puts(s);
+    }
+    return true;
+}
+static void c3_trace_wayland_iov(const char *dir,const task_t *cur,int fd,int sref,const iovec_t *iov,size_t iovcnt,size_t limit){
+    static uint32_t trace_count;
+    uint8_t buf[2048];
+    size_t used,off=0;
+    uint32_t msg_count=0;
+    if(trace_count>=1000u||!iov||!iovcnt)return;
+    used=c3_wl_collect_iov(iov,iovcnt,buf,sizeof(buf),limit);
+    while(off+8<=used&&msg_count<64u&&trace_count<1000u){
+        const uint8_t *msg=buf+off;
+        uint32_t obj=c3_wl_rd32(msg);
+        uint32_t wh=c3_wl_rd32(msg+4);
+        uint32_t op=wh&0xFFFFu;
+        uint32_t msz=wh>>16;
+        uint32_t a0=0,a1=0,a2=0,a3=0;
+        if(msz<8u||msz>used-off||(msz&3u)!=0u)break;
+        if(msz>=12u)a0=c3_wl_rd32(msg+8);
+        if(msz>=16u)a1=c3_wl_rd32(msg+12);
+        if(msz>=20u)a2=c3_wl_rd32(msg+16);
+        if(msz>=24u)a3=c3_wl_rd32(msg+20);
+        ++trace_count;
+        ++msg_count;
+        __boot_serial_force_puts("[wl-msg!] #");
+        __boot_serial_force_putu32(trace_count);
+        __boot_serial_force_puts(" ");
+        __boot_serial_force_puts(dir?dir:"?");
+        __boot_serial_force_puts(" pid=");
+        __boot_serial_force_putu32(cur?(uint32_t)cur->pid:0);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts(" fd=");
+        __boot_serial_force_putu32((uint32_t)fd);
+        __boot_serial_force_puts(" ref=");
+        __boot_serial_force_putu32((uint32_t)sref);
+        __boot_serial_force_puts(" obj=");
+        __boot_serial_force_putu32(obj);
+        __boot_serial_force_puts(" op=");
+        __boot_serial_force_putu32(op);
+        __boot_serial_force_puts(" size=");
+        __boot_serial_force_putu32(msz);
+        __boot_serial_force_puts(" a=");
+        __boot_serial_force_puthex64(((uint64_t)a1<<32)|a0);
+        __boot_serial_force_puts("/");
+        __boot_serial_force_puthex64(((uint64_t)a3<<32)|a2);
+        if(obj==1u&&op==0u&&msz>=12u)__boot_serial_force_puts(" display.sync");
+        else if(obj==1u&&op==1u&&msz>=12u)__boot_serial_force_puts(" display.get_registry");
+        else if(obj==2u&&op==0u&&msz>=20u){
+            if(c3_wl_print_string_arg(msg,msz,12u)){
+                uint32_t sl=c3_wl_rd32(msg+12);
+                uint32_t next=16u+((sl+3u)&~3u);
+                if(next+8u<=msz){
+                    __boot_serial_force_puts(" v=");
+                    __boot_serial_force_putu32(c3_wl_rd32(msg+next));
+                    __boot_serial_force_puts(" id=");
+                    __boot_serial_force_putu32(c3_wl_rd32(msg+next+4u));
+                }else if(next+4u<=msz){
+                    __boot_serial_force_puts(" v=");
+                    __boot_serial_force_putu32(c3_wl_rd32(msg+next));
+                }
+            }
+        }else if(obj==3u&&op==0u&&msz>=16u)__boot_serial_force_puts(" callback.done");
+        else if(obj==4u&&op==0u&&msz>=12u)__boot_serial_force_puts(" wl_shm.format");
+        else if(msz>=16u){
+            (void)c3_wl_print_string_arg(msg,msz,8u);
+        }
+        __boot_serial_force_puts("\n");
+        off+=msz;
+    }
+}
+static const char *const c3_dbus_trace_keys[]={
+        "StartServiceByName",
+        "RequestName",
+        "NameAcquired",
+        "NameLost",
+        "NameOwnerChanged",
+        "GetNameOwner",
+        "ListNames",
+        "ListActivatableNames",
+        "AddMatch",
+        "RemoveMatch",
+        "GetMountPoint",
+        "GetManagedObjects",
+        "GetAll",
+        "Introspect",
+        "CreateSession",
+        "OpenPipeWireRemote",
+        "Hello",
+        "org.freedesktop.portal.Desktop",
+        "org.freedesktop.portal.Documents",
+        "org.freedesktop.portal.Settings",
+        "org.freedesktop.portal.MemoryMonitor",
+        "org.freedesktop.portal.PowerProfileMonitor",
+        "org.freedesktop.impl.portal",
+        "org.freedesktop.DBus",
+        "org.freedesktop.systemd1",
+        "org.freedesktop.login1",
+        "org.freedesktop.PolicyKit1",
+        0
+};
+static const char *c3_dbus_trace_match(const uint8_t *buf,size_t used){
+    size_t i;
+    for(i=0;c3_dbus_trace_keys[i];++i){
+        if(c3_mem_has_token((const char*)buf,used,c3_dbus_trace_keys[i]))return c3_dbus_trace_keys[i];
+    }
+    return 0;
+}
+static void c3_dbus_trace_put_hits(const uint8_t *buf,size_t used){
+    bool any=false;
+    size_t i;
+    for(i=0;c3_dbus_trace_keys[i];++i){
+        if(c3_mem_has_token((const char*)buf,used,c3_dbus_trace_keys[i])){
+            if(any)__boot_serial_force_puts(",");
+            __boot_serial_force_puts(c3_dbus_trace_keys[i]);
+            any=true;
+        }
+    }
+    if(!any)__boot_serial_force_puts("unknown");
+}
+static void c3_trace_dbus_iov(const char *dir,const task_t *cur,int fd,int sref,const iovec_t *iov,size_t iovcnt,size_t limit){
+    static uint32_t trace_count;
+    uint8_t buf[4096];
+    const char *hit;
+    size_t used;
+    if(trace_count>=720u||!iov||!iovcnt)return;
+    used=c3_wl_collect_iov(iov,iovcnt,buf,sizeof(buf),limit);
+    if(!used)return;
+    hit=c3_dbus_trace_match(buf,used);
+    if(!hit)return;
+    ++trace_count;
+    __boot_serial_force_puts("[dbus-msg!] #");
+    __boot_serial_force_putu32(trace_count);
+    __boot_serial_force_puts(" ");
+    __boot_serial_force_puts(dir?dir:"?");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32(cur?(uint32_t)cur->pid:0);
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" fd=");
+    __boot_serial_force_putu32((uint32_t)fd);
+    __boot_serial_force_puts(" ref=");
+    __boot_serial_force_putu32((uint32_t)sref);
+    __boot_serial_force_puts(" len=");
+    __boot_serial_force_putu32((uint32_t)used);
+    __boot_serial_force_puts(" hit=");
+    __boot_serial_force_puts(hit);
+    __boot_serial_force_puts(" tags=");
+    c3_dbus_trace_put_hits(buf,used);
+    __boot_serial_force_puts("\n");
+}
 static bool c3_map_trace_wanted(const char *stage,const char *obj,uint64_t a,uint64_t b){
     (void)stage;
+    if(!c3_loader_debug_trace_enabled())return false;
     if(obj&&*obj&&
        (c3_has_token(obj,"firefox")||
         c3_has_token(obj,"chrome")||
         c3_has_token(obj,"chromium")||
+        c3_has_token(obj,"/opt/hyprland/")||
+        c3_has_token(obj,"Hyprland")||
+        c3_has_token(obj,"hyprland")||
+        c3_has_token(obj,"waybar")||
+        c3_has_token(obj,"nwg-dock-hyprland")||
+        c3_has_token(obj,"/opt/wayfire/")||
+        c3_has_token(obj,"wayfire")||
         c3_has_token(obj,"ld-linux")))return true;
     /* Cuando todavia no sabemos el nombre, solo traceamos imagenes enormes.
      * Para segmentos ya mapeados `a` puede ser una direccion alta, no tamano. */
@@ -133,7 +393,7 @@ static bool c3_fd_group_sync_fd(task_t *owner,int fd){
         c3_memcpy(&owner->fdt.fds[fd],&t->fdt.fds[fd],sizeof(real_fd_t));
         {
             static uint32_t sync_trace=0;
-            if(sync_trace<96){
+            if(sync_trace<24){
                 ++sync_trace;
                 __boot_serial_puts("[fd-group-sync] owner=");
                 __boot_serial_putu32((uint32_t)owner->pid);
@@ -212,6 +472,11 @@ static void c3_fd_group_copy_fd(task_t *owner,int fd){
         if(!c3_fd_same_group(t,owner))continue;
         c3_memcpy(&t->fdt.fds[fd],&owner->fdt.fds[fd],sizeof(real_fd_t));
     }
+}
+void compat3_fd_flags_changed(int fd){
+    task_t *cur=task_current();
+    if(!cur||fd<0||fd>=TASK_FD_MAX)return;
+    c3_fd_group_copy_fd(cur,fd);
 }
 static void c3_fd_group_clear_fd(task_t *owner,int fd){
     int i;
@@ -302,15 +567,313 @@ static bool c3_task_is_firefox_runtime(const task_t *t){
                        c3_has_token(t->name,"firefox-bin")))return true;
     return false;
 }
+static bool c3_task_is_hyprland_compositor(const task_t *t){
+    const char *ep=c3_task_exec_path(t);
+    if(ep&&(c3_has_token(ep,"/opt/hyprland/bin/Hyprland")||
+            c3_has_token(ep,"/opt/hyprland/usr/bin/Hyprland")||
+            c3_has_token(ep,"/opt/hyprland/bin/start-hyprland")||
+            c3_has_token(ep,"/usr/bin/start-hyprland")||
+            c3_has_token(ep,"/usr/bin/Hyprland")||
+            c3_has_token(ep,"/bin/Hyprland")))return true;
+    if(t&&t->name[0]&&(c3_strcmp(t->name,"Hyprland")==0||
+                       c3_strcmp(t->name,"hyprland")==0||
+                       c3_strcmp(t->name,"start-hyprland")==0))return true;
+    return false;
+}
+static bool c3_task_is_wayfire_runtime(const task_t *t){
+    const char *ep=c3_task_exec_path(t);
+    if(ep&&(c3_has_token(ep,"/opt/wayfire/")||
+            c3_has_token(ep,"/opt/hyprland/")||
+            c3_has_token(ep,"/opt/kde-plasma/")||
+            c3_has_token(ep,"/Hyprland")||
+            c3_has_token(ep,"/hyprctl")||
+            c3_has_token(ep,"/hyprpaper")||
+            c3_has_token(ep,"/hypridle")||
+            c3_has_token(ep,"/hyprlock")||
+            c3_has_token(ep,"/nwg-dock-hyprland")||
+            c3_has_token(ep,"/wofi")||
+            c3_has_token(ep,"/xdg-desktop-portal-hyprland")||
+            c3_has_token(ep,"/xdg-document-portal")||
+            c3_has_token(ep,"/xdg-permission-store")||
+            c3_has_token(ep,"/kwin_wayland")||
+            c3_has_token(ep,"/plasmashell")||
+            c3_has_token(ep,"/kded6")||
+            c3_has_token(ep,"/kglobalacceld")||
+            c3_has_token(ep,"/kactivitymanagerd")||
+            c3_has_token(ep,"/wayfire")||
+            c3_has_token(ep,"/wf-")||
+            c3_has_token(ep,"/wf-shell")||
+            c3_has_token(ep,"/ridux-ui-shell")||
+            c3_has_token(ep,"/injury-compositor")||
+            c3_has_token(ep,"/injury-shell")||
+            c3_has_token(ep,"/ridux-panel")||
+            c3_has_token(ep,"/waybar")||
+            c3_has_token(ep,"/wireplumber")||
+            c3_has_token(ep,"/pipewire")||
+            c3_has_token(ep,"/xdg-desktop-portal")||
+            c3_has_token(ep,"/xdg-document-portal")||
+            c3_has_token(ep,"/xdg-permission-store")||
+            c3_has_token(ep,"/swaync")||
+            c3_has_token(ep,"/thunar")||
+            c3_has_token(ep,"/wcm")))return true;
+    if(t&&t->name[0]&&(c3_has_token(t->name,"wayfire")||
+                       c3_has_token(t->name,"Hyprland")||
+                       c3_has_token(t->name,"hyprland")||
+                       c3_has_token(t->name,"hyprctl")||
+                       c3_has_token(t->name,"hyprpaper")||
+                       c3_has_token(t->name,"hypridle")||
+                       c3_has_token(t->name,"hyprlock")||
+                        c3_has_token(t->name,"nwg-dock-hyprland")||
+                        c3_has_token(t->name,"wofi")||
+                        c3_has_token(t->name,"xdg-desktop-portal-hyprland")||
+                        c3_has_token(t->name,"xdg-document-portal")||
+                        c3_has_token(t->name,"xdg-permission-store")||
+                       c3_has_token(t->name,"kwin_wayland")||
+                       c3_has_token(t->name,"plasmashell")||
+                       c3_has_token(t->name,"kded6")||
+                       c3_has_token(t->name,"kglobalacceld")||
+                       c3_has_token(t->name,"kactivitymanagerd")||
+                       c3_has_token(t->name,"wf-")||
+                       c3_has_token(t->name,"wf-shell")||
+                       c3_has_token(t->name,"ridux-ui-shell")||
+                       c3_has_token(t->name,"injury-compositor")||
+                       c3_has_token(t->name,"injury-shell")||
+                       c3_has_token(t->name,"ridux-panel")||
+                       c3_has_token(t->name,"ridux-gpu-ladder")||
+                       c3_has_token(t->name,"waybar")||
+                       c3_has_token(t->name,"wireplumber")||
+                       c3_has_token(t->name,"pipewire")||
+                       c3_has_token(t->name,"xdg-desktop-portal")||
+                       c3_has_token(t->name,"xdg-document-portal")||
+                       c3_has_token(t->name,"xdg-permission-store")||
+                       c3_has_token(t->name,"swaync")||
+                       c3_has_token(t->name,"thunar")||
+                       c3_has_token(t->name,"wcm")))return true;
+    return false;
+}
+static bool c3_task_is_wayfire_runtime_loose(const task_t *t){
+    return c3_task_is_wayfire_runtime(t)||
+        (t&&t->name[0]&&c3_has_token(t->name,"wayfire"));
+}
+
+static bool c3_task_is_hypr_portal_backend(const task_t *t){
+    const char *ep=c3_task_exec_path(t);
+    if(ep&&c3_has_token(ep,"/xdg-desktop-portal-hyprland"))return true;
+    if(t&&t->name[0]&&c3_has_token(t->name,"xdg-desktop-portal-hyprland"))return true;
+    return false;
+}
+
+static bool c3_hypr_ipc_path_interesting(const char *path){
+    if(!path||!path[0])return false;
+    return c3_has_token(path,"/tmp/hypr/")||
+           c3_has_token(path,"/run/user/1000/hypr/")||
+           c3_has_token(path,"/.socket.sock")||
+           c3_has_token(path,"/.socket2.sock")||
+           c3_has_token(path,"/xdph.conf")||
+           c3_has_token(path,"hyprland.log")||
+           c3_has_token(path,"xdg-desktop-portal-hyprland");
+}
+
+static bool c3_task_is_ridux_qt_runtime(const task_t *t){
+    const char *ep=c3_task_exec_path(t);
+    if(ep&&(c3_has_token(ep,"/ridux-shell")||
+            c3_has_token(ep,"/ridux-panel")||
+            c3_has_token(ep,"/ridux-dock")||
+            c3_has_token(ep,"/ridux-dashboard")||
+            c3_has_token(ep,"/ridux-files-qt")||
+            c3_has_token(ep,"/ridux-monitor-qt")))return true;
+    if(t&&t->name[0]&&(c3_has_token(t->name,"ridux-shell")||
+                       c3_has_token(t->name,"QDBusConnectionManager")||
+                       c3_has_token(t->name,"QQmlThread")||
+                       c3_has_token(t->name,"QQuick")||
+                       c3_has_token(t->name,"QSGRenderThread")||
+                       c3_has_token(t->name,"QThread")))return true;
+    return false;
+}
+static bool c3_task_is_vulkan_probe_runtime(const task_t *t){
+    const char *ep=c3_task_exec_path(t);
+    if(ep&&c3_has_token(ep,"/ridux-vulkan-probe"))return true;
+    if(t&&t->name[0]&&c3_has_token(t->name,"ridux-vulkan-probe"))return true;
+    return false;
+}
+
+static bool c3_wayfire_stdio_interesting(const void *buf,size_t count){
+    const char *p=(const char*)buf;
+    if(!p||!count)return false;
+    if(c3_mem_has_token(p,count,"ridux-visible-shell"))return true;
+    if(c3_mem_has_token(p,count,"ridux-gpu-ladder"))return true;
+    if(c3_mem_has_token(p,count,"Using OpenGL ES"))return true;
+    if(c3_mem_has_token(p,count,"GL renderer:"))return true;
+    if(c3_mem_has_token(p,count,"EGL vendor:"))return true;
+    if(c3_mem_has_token(p,count,"Using socket name"))return true;
+    if(c3_mem_has_token(p,count,"Modesetting with"))return true;
+    if(c3_mem_has_token(p,count,"new output:"))return true;
+    if(c3_mem_has_token(p,count,"aquamarine"))return true;
+    if(c3_mem_has_token(p,count,"Aquamarine"))return true;
+    if(c3_mem_has_token(p,count,"libseat"))return true;
+    if(c3_mem_has_token(p,count,"libinput"))return true;
+    if(c3_mem_has_token(p,count,"udev:"))return true;
+    if(c3_mem_has_token(p,count,"drm:"))return true;
+    if(c3_mem_has_token(p,count,"DRM"))return true;
+    if(c3_mem_has_token(p,count,"session"))return true;
+    if(c3_mem_has_token(p,count,"Session"))return true;
+    if(c3_mem_has_token(p,count,"backend"))return true;
+    if(c3_mem_has_token(p,count,"Backend"))return true;
+    if(c3_mem_has_token(p,count,"renderer"))return true;
+    if(c3_mem_has_token(p,count,"Renderer"))return true;
+    if(c3_mem_has_token(p,count,"output"))return true;
+    if(c3_mem_has_token(p,count,"Output"))return true;
+    if(c3_mem_has_token(p,count,"GPU"))return true;
+    if(c3_mem_has_token(p,count,"gpu"))return true;
+    if(c3_mem_has_token(p,count,"kwin"))return true;
+    if(c3_mem_has_token(p,count,"KWin"))return true;
+    if(c3_mem_has_token(p,count,"ASSERT"))return true;
+    if(c3_mem_has_token(p,count,"Assert"))return true;
+    if(c3_mem_has_token(p,count,"assert"))return true;
+    if(c3_mem_has_token(p,count,"Assertion"))return true;
+    if(c3_mem_has_token(p,count,"assertion"))return true;
+    if(c3_mem_has_token(p,count,"FATAL"))return true;
+    if(c3_mem_has_token(p,count,"No suitable DRM"))return true;
+    if(c3_mem_has_token(p,count,"EE "))return true;
+    if(c3_mem_has_token(p,count,"Error"))return true;
+    if(c3_mem_has_token(p,count,"Failed"))return true;
+    if(c3_mem_has_token(p,count,"failed"))return true;
+    return false;
+}
+
+static bool c3_desktop_stdio_error_interesting(const void *buf,size_t count){
+    const char *p=(const char*)buf;
+    if(!p||!count)return false;
+    if(c3_mem_has_token(p,count,"ASSERT"))return true;
+    if(c3_mem_has_token(p,count,"Assert"))return true;
+    if(c3_mem_has_token(p,count,"FATAL"))return true;
+    if(c3_mem_has_token(p,count,"CRITICAL"))return true;
+    if(c3_mem_has_token(p,count,"Critical"))return true;
+    if(c3_mem_has_token(p,count,"No suitable DRM"))return true;
+    if(c3_mem_has_token(p,count,"EE "))return true;
+    if(c3_mem_has_token(p,count,"Error"))return true;
+    if(c3_mem_has_token(p,count,"error"))return true;
+    if(c3_mem_has_token(p,count,"Assertion"))return true;
+    if(c3_mem_has_token(p,count,"assertion"))return true;
+    if(c3_mem_has_token(p,count,"Failed"))return true;
+    if(c3_mem_has_token(p,count,"failed"))return true;
+    return false;
+}
+
+static bool c3_desktop_stdio_verbose(const task_t *t){
+    const char *ep=c3_task_exec_path(t);
+    if(!c3_wayfire_debug_trace_enabled())return false;
+    if(ep&&(c3_has_token(ep,"/waybar")||
+            c3_has_token(ep,"/Hyprland")||
+            c3_has_token(ep,"/hyprctl")||
+            c3_has_token(ep,"/hyprpaper")||
+            c3_has_token(ep,"/nwg-dock-hyprland")||
+            c3_has_token(ep,"/xdg-desktop-portal-hyprland")||
+            c3_has_token(ep,"/xdg-document-portal")||
+            c3_has_token(ep,"/xdg-permission-store")||
+            c3_has_token(ep,"/kwin_wayland")||
+            c3_has_token(ep,"/plasmashell")||
+            c3_has_token(ep,"/kded6")||
+            c3_has_token(ep,"/wf-dock")||
+            c3_has_token(ep,"/wf-panel")||
+            c3_has_token(ep,"/wf-shell")||
+            c3_has_token(ep,"/swaync")||
+            c3_has_token(ep,"/wofi")||
+            c3_has_token(ep,"/fuzzel")||
+            c3_has_token(ep,"/foot")||
+            c3_has_token(ep,"/kitty")||
+            c3_has_token(ep,"/thunar")||
+            c3_has_token(ep,"/wcm")||
+            c3_has_token(ep,"/ridux-terminal")||
+            c3_has_token(ep,"/ridux-open-")))return true;
+    if(t&&t->name[0]&&(c3_has_token(t->name,"waybar")||
+                       c3_has_token(t->name,"Hyprland")||
+                       c3_has_token(t->name,"hyprctl")||
+                       c3_has_token(t->name,"hyprpaper")||
+                       c3_has_token(t->name,"nwg-dock-hyprland")||
+                       c3_has_token(t->name,"xdg-desktop-portal-hyprland")||
+                       c3_has_token(t->name,"xdg-document-portal")||
+                       c3_has_token(t->name,"xdg-permission-store")||
+                       c3_has_token(t->name,"kwin_wayland")||
+                       c3_has_token(t->name,"plasmashell")||
+                       c3_has_token(t->name,"kded6")||
+                       c3_has_token(t->name,"wf-dock")||
+                       c3_has_token(t->name,"wf-panel")||
+                       c3_has_token(t->name,"wf-shell")||
+                       c3_has_token(t->name,"swaync")||
+                       c3_has_token(t->name,"wofi")||
+                       c3_has_token(t->name,"fuzzel")||
+                       c3_has_token(t->name,"foot")||
+                       c3_has_token(t->name,"kitty")||
+                       c3_has_token(t->name,"thunar")||
+                       c3_has_token(t->name,"wcm")||
+                       c3_has_token(t->name,"ridux-terminal")||
+                       c3_has_token(t->name,"ridux-open-")))return true;
+    return false;
+}
+
+static bool c3_wayfire_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0)cached=(kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                        kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    return cached!=0;
+}
+
+static bool c3_dbus_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0)cached=(kvfs_exists("/etc/ridux-dbus-trace.enable")||
+                        kvfs_exists("/etc/ridux-ipc-debug.enable"))?1:0;
+    return cached!=0;
+}
+
+static bool c3_hyprland_log_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0)cached=(kvfs_exists("/etc/ridux-hyprland-log.enable")||
+                        kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    return cached!=0;
+}
+
+static bool c3_browser_memory_reserve_ok(task_t *t,const char *why){
+    enum { C3_BROWSER_MIN_FREE_PAGES = 1024 };
+    static uint32_t trace_count=0;
+    if(!c3_task_is_browser_runtime(t))return true;
+    if(pmm_free_count()>C3_BROWSER_MIN_FREE_PAGES)return true;
+    if(trace_count<16){
+        ++trace_count;
+        __boot_serial_force_puts("[browser-mem-guard] pid=");
+        __boot_serial_force_putu32((uint32_t)(t?t->pid:0));
+        c3_force_task_name(t);
+        __boot_serial_force_puts(" why=");
+        __boot_serial_force_puts(why?why:"?");
+        __boot_serial_force_puts(" free=");
+        __boot_serial_force_putu32(pmm_free_count());
+        __boot_serial_force_puts("\n");
+    }
+    return false;
+}
 static bool c3_task_is_firefox_ipc_trace(const task_t *t){
     if(!c3_task_is_firefox_runtime(t))return false;
     if(!t||!t->name[0])return true;
     if(c3_has_token(t->name,"IPC"))return true;
+    if(c3_has_token(t->name,"Socket Thread"))return true;
+    if(c3_has_token(t->name,"DNS Resolver"))return true;
+    if(c3_has_token(t->name,"StreamTrans"))return true;
     if(c3_has_token(t->name,"Web Content"))return true;
     if(c3_has_token(t->name,"MainThread"))return true;
     if(c3_has_token(t->name,"Async"))return true;
     if(c3_has_token(t->name,"firefox"))return true;
     if(c3_has_token(t->name,"firefox-bin"))return true;
+    return false;
+}
+static bool c3_task_is_browser_ipc_trace(const task_t *t){
+    if(c3_task_is_firefox_ipc_trace(t))return true;
+    if(!c3_task_is_chromium_runtime(t))return false;
+    if(!t||!t->name[0])return true;
+    if(c3_has_token(t->name,"Chrome_ChildIOThread"))return true;
+    if(c3_has_token(t->name,"Chrome_IOThread"))return true;
+    if(c3_has_token(t->name,"NetworkService"))return true;
+    if(c3_has_token(t->name,"ThreadPool"))return true;
+    if(c3_has_token(t->name,"chrome"))return true;
     return false;
 }
 static void c3_trace_one_fd(const char *tag,const task_t *t,int fd){
@@ -465,6 +1028,52 @@ static bool c3_exec_is_firefox_glxtest(const char *path,char **argv,int argc){
     }
     return false;
 }
+static bool c3_exec_is_fusermount_path(const char *path){
+    return path&&(c3_has_token(path,"/fusermount3")||
+                  c3_has_token(path,"/fusermount"));
+}
+static int c3_exec_env_fd_value(char **envp,int envc,const char *key){
+    int i;
+    size_t n;
+    int out=0;
+    if(!envp||!key)return -1;
+    n=c3_strlen(key);
+    for(i=0;i<envc;++i){
+        const char *e=envp[i];
+        const char *p;
+        if(!e||c3_strncmp(e,key,n)!=0)continue;
+        p=e+n;
+        if(!*p)return -1;
+        while(*p){
+            if(*p<'0'||*p>'9')return -1;
+            out=out*10+(*p-'0');
+            if(out>=TASK_FD_MAX)return -1;
+            ++p;
+        }
+        return out;
+    }
+    return -1;
+}
+static const char *c3_exec_env_value(char **envp,int envc,const char *key){
+    int i;
+    size_t n;
+    if(!envp||!key)return 0;
+    n=c3_strlen(key);
+    for(i=0;i<envc;++i){
+        const char *e=envp[i];
+        if(!e||c3_strncmp(e,key,n)!=0)continue;
+        return e+n;
+    }
+    return 0;
+}
+static void c3_trace_exec_env_value(const char *tag,char **envp,int envc,const char *key){
+    const char *value=c3_exec_env_value(envp,envc,key);
+    __boot_serial_force_puts(tag);
+    __boot_serial_force_puts(" ");
+    __boot_serial_force_puts(key);
+    __boot_serial_force_puts(value&&*value?value:"(missing)");
+    __boot_serial_force_puts("\n");
+}
 static bool c3_exec_is_chromium_trace(const char *path,char **argv,int argc){
     int i;
     if(path&&(c3_has_token(path,"/opt/chromium/")||
@@ -487,6 +1096,7 @@ static bool c3_exec_chromium_drop_arg(const char *arg){
     if(c3_starts_with(arg,"--pseudonymization-salt-handle="))return true;
     if(c3_starts_with(arg,"--trace-process-track-uuid="))return true;
     if(c3_starts_with(arg,"--trace-startup"))return true;
+    if(c3_starts_with(arg,"--disable-features="))return true;
     if(c3_starts_with(arg,"--enable-crash-reporter="))return true;
     if(c3_starts_with(arg,"--variations-seed-version"))return true;
     return false;
@@ -515,6 +1125,8 @@ static int c3_exec_append_arg(char **argv,int *argc,const char *arg){
 static int c3_exec_stabilize_chromium_args(char **argv,int *argc){
     int added=0;
     if(!argv||!argc)return 0;
+    if(!c3_exec_arg_has_prefix(argv,*argc,"--disable-features="))
+        added+=c3_exec_append_arg(argv,argc,"--disable-features=AudioServiceOutOfProcess,AutofillServerCommunication,CalculateNativeWinOcclusion,CanvasOopRasterization,CertificateTransparencyComponentUpdater,DialMediaRouteProvider,EnablePerfettoSystemBackgroundTracing,EnablePerfettoSystemTracing,FirstRunDesktopRefresh,FirstRunDesktopRevamp,IsolateOrigins,MediaRouter,MojoUseEventFd,OptimizationHints,ProcessPerSiteUpToMainFrameThreshold,SitePerProcess,StorageServiceOutOfProcess,StrictOriginIsolation,PartitionAllocBackupRefPtr,PartitionAllocMemoryTagging,PartitionAllocWithAdvancedChecks,PartitionAllocSchedulerLoopQuarantine,PartitionAllocSchedulerLoopQuarantineTaskControlledPurge,PartitionAllocEventuallyZeroFreedMemory,PartitionAllocMemoryReclaimer,PartitionAllocStraightenLargerSlotSpanFreeLists,PartitionAllocSortSmallerSlotSpanFreeLists,PartitionAllocSortActiveSlotSpans,PartitionAllocUseDenserDistribution,PartitionAllocFreeWithSize,PartitionAllocExternalMetadata,PartitionAllocLargeThreadCacheSize,PartitionAllocLargeEmptySlotSpanRing");
     if(!c3_exec_arg_has_prefix(argv,*argc,"--disable-background-tracing"))
         added+=c3_exec_append_arg(argv,argc,"--disable-background-tracing");
     if(!c3_exec_arg_has_prefix(argv,*argc,"--disable-chrome-tracing-computation"))
@@ -581,17 +1193,134 @@ static void c3_task_force_browser_stable_mode(task_t *t,const char *path){
     if(path&&(c3_has_token(path,"/opt/firefox/")||
               c3_has_token(path,"/firefox")))firefox=true;
     if(firefox||c3_task_is_firefox_runtime(t)){
-        t->no_timer_preempt=true;
-        g_task_preempt_defer_ticks=3;
+        t->no_timer_preempt=false;
+        g_task_preempt_defer_ticks=1;
     }
+}
+#define C3_USER_TOP      0x0000800000000000ULL
+#define C3_USER_LOW_SAFE RIDUX_USER_LOW_SAFE
+#define C3_USER_HEAP_GAP (2ULL*1024ULL*1024ULL)
+#define C3_USER_HEAP_RESERVE (256ULL*1024ULL*1024ULL)
+static uint64_t c3_align_up_page(uint64_t v){
+    return (v+PAGE_SIZE-1ULL)&~(PAGE_SIZE-1ULL);
+}
+static bool c3_place_user_heap(task_t *t,const char *why){
+    uint64_t old_start,old_current;
+    uint64_t base,limit,next_mmap;
+    static uint32_t trace_count=0;
+    if(!t)return false;
+    old_start=t->brk_start;
+    old_current=t->brk_current;
+    base=c3_align_up_page(t->brk_start);
+    if(t->mmap_base<C3_USER_LOW_SAFE)t->mmap_base=C3_USER_LOW_SAFE;
+    if(!base||base<C3_USER_LOW_SAFE||base<t->mmap_base+C3_USER_HEAP_GAP)
+        base=c3_align_up_page(t->mmap_base+C3_USER_HEAP_GAP);
+    if(base<C3_USER_LOW_SAFE)base=C3_USER_LOW_SAFE;
+    if(base>=C3_USER_TOP||C3_USER_HEAP_RESERVE>C3_USER_TOP-base)return false;
+    limit=base+C3_USER_HEAP_RESERVE;
+    if(C3_USER_HEAP_GAP>C3_USER_TOP-limit)return false;
+    next_mmap=c3_align_up_page(limit+C3_USER_HEAP_GAP);
+    t->brk_start=base;
+    if(t->brk_current<base||t->brk_current>=limit)t->brk_current=base;
+    if(t->mmap_base<next_mmap)t->mmap_base=next_mmap;
+    if(c3_wayfire_debug_trace_enabled()&&trace_count<32&&
+       (old_start!=t->brk_start||old_current!=t->brk_current)){
+        ++trace_count;
+        __boot_serial_force_puts("[linux-heap-place!] pid=");
+        __boot_serial_force_putu32((uint32_t)t->pid);
+        c3_force_task_name(t);
+        __boot_serial_force_puts(" why=");
+        __boot_serial_force_puts(why?why:"?");
+        __boot_serial_force_puts(" old=");
+        __boot_serial_force_puthex64(old_start);
+        __boot_serial_force_puts("/");
+        __boot_serial_force_puthex64(old_current);
+        __boot_serial_force_puts(" new=");
+        __boot_serial_force_puthex64(t->brk_start);
+        __boot_serial_force_puts("/");
+        __boot_serial_force_puthex64(t->brk_current);
+        __boot_serial_force_puts(" mmap=");
+        __boot_serial_force_puthex64(t->mmap_base);
+        __boot_serial_force_puts("\n");
+    }
+    return true;
 }
 static int c3_task_index_by_pid(int pid){int i;for(i=0;i<TASK_MAX;++i)if(g_tasks[i].used&&g_tasks[i].pid==pid)return i;return -1;}
 static task_t *c3_task_by_pid(int pid){int i=c3_task_index_by_pid(pid);return(i>=0)?&g_tasks[i]:0;}
 static void c3_clone_prepare_user_tls_stack(task_t *cur,uint64_t child_pid,uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_t ctid,uint64_t tls);
+static void c3_vm_layout_pull_shared(task_t *cur);
+static void c3_vm_layout_push_shared(task_t *cur);
 
 static inline uint64_t c3_rdtsc(void){uint32_t lo,hi;__asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));return((uint64_t)hi<<32)|lo;}
 static uint64_t g_boot_tsc=0;
 static uint64_t g_tsc_freq_approx=3000000000ULL; /* ~3GHz estimate */
+static uint64_t c3_muldiv_u64_sat(uint64_t a,uint64_t b,uint64_t d){
+    uint64_t q,r,hi,lo;
+    if(!a||!b)return 0;
+    if(!d)return ~0ULL;
+    q=a/d;
+    r=a%d;
+    if(q&&b>(~0ULL/q))return ~0ULL;
+    hi=q*b;
+    if(r&&b>(~0ULL/r))return ~0ULL;
+    lo=(r*b)/d;
+    return lo>(~0ULL-hi)?~0ULL:(hi+lo);
+}
+static uint64_t c3_add_sat_u64(uint64_t a,uint64_t b){
+    return b>(~0ULL-a)?~0ULL:(a+b);
+}
+static uint64_t c3_kernel_ticks_to_ns(uint64_t ticks,uint32_t hz){
+    uint64_t sec,rem;
+    if(!hz)return 0;
+    sec=ticks/(uint64_t)hz;
+    rem=ticks%(uint64_t)hz;
+    return sec*1000000000ULL+(rem*1000000000ULL)/(uint64_t)hz;
+}
+static uint64_t c3_kernel_monotonic_ns(void){
+    uint32_t hz=ridux_kernel_timer_hz();
+    uint64_t ticks=ridux_kernel_timer_ticks();
+    if(!hz)hz=100u;
+    return c3_kernel_ticks_to_ns(ticks,hz);
+}
+static void c3_calibrate_tsc_from_kernel_timer(void){
+    uint32_t hz=ridux_kernel_timer_hz();
+    uint64_t start_tick,first_tick,target_tick,cur_tick;
+    uint64_t t0,t1,delta_tsc,delta_ticks,freq;
+    uint64_t guard;
+    if(hz<10u||hz>10000u)return;
+    start_tick=ridux_kernel_timer_ticks();
+    guard=c3_rdtsc()+g_tsc_freq_approx;
+    do{
+        __asm__ volatile("pause");
+        first_tick=ridux_kernel_timer_ticks();
+    }while(first_tick==start_tick&&c3_rdtsc()<guard);
+    if(first_tick==start_tick)return;
+    t0=c3_rdtsc();
+    target_tick=first_tick+(uint64_t)(hz/10u);
+    if(target_tick<=first_tick)target_tick=first_tick+1u;
+    guard=t0+g_tsc_freq_approx;
+    do{
+        __asm__ volatile("pause");
+        cur_tick=ridux_kernel_timer_ticks();
+    }while(cur_tick<target_tick&&c3_rdtsc()<guard);
+    t1=c3_rdtsc();
+    if(cur_tick<=first_tick||t1<=t0)return;
+    delta_ticks=cur_tick-first_tick;
+    delta_tsc=t1-t0;
+    freq=(delta_tsc*(uint64_t)hz)/delta_ticks;
+    if(freq>=100000000ULL&&freq<=10000000000ULL){
+        g_tsc_freq_approx=freq;
+        if(c3_syscall_debug_trace_enabled()){
+            __boot_serial_puts("[tsc-calib] hz=");
+            __boot_serial_putu32(hz);
+            __boot_serial_puts(" ticks=");
+            __boot_serial_puthex64(delta_ticks);
+            __boot_serial_puts(" freq=");
+            __boot_serial_puthex64(freq);
+            __boot_serial_puts("\n");
+        }
+    }
+}
 static uint32_t g_umask_val=022;
 static uint8_t  g_c3_seccomp_mode[TASK_MAX];
 
@@ -600,6 +1329,7 @@ static uint8_t  g_c3_seccomp_mode[TASK_MAX];
 typedef struct {
     bool used;
     real_fd_t fd;
+    uint32_t drm_prime_handle;
 } c3_scm_right_t;
 static c3_scm_right_t g_c3_scm_rights[C3_SCM_RIGHTS_MAX];
 static uint32_t g_c3_scm_rights_next=0;
@@ -608,6 +1338,8 @@ static uint64_t g_c3_ns_mask[TASK_MAX];
 static uint8_t  g_c3_no_new_privs[TASK_MAX];
 #define C3_AFFINITY_WORDS ((TASK_MAX+63)/64)
 static uint64_t g_c3_sched_affinity[TASK_MAX][C3_AFFINITY_WORDS];
+static int g_c3_sched_policy[TASK_MAX];
+static int g_c3_sched_priority[TASK_MAX];
 #define C3_RLIMIT_RESOURCE_MAX 16
 typedef struct {
     uint64_t cur;
@@ -616,6 +1348,21 @@ typedef struct {
 static c3_rlimit_pair_t g_c3_rlimits[TASK_MAX][C3_RLIMIT_RESOURCE_MAX];
 static uint8_t g_c3_rlimits_inited[TASK_MAX];
 static int g_c3_rlimits_pid[TASK_MAX];
+typedef struct{
+    uint8_t  registered;
+    int      owner_pid;
+    uint64_t user_ptr;
+    uint32_t user_len;
+    uint32_t signature;
+} c3_rseq_state_t;
+typedef struct{
+    uint32_t cpu_id_start;
+    uint32_t cpu_id;
+    uint64_t rseq_cs;
+    uint32_t flags;
+} c3_rseq_user_t;
+static c3_rseq_state_t g_c3_rseq_state[TASK_MAX];
+static uint8_t g_c3_membarrier_reg[TASK_MAX];
 static uint32_t g_c3_dyn_images_mapped=0;
 static uint32_t g_c3_dyn_reloc_applied=0;
 static uint32_t g_c3_dyn_reloc_failed=0;
@@ -624,7 +1371,7 @@ static uint32_t g_c3_dyn_needed_loaded=0;
 static uint32_t g_c3_dyn_needed_missing=0;
 static uint32_t g_c3_dyn_objects=0;
 static int g_c3_dyn_load_depth=0;
-static uint32_t g_c3_dyn_timeout_ms=4000;
+static uint32_t g_c3_dyn_timeout_ms=20000;
 static uint32_t g_c3_dyn_timeout_hits=0;
 static uint64_t g_c3_dyn_last_timeout_tsc=0;
 static char g_c3_dyn_last_timeout_obj[128];
@@ -653,23 +1400,25 @@ static uint16_t g_c3_phys_refcnt[PMM_MAX_PAGES];
 #define C3_MPROTECT_TRACE_MAX 48
 #endif
 #ifndef C3_MUNMAP_TRACE_MAX
-#define C3_MUNMAP_TRACE_MAX 32
+#define C3_MUNMAP_TRACE_MAX 128
 #endif
 
-#define C3_USER_TOP      0x0000800000000000ULL
 #define C3_PMM_BASE      0x200000ULL
 #define C3_PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 #define C3_PTE_KEEP_MASK (~C3_PTE_ADDR_MASK)
 #define C3_PAGE_SOFT_COW (1ULL<<9)
 
-#define C3_FILEPAGE_MAX  8192
+#define C3_FILEPAGE_MAX  65536
+#define C3_FILEPAGE_LOOKUP_MAX 8192
 typedef struct {
     bool     used;
     char     path[VFS_PATH_MAX];
     uint64_t page_off;
     uint64_t phys;
+    uint64_t hash;
 } c3_file_page_t;
 static c3_file_page_t g_c3_file_pages[C3_FILEPAGE_MAX];
+static uint32_t g_c3_file_page_lookup[C3_FILEPAGE_LOOKUP_MAX];
 
 #ifndef C3_EXEC_ARG_MAX
 #define C3_EXEC_ARG_MAX   256
@@ -687,11 +1436,15 @@ static c3_file_page_t g_c3_file_pages[C3_FILEPAGE_MAX];
 #define C3_USER_TLS_DTV   (C3_USER_TLS_BASE+0x200ULL)
 #define C3_USER_TLS_DTV_SLOTS 32
 static void c3_trace_user_addr_mapping(const task_t *cur,uint64_t addr,const char *tag);
+static void c3_force_browser_addr_mapping(const task_t *cur,uint64_t addr,const char *tag);
+static void c3_force_wayfire_addr_mapping(const task_t *cur,uint64_t addr,const char *tag);
 /* Exec scratch area to avoid large allocations on the kernel stack. */
 static char  g_c3_exec_argv_pool[C3_EXEC_STR_MAX];
 static char  g_c3_exec_env_pool[C3_EXEC_STR_MAX];
 static char *g_c3_exec_argv[C3_EXEC_ARG_MAX+1];
 static char *g_c3_exec_envp[C3_EXEC_ENV_MAX+1];
+static volatile int g_c3_execve_lock=0;
+static volatile int g_c3_execve_lock_owner=0;
 
 typedef struct {
     uint64_t val;
@@ -772,12 +1525,43 @@ static c3_dyn_profile_t g_c3_exec_dyn_profile_backup[C3_DYN_PROFILE_MAX];
 
 static uint64_t c3_tsc_to_us(uint64_t cyc){
     if(!cyc||!g_tsc_freq_approx)return 0;
-    return(cyc*1000000ULL)/g_tsc_freq_approx;
+    return c3_muldiv_u64_sat(cyc,1000000ULL,g_tsc_freq_approx);
+}
+
+static void c3_execve_lock_acquire(task_t *cur,const char *path){
+    uint32_t spins=0;
+    while(__sync_lock_test_and_set(&g_c3_execve_lock,1)){
+        if((spins++&0x3fU)==0){
+            if(c3_wayfire_debug_trace_enabled()){
+                static uint32_t trace_count=0;
+                if(trace_count<24u){
+                    ++trace_count;
+                    __boot_serial_force_puts("[execve-lock-wait!] pid=");
+                    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" owner=");
+                    __boot_serial_force_putu32((uint32_t)g_c3_execve_lock_owner);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(path?path:"?");
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            task_schedule();
+        }
+    }
+    g_c3_execve_lock_owner=cur?cur->pid:0;
+}
+
+static void c3_execve_lock_release(void){
+    g_c3_execve_lock_owner=0;
+    __sync_lock_release(&g_c3_execve_lock);
 }
 
 static uint64_t c3_dyn_deadline_from_ms(uint32_t ms){
+    uint64_t delta;
     if(!ms||!g_tsc_freq_approx)return 0;
-    return c3_rdtsc()+((uint64_t)ms*g_tsc_freq_approx)/1000ULL;
+    delta=c3_muldiv_u64_sat((uint64_t)ms,g_tsc_freq_approx,1000ULL);
+    return c3_add_sat_u64(c3_rdtsc(),delta);
 }
 
 static bool c3_dyn_deadline_expired(uint64_t deadline){
@@ -791,8 +1575,16 @@ static uint64_t c3_poll_slice_deadline(uint64_t deadline){
     return slice?slice:now;
 }
 
+static void c3_net_pump_once(void){
+    static uint32_t tick_div;
+    e1000_poll_rx();
+    drm_virtgpu_pump();
+    if((tick_div++ & 7u)==0u)tcp7_tick();
+}
+
 static void c3_poll_wait_slice(task_t *cur,uint64_t deadline){
     uint64_t slice=c3_poll_slice_deadline(deadline);
+    c3_net_pump_once();
     if(!cur){
         task_schedule();
         return;
@@ -800,6 +1592,39 @@ static void c3_poll_wait_slice(task_t *cur,uint64_t deadline){
     if(slice<=c3_rdtsc()){
         __asm__ volatile("pause");
         return;
+    }
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_wait_trace=0;
+        if(wf_wait_trace<320u){
+            int ti;
+            ++wf_wait_trace;
+            __boot_serial_force_puts("[wf-poll-sleep!] #");
+            __boot_serial_force_putu32(wf_wait_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" deadline=");
+            __boot_serial_force_puthex64(deadline);
+            __boot_serial_force_puts(" slice=");
+            __boot_serial_force_puthex64(slice);
+            if((wf_wait_trace&63u)==0u){
+                __boot_serial_force_puts(" tasks=");
+                for(ti=0;ti<TASK_MAX;++ti){
+                    task_t *wt=&g_tasks[ti];
+                    if(!wt->used)continue;
+                    if(wt->addr_space!=cur->addr_space&&!c3_task_is_wayfire_runtime(wt))continue;
+                    __boot_serial_force_puts(" ");
+                    __boot_serial_force_putu32((uint32_t)wt->pid);
+                    __boot_serial_force_puts(":s");
+                    __boot_serial_force_putu32((uint32_t)wt->state);
+                    __boot_serial_force_puts(":rip");
+                    __boot_serial_force_puthex64(wt->ctx.rip);
+                    __boot_serial_force_puts(":rsp");
+                    __boot_serial_force_puthex64(wt->ctx.rsp);
+                }
+            }
+            __boot_serial_force_puts("\n");
+        }
     }
     cur->sleep_until=slice;
     cur->state=TASK_SLEEPING;
@@ -1011,6 +1836,9 @@ static int c3_inotify_watch_add(int ref,const char *path,uint32_t mask);
 static int c3_inotify_watch_rm(int ref,int32_t wd);
 static int64_t c3_inotify_read(int ref,void *buf,size_t count,int flags);
 static void c3_inotify_notify_path(const char *path,uint32_t mask,uint32_t cookie);
+static bool c3_drm_event_has_fd(int fd);
+static int64_t c3_drm_event_read(task_t *cur,int fd,void *buf,size_t count);
+static void c3_drm_event_drop_fd_ref(int fd,int ref,bool last_ref);
 
 static uint32_t c3_futex_wake_n(uint32_t *uaddr,uint32_t want,uintptr_t mm_key,bool exact_key,uint32_t bitset);
 static void c3_futex_waiter_remove_task_uaddr(int task_index,uint32_t *uaddr,uintptr_t mm_key,bool exact_key);
@@ -1021,6 +1849,9 @@ static void c3_phys_ref_retain(uint64_t phys);
 static void c3_phys_ref_release(uint64_t phys);
 static void c3_file_page_invalidate_phys(uint64_t phys);
 static void c3_file_page_invalidate_path(const char *path);
+static void c3_file_page_rename_path(const char *old_path,const char *new_path);
+static void c3_mmap_rename_backing_path(const char *old_path,const char *new_path);
+static uint64_t c3_alloc_user_frame(void);
 static int c3_exec_capture_vec(char *const src[],char **outv,int maxc,char *pool,size_t poolsz,int *outc);
 static int c3_exec_extract_interp(const uint8_t *data,uint32_t sz,char *out,size_t out_cap,bool *needs_interp);
 static int c3_exec_resolve_interp_path(const char *exe_path,const char *interp,char *out,size_t out_cap);
@@ -1029,9 +1860,291 @@ static bool c3_exec_map_user_stack(address_space_t *as);
 static void c3_exec_fill_random16(uint8_t out[16]);
 static void c3_exec_close_cloexec_fds(task_t *cur);
 static void c3_exec_reset_signal_state(task_t *cur);
+static int c3_user_copy_in(task_t *cur,void *dst,const void *src,size_t len,const char *tag);
+static int c3_user_copy_out(task_t *cur,void *dst,const void *src,size_t len,const char *tag);
+static int c3_user_path_is_empty(task_t *cur,const char *path,bool *empty,const char *tag);
+static int c3_user_materialize_read_page(task_t *cur,uint64_t page,const char *tag);
 static int c3_user_write_u32_as(address_space_t *as,uint64_t va,uint32_t val,const char *tag);
 static void c3_exec_reset_dynamic_state(void);
 static void c3_exec_clear_mmap_for_as(address_space_t *as);
+
+#define C3_DRM_EVENT_MAX 64
+#define C3_DRM_EVENT_FLIP_COMPLETE 0x02u
+
+typedef struct __attribute__((packed)) {
+    uint32_t type;
+    uint32_t length;
+    uint64_t user_data;
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+    uint32_t sequence;
+    uint32_t crtc_id;
+} c3_drm_event_vblank_t;
+
+typedef struct {
+    bool used;
+    int fd;
+    int ref;
+    uint64_t due_us;
+    c3_drm_event_vblank_t ev;
+} c3_drm_event_slot_t;
+
+static c3_drm_event_slot_t g_c3_drm_events[C3_DRM_EVENT_MAX];
+static uint32_t g_c3_drm_event_seq;
+static uint64_t g_c3_drm_next_flip_due_us;
+
+static uint64_t c3_drm_now_us(void){
+    timespec_t ts;
+    if(real_sys_clock_gettime(1/*CLOCK_MONOTONIC*/,&ts)==0&&ts.tv_sec>=0&&ts.tv_nsec>=0)
+        return (uint64_t)ts.tv_sec*1000000ULL+(uint64_t)ts.tv_nsec/1000ULL;
+    return 0ULL;
+}
+
+static uint64_t c3_drm_refresh_interval_us(void){
+    uint32_t hz=c3_display_refresh_hz();
+    if(hz<30u)hz=60u;
+    if(hz>240u)hz=240u;
+    return (1000000ULL+(uint64_t)hz-1ULL)/(uint64_t)hz;
+}
+
+static bool c3_drm_event_ready(const c3_drm_event_slot_t *slot,uint64_t now_us){
+    return slot&&slot->used&&(!slot->due_us||!now_us||slot->due_us<=now_us);
+}
+
+static uint32_t c3_wake_fd_waiters(uint8_t kind,int ref,const char *tag){
+    int ti,fd;
+    uint32_t woke=0;
+    for(ti=0;ti<TASK_MAX;++ti){
+        task_t *t=&g_tasks[ti];
+        bool interested=false;
+        if(!t->used||t->state!=TASK_SLEEPING)continue;
+        if(t->state==TASK_ZOMBIE||t->state==TASK_FREE)continue;
+        for(fd=0;fd<TASK_FD_MAX;++fd){
+            uint8_t fk=t->fdt.fds[fd].kind;
+            int fr=t->fdt.fds[fd].ref;
+            if(fk==FDKIND_NONE)continue;
+            if(fk==kind&&(ref<0||fr==ref)){
+                interested=true;
+                break;
+            }
+            if(fk==FDKIND_EPOLL){
+                interested=true;
+                break;
+            }
+        }
+        if(!interested)continue;
+        if(task_make_runnable(ti))++woke;
+    }
+    if(woke){
+        static uint32_t trace_count=0;
+        if((c3_wayfire_debug_trace_enabled()||c3_hyprland_log_trace_enabled())&&trace_count<64u){
+            ++trace_count;
+            __boot_serial_puts("[fd-wake] tag=");
+            __boot_serial_puts(tag?tag:"?");
+            __boot_serial_puts(" kind=");
+            __boot_serial_putu32((uint32_t)kind);
+            __boot_serial_puts(" ref=");
+            __boot_serial_putu32(ref<0?0xFFFFFFFFu:(uint32_t)ref);
+            __boot_serial_puts(" woke=");
+            __boot_serial_putu32(woke);
+            __boot_serial_puts("\n");
+        }
+    }
+    return woke;
+}
+
+static void c3_wake_socket_peer_waiters(int ref,const char *tag){
+    int peer=-1;
+    if(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)
+        peer=g_sockets[ref].peer;
+    c3_wake_fd_waiters(FDKIND_SOCKET,ref,tag);
+    if(peer>=0)c3_wake_fd_waiters(FDKIND_SOCKET,peer,tag);
+}
+
+bool drm_fd_is_render_node(int fd){
+    task_t *cur=task_current();
+    if(fd<0||!cur)return false;
+    if(!fd_valid(&cur->fdt,fd))return false;
+    if(cur->fdt.fds[fd].kind!=FDKIND_DEVFB)return false;
+    /* ref==1: /dev/dri/card0 (KMS), ref==2: /dev/dri/renderD128 (render-only),
+     * ref==0: /dev/fb0. Render nodes must not expose KMS resources. */
+    return cur->fdt.fds[fd].ref==2;
+}
+
+void drm_queue_page_flip_event(int fd,uint64_t user_data,uint32_t crtc_id){
+    int i,slot=-1;
+    int ref=-1;
+    task_t *cur=task_current();
+    uint64_t now_us=c3_drm_now_us();
+    uint64_t due_us=now_us;
+    uint64_t interval_us=c3_drm_refresh_interval_us();
+    if(fd<0)return;
+    if(cur&&fd_valid(&cur->fdt,fd)&&cur->fdt.fds[fd].kind==FDKIND_DEVFB)
+        ref=cur->fdt.fds[fd].ref;
+    if(interval_us){
+        if(g_c3_drm_next_flip_due_us>now_us)
+            due_us=g_c3_drm_next_flip_due_us+interval_us;
+        else
+            due_us=now_us+interval_us;
+        g_c3_drm_next_flip_due_us=due_us;
+    }
+    for(i=0;i<C3_DRM_EVENT_MAX;++i){
+        if(!g_c3_drm_events[i].used){slot=i;break;}
+    }
+    if(slot<0){
+        uint32_t best_seq=0;
+        for(i=0;i<C3_DRM_EVENT_MAX;++i){
+            if(!c3_drm_event_ready(&g_c3_drm_events[i],now_us))continue;
+            if(slot<0||g_c3_drm_events[i].ev.sequence<best_seq){
+                slot=i;
+                best_seq=g_c3_drm_events[i].ev.sequence;
+            }
+        }
+    }
+    if(slot<0)slot=0;
+    c3_memset(&g_c3_drm_events[slot],0,sizeof(g_c3_drm_events[slot]));
+    g_c3_drm_events[slot].used=true;
+    g_c3_drm_events[slot].fd=fd;
+    g_c3_drm_events[slot].ref=ref;
+    g_c3_drm_events[slot].due_us=due_us;
+    g_c3_drm_events[slot].ev.type=C3_DRM_EVENT_FLIP_COMPLETE;
+    g_c3_drm_events[slot].ev.length=(uint32_t)sizeof(c3_drm_event_vblank_t);
+    g_c3_drm_events[slot].ev.user_data=user_data;
+    g_c3_drm_events[slot].ev.sequence=++g_c3_drm_event_seq;
+    g_c3_drm_events[slot].ev.crtc_id=crtc_id;
+    /* Real DRM drivers fill tv_sec/tv_usec with the monotonic timestamp of
+     * the actual vblank, used by Wayland presentation-time and EGL_KHR_swap_
+     * buffers_with_damage. We approximate with the current monotonic clock,
+     * which is what wlroots also passes through to clients. */
+    g_c3_drm_events[slot].ev.tv_sec=(uint32_t)(due_us/1000000ULL);
+    g_c3_drm_events[slot].ev.tv_usec=(uint32_t)(due_us%1000000ULL);
+    {
+        static uint32_t trace_count;
+        if((c3_wayfire_debug_trace_enabled()||c3_hyprland_log_trace_enabled())&&trace_count<96){
+            ++trace_count;
+            __boot_serial_force_puts("[drm-event-queue] fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)(ref<0?0:ref));
+            __boot_serial_force_puts(" slot=");
+            __boot_serial_force_putu32((uint32_t)slot);
+            __boot_serial_force_puts(" seq=");
+            __boot_serial_force_putu32(g_c3_drm_events[slot].ev.sequence);
+            __boot_serial_force_puts(" user=");
+            __boot_serial_force_puthex64(user_data);
+            __boot_serial_force_puts(" crtc=");
+            __boot_serial_force_putu32(crtc_id);
+            __boot_serial_force_puts(" due_us=");
+            __boot_serial_force_puthex64(due_us);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(due_us<=now_us)
+        c3_wake_fd_waiters(FDKIND_DEVFB,ref,"drm");
+}
+
+static bool c3_drm_event_matches_fd(task_t *cur,const c3_drm_event_slot_t *slot,int fd){
+    real_fd_t *fe;
+    if(!slot||!slot->used||fd<0)return false;
+    if(slot->fd==fd)return true;
+    if(!cur||!fd_valid(&cur->fdt,fd))return false;
+    fe=&cur->fdt.fds[fd];
+    return fe->kind==FDKIND_DEVFB&&slot->ref>=0&&slot->ref==fe->ref;
+}
+
+static bool c3_drm_event_has_fd(int fd){
+    int i;
+    task_t *cur=task_current();
+    uint64_t now_us=c3_drm_now_us();
+    if(fd<0)return false;
+    for(i=0;i<C3_DRM_EVENT_MAX;++i)
+        if(c3_drm_event_matches_fd(cur,&g_c3_drm_events[i],fd)&&
+           c3_drm_event_ready(&g_c3_drm_events[i],now_us))
+            return true;
+    return false;
+}
+
+static int c3_drm_next_ready_event_slot(task_t *cur,int fd,uint64_t now_us){
+    int i,best=-1;
+    uint32_t best_seq=0;
+    if(fd<0)return -1;
+    for(i=0;i<C3_DRM_EVENT_MAX;++i){
+        c3_drm_event_slot_t *slot=&g_c3_drm_events[i];
+        if(!c3_drm_event_matches_fd(cur,slot,fd))continue;
+        if(!c3_drm_event_ready(slot,now_us))continue;
+        if(best<0||slot->ev.sequence<best_seq){
+            best=i;
+            best_seq=slot->ev.sequence;
+        }
+    }
+    return best;
+}
+
+bool drm_page_flip_inflight(int fd){
+    int i;
+    task_t *cur=task_current();
+    uint64_t now_us=c3_drm_now_us();
+    if(fd<0)return false;
+    for(i=0;i<C3_DRM_EVENT_MAX;++i)
+        if(c3_drm_event_matches_fd(cur,&g_c3_drm_events[i],fd)&&
+           g_c3_drm_events[i].used&&g_c3_drm_events[i].due_us&&
+           (!now_us||g_c3_drm_events[i].due_us>now_us))
+            return true;
+    return false;
+}
+
+static int64_t c3_drm_event_read(task_t *cur,int fd,void *buf,size_t count){
+    int i;
+    uint64_t now_us=c3_drm_now_us();
+    if(count<sizeof(c3_drm_event_vblank_t))return -EINVAL;
+    for(;;){
+        c3_drm_event_vblank_t ev;
+        i=c3_drm_next_ready_event_slot(cur,fd,now_us);
+        if(i<0)break;
+        c3_memcpy(&ev,&g_c3_drm_events[i].ev,sizeof(ev));
+        if(c3_user_copy_out(cur,buf,&ev,sizeof(ev),"drm-event")<0)return -EFAULT;
+        g_c3_drm_events[i].used=false;
+        {
+            static uint32_t trace_count;
+            if((c3_wayfire_debug_trace_enabled()||c3_hyprland_log_trace_enabled())&&trace_count<96){
+                ++trace_count;
+                __boot_serial_force_puts("[drm-event-read] pid=");
+                __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" queued_fd=");
+                __boot_serial_force_putu32((uint32_t)g_c3_drm_events[i].fd);
+                __boot_serial_force_puts(" seq=");
+                __boot_serial_force_putu32(ev.sequence);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return (int64_t)sizeof(ev);
+    }
+    return -EAGAIN;
+}
+
+static void c3_drm_event_drop_fd_ref(int fd,int ref,bool last_ref){
+    int i;
+    if(fd<0)return;
+    for(i=0;i<C3_DRM_EVENT_MAX;++i){
+        if(!g_c3_drm_events[i].used)continue;
+        /*
+         * DRM events belong to the open file description.  wlroots keeps a
+         * duplicated DRM fd in epoll, so closing the original number must not
+         * throw away the pending page-flip event while another fd with the same
+         * ref is still alive.
+         */
+        if(g_c3_drm_events[i].ref>=0){
+            if(last_ref&&g_c3_drm_events[i].ref==ref)
+                g_c3_drm_events[i].used=false;
+            continue;
+        }
+        if(g_c3_drm_events[i].fd==fd)
+            g_c3_drm_events[i].used=false;
+    }
+}
 
 typedef struct __attribute__((packed)) {
     uint64_t r_offset;
@@ -1190,10 +2303,13 @@ typedef struct {
 } c3_pollfd_t;
 
 #define C3_MSG_IOV_MAX 1024
+#define C3_MSG_IOV_LOCAL_MAX 128
+#define C3_MSG_CONTROL_LOCAL_MAX 4096u
 #define C3_MMSG_MAX 1024
 #define C3_MSG_PEEK 0x2
 #define C3_MSG_DONTWAIT 0x40
 #define C3_MSG_CTRUNC 0x8
+#define C3_MSG_TRUNC 0x20
 #define C3_MSG_WAITFORONE 0x10000
 #define C3_MSG_CMSG_CLOEXEC 0x40000000u
 #define C3_SOL_SOCKET 1
@@ -1208,13 +2324,19 @@ typedef struct {
 #define C3_SO_PASSCRED 16
 #define C3_SO_PEERCRED 17
 #define C3_SO_ACCEPTCONN 30
+#define C3_SO_PEERSEC 31
 #define C3_SO_PROTOCOL 38
 #define C3_SO_DOMAIN 39
+#define C3_SO_PEERGROUPS 59
+#define C3_SO_PASSPIDFD 76
+#define C3_SO_PEERPIDFD 77
 #define C3_SOCK_VFLAG_PASSCRED 0x0040u
+#define C3_SOCK_VFLAG_PASSPIDFD 0x0080u
 #define C3_POLLIN  0x001
 #define C3_POLLOUT 0x004
 #define C3_POLLERR 0x008
 #define C3_POLLHUP 0x010
+#define C3_POLLNVAL 0x020
 
 typedef struct {
     int32_t pid;
@@ -1222,12 +2344,100 @@ typedef struct {
     int32_t gid;
 } c3_ucred_t;
 
-static bool c3_socket_ref_closed(int ref){
+typedef struct {
+    uint32_t nlmsg_len;
+    uint16_t nlmsg_type;
+    uint16_t nlmsg_flags;
+    uint32_t nlmsg_seq;
+    uint32_t nlmsg_pid;
+} c3_nlmsghdr_t;
+
+typedef struct {
+    c3_nlmsghdr_t hdr;
+    int32_t error;
+    c3_nlmsghdr_t request;
+} c3_nlmsgerr_t;
+
+typedef struct {
+    uint16_t rta_len;
+    uint16_t rta_type;
+} c3_rtattr_t;
+
+typedef struct {
+    uint8_t ifi_family;
+    uint8_t __ifi_pad;
+    uint16_t ifi_type;
+    int32_t ifi_index;
+    uint32_t ifi_flags;
+    uint32_t ifi_change;
+} c3_ifinfomsg_t;
+
+typedef struct {
+    uint8_t ifa_family;
+    uint8_t ifa_prefixlen;
+    uint8_t ifa_flags;
+    uint8_t ifa_scope;
+    uint32_t ifa_index;
+} c3_ifaddrmsg_t;
+
+typedef struct {
+    uint8_t rtm_family;
+    uint8_t rtm_dst_len;
+    uint8_t rtm_src_len;
+    uint8_t rtm_tos;
+    uint8_t rtm_table;
+    uint8_t rtm_protocol;
+    uint8_t rtm_scope;
+    uint8_t rtm_type;
+    uint32_t rtm_flags;
+} c3_rtmsg_t;
+
+#define C3_NLMSG_ERROR 2u
+#define C3_NLMSG_DONE  3u
+#define C3_NLM_F_REQUEST 0x0001u
+#define C3_NLM_F_ACK     0x0004u
+#define C3_NLM_F_DUMP    0x0300u
+#define C3_RTM_NEWLINK  16u
+#define C3_RTM_GETLINK  18u
+#define C3_RTM_NEWADDR  20u
+#define C3_RTM_GETADDR  22u
+#define C3_RTM_NEWROUTE 24u
+#define C3_RTM_GETROUTE 26u
+#define C3_RT_TABLE_MAIN 254u
+#define C3_RT_TABLE_LOCAL 255u
+#define C3_RTPROT_KERNEL 2u
+#define C3_RTPROT_BOOT   3u
+#define C3_RT_SCOPE_UNIVERSE 0u
+#define C3_RT_SCOPE_HOST     254u
+#define C3_RTN_UNICAST 1u
+#define C3_RTN_LOCAL   2u
+#define C3_ARPHRD_ETHER    1u
+#define C3_ARPHRD_LOOPBACK 772u
+#define C3_IFF_UP        0x0001u
+#define C3_IFF_BROADCAST 0x0002u
+#define C3_IFF_LOOPBACK  0x0008u
+#define C3_IFF_RUNNING   0x0040u
+#define C3_IFF_MULTICAST 0x1000u
+#define C3_IFLA_ADDRESS   1u
+#define C3_IFLA_IFNAME    3u
+#define C3_IFLA_OPERSTATE 16u
+#define C3_IFA_ADDRESS 1u
+#define C3_IFA_LOCAL   2u
+#define C3_IFA_LABEL   3u
+#define C3_RTA_OIF     4u
+#define C3_RTA_GATEWAY 5u
+#define C3_RTA_PREFSRC 7u
+#define C3_IFA_F_PERMANENT 0x80u
+#define C3_IF_OPER_UP 6u
+
+static task_t *c3_socket_owner_task(int sref, const task_t *skip);
+
+static bool c3_socket_ref_recv_eof(int ref){
     socket_t *s;
     if(ref<0||ref>=SOCK_MAX)return true;
     s=&g_sockets[ref];
     if(!s->used)return true;
-    return s->type==1&&s->tcp_state==TCP_CLOSED;
+    return s->type==1&&(s->tcp_state==TCP_CLOSED||s->shutdown_rx);
 }
 
 static uint32_t c3_socket_rx_used(int ref){
@@ -1257,6 +2467,335 @@ static uint32_t c3_socket_send_space(int ref){
     return (uint32_t)(SOCK_BUF_SIZE-used);
 }
 
+static uint32_t c3_nl_align4(uint32_t n){
+    return (n+3u)&~3u;
+}
+
+static uint32_t c3_hton32(uint32_t v){
+    return ((v&0x000000ffu)<<24)|
+           ((v&0x0000ff00u)<<8)|
+           ((v&0x00ff0000u)>>8)|
+           ((v&0xff000000u)>>24);
+}
+
+static int c3_netlink_rx_push(int ref,const void *buf,size_t len){
+    socket_t *s;
+    const uint8_t *p=(const uint8_t*)buf;
+    size_t used,av,i;
+    if(ref<0||ref>=SOCK_MAX||!g_sockets[ref].used||!buf)return -EBADF;
+    s=&g_sockets[ref];
+    used=s->rx_head-s->rx_tail;
+    if(used>SOCK_BUF_SIZE)used=SOCK_BUF_SIZE;
+    av=SOCK_BUF_SIZE-used;
+    if(len>av)return -ENOMEM;
+    for(i=0;i<len;++i){
+        s->rx_buf[s->rx_head&(SOCK_BUF_SIZE-1)]=p[i];
+        ++s->rx_head;
+    }
+    c3_wake_fd_waiters(FDKIND_SOCKET,ref,"netlink");
+    return (int)len;
+}
+
+static int c3_netlink_msg_start(uint8_t *msg,size_t cap,
+                                const c3_nlmsghdr_t *req,uint16_t type,
+                                const void *payload,size_t payload_len,
+                                size_t *off){
+    c3_nlmsghdr_t *h;
+    size_t start;
+    if(!msg||!req||!off)return -EINVAL;
+    if(sizeof(*h)+payload_len>cap)return -ENOMEM;
+    c3_memset(msg,0,cap);
+    h=(c3_nlmsghdr_t*)msg;
+    h->nlmsg_type=type;
+    h->nlmsg_seq=req->nlmsg_seq;
+    h->nlmsg_pid=0;
+    start=sizeof(*h);
+    if(payload_len&&payload)c3_memcpy(msg+start,payload,payload_len);
+    *off=(size_t)c3_nl_align4((uint32_t)(start+payload_len));
+    h->nlmsg_len=(uint32_t)(start+payload_len);
+    return 0;
+}
+
+static int c3_netlink_attr_add(uint8_t *msg,size_t cap,size_t *off,
+                               uint16_t type,const void *data,size_t len){
+    c3_rtattr_t *a;
+    size_t raw,padded;
+    if(!msg||!off)return -EINVAL;
+    raw=sizeof(*a)+len;
+    padded=(size_t)c3_nl_align4((uint32_t)raw);
+    if(*off+padded>cap)return -ENOMEM;
+    c3_memset(msg+*off,0,padded);
+    a=(c3_rtattr_t*)(msg+*off);
+    a->rta_len=(uint16_t)raw;
+    a->rta_type=type;
+    if(len&&data)c3_memcpy(msg+*off+sizeof(*a),data,len);
+    *off+=padded;
+    return 0;
+}
+
+static int c3_netlink_msg_finish(int ref,uint8_t *msg,size_t off){
+    c3_nlmsghdr_t *h;
+    if(!msg||off<sizeof(*h))return -EINVAL;
+    h=(c3_nlmsghdr_t*)msg;
+    h->nlmsg_len=(uint32_t)off;
+    return c3_netlink_rx_push(ref,msg,off);
+}
+
+static int c3_netlink_queue_done(task_t *cur,int ref,const c3_nlmsghdr_t *req);
+
+static int c3_netlink_queue_link(task_t *cur,int ref,const c3_nlmsghdr_t *req,
+                                 int ifindex,const char *name,uint16_t arptype,
+                                 uint32_t flags,const uint8_t *mac,size_t mac_len){
+    uint8_t msg[256];
+    c3_ifinfomsg_t ifi;
+    size_t off=0;
+    uint8_t oper=C3_IF_OPER_UP;
+    int rc;
+    (void)cur;
+    c3_memset(&ifi,0,sizeof(ifi));
+    ifi.ifi_family=0;
+    ifi.ifi_type=arptype;
+    ifi.ifi_index=ifindex;
+    ifi.ifi_flags=flags;
+    ifi.ifi_change=0xffffffffu;
+    rc=c3_netlink_msg_start(msg,sizeof(msg),req,C3_RTM_NEWLINK,
+                            &ifi,sizeof(ifi),&off);
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_IFLA_IFNAME,
+                           name,c3_strlen(name)+1);
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_IFLA_OPERSTATE,
+                           &oper,sizeof(oper));
+    if(rc<0)return rc;
+    if(mac&&mac_len){
+        rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_IFLA_ADDRESS,
+                               mac,mac_len);
+        if(rc<0)return rc;
+    }
+    return c3_netlink_msg_finish(ref,msg,off);
+}
+
+static int c3_netlink_queue_addr(task_t *cur,int ref,const c3_nlmsghdr_t *req,
+                                 int ifindex,const char *label,uint32_t ip,
+                                 uint8_t prefix,uint8_t scope){
+    uint8_t msg[256];
+    c3_ifaddrmsg_t ifa;
+    uint32_t nip=c3_hton32(ip);
+    size_t off=0;
+    int rc;
+    (void)cur;
+    c3_memset(&ifa,0,sizeof(ifa));
+    ifa.ifa_family=2;
+    ifa.ifa_prefixlen=prefix;
+    ifa.ifa_flags=C3_IFA_F_PERMANENT;
+    ifa.ifa_scope=scope;
+    ifa.ifa_index=(uint32_t)ifindex;
+    rc=c3_netlink_msg_start(msg,sizeof(msg),req,C3_RTM_NEWADDR,
+                            &ifa,sizeof(ifa),&off);
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_IFA_ADDRESS,
+                           &nip,sizeof(nip));
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_IFA_LOCAL,
+                           &nip,sizeof(nip));
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_IFA_LABEL,
+                           label,c3_strlen(label)+1);
+    if(rc<0)return rc;
+    return c3_netlink_msg_finish(ref,msg,off);
+}
+
+static int c3_netlink_queue_route(task_t *cur,int ref,const c3_nlmsghdr_t *req,
+                                  int ifindex,uint32_t gateway,uint32_t prefsrc){
+    uint8_t msg[256];
+    c3_rtmsg_t rt;
+    uint32_t oif=(uint32_t)ifindex;
+    uint32_t gw=c3_hton32(gateway);
+    uint32_t src=c3_hton32(prefsrc);
+    size_t off=0;
+    int rc;
+    (void)cur;
+    c3_memset(&rt,0,sizeof(rt));
+    rt.rtm_family=2;
+    rt.rtm_dst_len=0;
+    rt.rtm_table=C3_RT_TABLE_MAIN;
+    rt.rtm_protocol=C3_RTPROT_BOOT;
+    rt.rtm_scope=C3_RT_SCOPE_UNIVERSE;
+    rt.rtm_type=C3_RTN_UNICAST;
+    rc=c3_netlink_msg_start(msg,sizeof(msg),req,C3_RTM_NEWROUTE,
+                            &rt,sizeof(rt),&off);
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_RTA_OIF,&oif,sizeof(oif));
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_RTA_GATEWAY,&gw,sizeof(gw));
+    if(rc<0)return rc;
+    rc=c3_netlink_attr_add(msg,sizeof(msg),&off,C3_RTA_PREFSRC,&src,sizeof(src));
+    if(rc<0)return rc;
+    return c3_netlink_msg_finish(ref,msg,off);
+}
+
+static int c3_netlink_queue_route_dump(task_t *cur,int ref,const c3_nlmsghdr_t *req){
+    uint8_t mac[6]={0x52,0x54,0x00,0x12,0x34,0x56};
+    int rc=0;
+    if(!req)return -EINVAL;
+    if(req->nlmsg_type==C3_RTM_GETLINK){
+        rc=c3_netlink_queue_link(cur,ref,req,1,"lo",C3_ARPHRD_LOOPBACK,
+                                 C3_IFF_UP|C3_IFF_RUNNING|C3_IFF_LOOPBACK,
+                                 0,0);
+        if(rc<0)return rc;
+        rc=c3_netlink_queue_link(cur,ref,req,2,"eth0",C3_ARPHRD_ETHER,
+                                 C3_IFF_UP|C3_IFF_RUNNING|C3_IFF_BROADCAST|C3_IFF_MULTICAST,
+                                 mac,sizeof(mac));
+        if(rc<0)return rc;
+    }else if(req->nlmsg_type==C3_RTM_GETADDR){
+        rc=c3_netlink_queue_addr(cur,ref,req,1,"lo",0x7f000001u,8,C3_RT_SCOPE_HOST);
+        if(rc<0)return rc;
+        rc=c3_netlink_queue_addr(cur,ref,req,2,"eth0",0x0a00020fu,24,C3_RT_SCOPE_UNIVERSE);
+        if(rc<0)return rc;
+    }else if(req->nlmsg_type==C3_RTM_GETROUTE){
+        rc=c3_netlink_queue_route(cur,ref,req,2,0x0a000202u,0x0a00020fu);
+        if(rc<0)return rc;
+    }
+    return c3_netlink_queue_done(cur,ref,req);
+}
+
+static int c3_netlink_queue_done(task_t *cur,int ref,const c3_nlmsghdr_t *req){
+    c3_nlmsghdr_t done;
+    if(!req)return -EINVAL;
+    c3_memset(&done,0,sizeof(done));
+    done.nlmsg_len=sizeof(done);
+    done.nlmsg_type=C3_NLMSG_DONE;
+    done.nlmsg_seq=req->nlmsg_seq;
+    done.nlmsg_pid=0;
+    return c3_netlink_rx_push(ref,&done,sizeof(done));
+}
+
+static int c3_netlink_queue_ack(task_t *cur,int ref,const c3_nlmsghdr_t *req,int32_t error){
+    c3_nlmsgerr_t ack;
+    if(!req)return -EINVAL;
+    c3_memset(&ack,0,sizeof(ack));
+    ack.hdr.nlmsg_len=sizeof(ack);
+    ack.hdr.nlmsg_type=C3_NLMSG_ERROR;
+    ack.hdr.nlmsg_seq=req->nlmsg_seq;
+    ack.hdr.nlmsg_pid=0;
+    ack.error=error;
+    ack.request=*req;
+    return c3_netlink_rx_push(ref,&ack,sizeof(ack));
+}
+
+static int64_t c3_netlink_sendmsg(task_t *cur,int fd,int ref,const iovec_t *iov,size_t iovcnt,int flags){
+    c3_nlmsghdr_t hdr;
+    uint8_t *h=(uint8_t*)&hdr;
+    size_t total=0,got=0,i;
+    socket_t *s;
+    (void)fd;
+    (void)flags;
+    if(ref<0||ref>=SOCK_MAX||!g_sockets[ref].used)return -EBADF;
+    s=&g_sockets[ref];
+    c3_memset(&hdr,0,sizeof(hdr));
+    for(i=0;i<iovcnt;++i){
+        size_t len=iov[i].iov_len;
+        const uint8_t *base=(const uint8_t*)iov[i].iov_base;
+        size_t cp;
+        if(!len)continue;
+        if(!base)return -EFAULT;
+        if(total+len<total)return -EINVAL;
+        total+=len;
+        if(got>=sizeof(hdr))continue;
+        cp=sizeof(hdr)-got;
+        if(cp>len)cp=len;
+        if(c3_user_copy_in(cur,h+got,base,cp,"netlink-sendmsg")<0)return -EFAULT;
+        got+=cp;
+    }
+    if(!total)return 0;
+    if(got>=sizeof(hdr)&&hdr.nlmsg_len>=sizeof(hdr)){
+        bool dump=(hdr.nlmsg_flags&C3_NLM_F_DUMP)!=0;
+        bool ack=(hdr.nlmsg_flags&C3_NLM_F_ACK)!=0;
+        bool route_dump=s->protocol==0&&
+            (hdr.nlmsg_type==C3_RTM_GETLINK||
+             hdr.nlmsg_type==C3_RTM_GETADDR||
+             hdr.nlmsg_type==C3_RTM_GETROUTE);
+        if(route_dump){
+            (void)c3_netlink_queue_route_dump(cur,ref,&hdr);
+        }else if(dump){
+            (void)c3_netlink_queue_done(cur,ref,&hdr);
+        }else if(ack){
+            (void)c3_netlink_queue_ack(cur,ref,&hdr,0);
+        }
+        if(cur&&((c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur))||
+                 c3_dbus_debug_trace_enabled())){
+            static uint32_t trace_count;
+            if(trace_count<96u){
+                ++trace_count;
+                __boot_serial_force_puts("[netlink-sendmsg] #");
+                __boot_serial_force_putu32(trace_count);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" ref=");
+                __boot_serial_force_putu32((uint32_t)ref);
+                __boot_serial_force_puts(" proto=");
+                __boot_serial_force_putu32((uint32_t)s->protocol);
+                __boot_serial_force_puts(" type=");
+                __boot_serial_force_putu32((uint32_t)hdr.nlmsg_type);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)hdr.nlmsg_flags);
+                __boot_serial_force_puts(" seq=");
+                __boot_serial_force_putu32(hdr.nlmsg_seq);
+                __boot_serial_force_puts(" rx=");
+                __boot_serial_force_putu32(c3_socket_rx_used(ref));
+                __boot_serial_force_puts("\n");
+            }
+        }
+    }
+    return (int64_t)total;
+}
+
+static int64_t c3_netlink_recv_kernel(int ref,void *buf,size_t cap,int flags,int *msg_flags){
+    socket_t *s;
+    size_t av,cp,i;
+    uint8_t *out=(uint8_t*)buf;
+    if(ref<0||ref>=SOCK_MAX||!g_sockets[ref].used)return -EBADF;
+    if(!buf&&cap)return -EFAULT;
+    s=&g_sockets[ref];
+    av=s->rx_head-s->rx_tail;
+    if(av>SOCK_BUF_SIZE)av=SOCK_BUF_SIZE;
+    if(!av)return -EAGAIN;
+    cp=av;
+    if(cp>cap)cp=cap;
+    for(i=0;i<cp;++i)out[i]=s->rx_buf[(s->rx_tail+i)&(SOCK_BUF_SIZE-1)];
+    if(!(flags&C3_MSG_PEEK))s->rx_tail+=(uint32_t)av;
+    if(msg_flags){
+        *msg_flags=0;
+        if(cp<av)*msg_flags|=C3_MSG_TRUNC;
+    }
+    return (flags&C3_MSG_TRUNC)?(int64_t)av:(int64_t)cp;
+}
+
+static int64_t c3_netlink_recv_user(task_t *cur,int ref,void *buf,size_t len,int flags){
+    uint8_t pkt[C3_MSG_SCRATCH_SIZE];
+    size_t cap=len;
+    int msg_flags=0;
+    int64_t rc;
+    if(!cur)return -ESRCH;
+    if(!buf&&len)return -EFAULT;
+    if(cap>sizeof(pkt))cap=sizeof(pkt);
+    for(;;){
+        rc=c3_netlink_recv_kernel(ref,pkt,cap,flags,&msg_flags);
+        if(rc!=-EAGAIN||flags&C3_MSG_DONTWAIT)break;
+        if(c3_task_has_unblocked_signal(cur))return -EINTR;
+        c3_poll_wait_slice(cur,0);
+    }
+    if(rc>0&&cap){
+        size_t cp=(size_t)rc;
+        if(cp>cap)cp=cap;
+        if(c3_user_copy_out(cur,buf,pkt,cp,"netlink-recvfrom")<0)return -EFAULT;
+    }
+    return rc;
+}
+
 static int c3_socket_ref_virtual_service(int ref){
     socket_t *s;
     int svc;
@@ -1266,6 +2805,25 @@ static int c3_socket_ref_virtual_service(int ref){
     if(svc!=SOCK_VIRT_NONE)return svc;
     if(s->peer>=0&&s->peer<SOCK_MAX&&g_sockets[s->peer].used)return g_sockets[s->peer].virt_service;
     return SOCK_VIRT_NONE;
+}
+
+static bool c3_socket_ref_is_real_web_stream(int ref){
+    socket_t *s;
+    if(ref<0||ref>=SOCK_MAX||!g_sockets[ref].used)return false;
+    s=&g_sockets[ref];
+    if(s->type==1&&net_is_real_external(s->remote_ip)&&
+       (s->remote_port==80||s->remote_port==443))return true;
+    if(s->peer>=0&&s->peer<SOCK_MAX&&g_sockets[s->peer].used){
+        s=&g_sockets[s->peer];
+        if(s->type==1&&net_is_real_external(s->remote_ip)&&
+           (s->remote_port==80||s->remote_port==443))return true;
+    }
+    return false;
+}
+
+static bool c3_socket_ref_should_trace_browser_io(int ref){
+    if(c3_socket_ref_virtual_service(ref)==SOCK_VIRT_NONE)return true;
+    return c3_socket_ref_is_real_web_stream(ref);
 }
 
 static bool c3_socket_ref_is_virtual_stream(int ref){
@@ -1284,14 +2842,17 @@ static bool c3_socket_ref_is_virtual_stream(int ref){
 }
 
 static int64_t c3_socket_send_iov_coalesced(int sref,const iovec_t *iov,size_t iovcnt,int flags){
+    task_t *cur=task_current();
     uint8_t pkt[C3_MSG_SCRATCH_SIZE];
     size_t total=0,i;
     int64_t rc;
+    if(!cur)return -ESRCH;
     for(i=0;i<iovcnt;++i){
         if(!iov[i].iov_len)continue;
         if(!iov[i].iov_base)return -EFAULT;
         if(total+iov[i].iov_len>sizeof(pkt))return -EFBIG;
-        c3_memcpy(pkt+total,iov[i].iov_base,iov[i].iov_len);
+        if(c3_user_copy_in(cur,pkt+total,iov[i].iov_base,iov[i].iov_len,
+                           "socket-send-iov")<0)return -EFAULT;
         total+=iov[i].iov_len;
     }
     if(!total)return 0;
@@ -1308,8 +2869,9 @@ static void c3_trace_x11_read_result(int fd,int ref,size_t count,int flags,int64
     socket_t *s=0;
     task_t *cur=task_current();
     int trace_svc=c3_socket_ref_virtual_service(ref);
+    if(!c3_wayfire_debug_trace_enabled()&&!c3_dbus_debug_trace_enabled())return;
     if(trace_svc!=SOCK_VIRT_X11&&trace_svc!=SOCK_VIRT_WL)return;
-    if(g_c3_x11_read_trace_count>=256)return;
+    if(g_c3_x11_read_trace_count>=32)return;
     if(r<=0)return;
     rx_after=c3_socket_rx_used(ref);
     if(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)s=&g_sockets[ref];
@@ -1368,11 +2930,12 @@ static void c3_trace_x11_read_result(int fd,int ref,size_t count,int flags,int64
     __boot_serial_puts("\n");
 }
 
-static int64_t c3_socket_recv_wait(int ref,void *buf,size_t len,int flags){
+static int64_t c3_socket_recv_kernel_wait(int ref,void *buf,size_t len,int flags){
     task_t *cur=task_current();
     uint32_t waits=0;
     uint32_t rx_before;
     if(len==0)return 0;
+    if(!buf)return -EFAULT;
     for(;;){
         rx_before=c3_socket_rx_used(ref);
         int64_t r=(int64_t)sock_recv(ref,buf,len,flags);
@@ -1380,10 +2943,10 @@ static int64_t c3_socket_recv_wait(int ref,void *buf,size_t len,int flags){
             c3_trace_x11_read_result(-1,ref,len,flags,r,buf,rx_before);
             return r;
         }
+        if(c3_socket_ref_recv_eof(ref))return 0;
         if(flags&C3_MSG_DONTWAIT)return -EAGAIN;
-        if(c3_socket_ref_closed(ref))return 0;
         if(cur&&c3_task_has_unblocked_signal(cur))return -EINTR;
-        if(waits<8){
+        if(c3_wayfire_debug_trace_enabled()&&waits<8){
             ++waits;
             __boot_serial_puts("[sock-wait] pid=");
             __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
@@ -1414,6 +2977,18 @@ static int64_t c3_socket_recv_wait(int ref,void *buf,size_t len,int flags){
     }
 }
 
+static int64_t c3_socket_recv_wait(int ref,void *buf,size_t len,int flags){
+    task_t *cur=task_current();
+    uint8_t pkt[4096];
+    size_t want=len;
+    int64_t r;
+    if(!cur||!buf)return -EFAULT;
+    if(want>sizeof(pkt))want=sizeof(pkt);
+    r=c3_socket_recv_kernel_wait(ref,pkt,want,flags);
+    if(r>0&&c3_user_copy_out(cur,buf,pkt,(size_t)r,"socket-recv")<0)return -EFAULT;
+    return r;
+}
+
 /* VFS bridge: open/read/write/close over FD table */
 
 /* Kernel VFS from kernel.c is accessed via non-static wrappers */
@@ -1425,7 +3000,21 @@ extern bool kvfs_remove(const char *path);
 extern bool kvfs_rename(const char *src,const char *dst);
 extern bool kvfs_listdir(const char *dir,char *out,uint32_t out_cap);
 
+static bool c3_vbox_gpu_mode(void){
+    return kvfs_exists("/etc/ridux-vbox-gpu.enable") ||
+           kvfs_exists("/etc/ridux-wayfire-vbox-gpu.enable") ||
+           kvfs_exists("/etc/ridux-plasma-vbox-gpu.enable") ||
+           drm_vbox_gpu_detected();
+}
+
+static const char *c3_drm_pci_driver_dir(void){
+    return c3_vbox_gpu_mode()?"/sys/bus/pci/drivers/vmwgfx":"/sys/bus/pci/drivers/virtio-pci";
+}
+
 static void c3_file_page_invalidate_path(const char *path);
+static void c3_file_page_rename_path(const char *old_path,const char *new_path);
+static void c3_mmap_rename_backing_path(const char *old_path,const char *new_path);
+static bool c3_mmap_backing_path_used_anywhere(const char *path);
 static int c3_file_page_find_slot(const char *path,uint64_t page_off);
 static uint64_t c3_file_page_get_frame(const char *path,const uint8_t *file_data,uint32_t file_size,uint64_t page_off);
 static void c3_path_mode_remove(const char *path);
@@ -1472,14 +3061,14 @@ static int c3_memfd_track_find(const char *path){
     return -1;
 }
 
-static void c3_memfd_track_set(const char *path,uint32_t seals){
+static bool c3_memfd_track_set(const char *path,uint32_t seals){
     int i,free_slot=-1;
-    if(!path||!path[0])return;
+    if(!path||!path[0])return false;
     for(i=0;i<C3_MEMFD_TRACK_MAX;++i){
         if(g_c3_memfds[i].used){
             if(c3_strcmp(g_c3_memfds[i].path,path)==0){
                 g_c3_memfds[i].seals=seals;
-                return;
+                return true;
             }
         }else if(free_slot<0){
             free_slot=i;
@@ -1490,7 +3079,29 @@ static void c3_memfd_track_set(const char *path,uint32_t seals){
         c3_strlcpy(g_c3_memfds[free_slot].path,path,sizeof(g_c3_memfds[free_slot].path));
         g_c3_memfds[free_slot].seals=seals;
         g_c3_memfds[free_slot].size=0;
+        return true;
     }
+    return false;
+}
+
+static bool c3_memfd_track_rename(const char *old_path,const char *new_path){
+    int idx=c3_memfd_track_find(old_path);
+    if(idx<0||!new_path||!new_path[0])return false;
+    c3_strlcpy(g_c3_memfds[idx].path,new_path,sizeof(g_c3_memfds[idx].path));
+    return true;
+}
+
+static bool c3_memfd_track_remove(const char *path){
+    int idx=c3_memfd_track_find(path);
+    if(idx<0)return false;
+    c3_memset(&g_c3_memfds[idx],0,sizeof(g_c3_memfds[idx]));
+    return true;
+}
+
+static bool c3_sparse_tmpfs_path(const char *path){
+    return path&&(c3_starts_with(path,"/dev/shm/")||
+                  c3_starts_with(path,"/tmp/ridux-visible-shell-")||
+                  c3_starts_with(path,"/tmp/wlroots-"));
 }
 
 static bool c3_memfd_path_get_seals(const char *path,uint32_t *seals){
@@ -1533,7 +3144,7 @@ static bool c3_memfd_fd_path(task_t *cur,int fd,const char **path){
     if(path)*path=0;
     if(!cur||!fd_valid(&cur->fdt,fd)||cur->fdt.fds[fd].kind!=FDKIND_VFSFILE)return false;
     p=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
-    if(!p||!c3_starts_with(p,C3_MEMFD_PREFIX))return false;
+    if(!p||!c3_memfd_path_get_size(p,0))return false;
     if(path)*path=p;
     return true;
 }
@@ -1562,6 +3173,72 @@ static size_t c3_memfd_sparse_read(const char *path,uint64_t off,void *buf,size_
         done+=chunk;
     }
     return done;
+}
+
+static uint32_t c3_argb_over_xrgb(uint32_t dst,uint32_t src){
+    uint32_t a=(src>>24)&0xffu;
+    uint32_t sr=(src>>16)&0xffu,sg=(src>>8)&0xffu,sb=src&0xffu;
+    uint32_t dr=(dst>>16)&0xffu,dg=(dst>>8)&0xffu,db=dst&0xffu;
+    if(!a)return dst;
+    if(a==255u)return 0xff000000u|(sr<<16)|(sg<<8)|sb;
+    return 0xff000000u|
+           (((sr*a+dr*(255u-a))/255u)<<16)|
+           (((sg*a+dg*(255u-a))/255u)<<8)|
+           ((sb*a+db*(255u-a))/255u);
+}
+
+static uint64_t c3_copy_memfd_frame(const char *path,void *dst,uint32_t pitch,
+                                    uint32_t width,uint32_t height,bool alpha){
+    uint64_t row_bytes=(uint64_t)width*4ULL;
+    uint64_t logical=0,copied=0;
+    uint32_t y;
+    if(!path||!dst||!pitch||!width||!height||pitch<row_bytes)return 0;
+    if(row_bytes>(uint64_t)C3_VFS_FILE_MAX)return 0;
+    if(!c3_memfd_path_get_size(path,&logical))return 0;
+    if(logical<row_bytes*(uint64_t)height)return 0;
+    for(y=0;y<height;++y){
+        uint8_t *row=(uint8_t*)dst+(uint64_t)y*(uint64_t)pitch;
+        size_t got;
+        if(alpha){
+            uint32_t x;
+            got=c3_memfd_sparse_read(path,(uint64_t)y*row_bytes,
+                                     g_c3_vfs_file_scratch,(size_t)row_bytes);
+            if(got<(size_t)row_bytes)break;
+            for(x=0;x<width;++x){
+                uint32_t src=((const uint32_t*)(const void*)g_c3_vfs_file_scratch)[x];
+                uint32_t *dr=(uint32_t*)(void*)row;
+                dr[x]=c3_argb_over_xrgb(dr[x],src);
+            }
+        }else{
+            got=c3_memfd_sparse_read(path,(uint64_t)y*row_bytes,row,(size_t)row_bytes);
+            if(got<(size_t)row_bytes)break;
+        }
+        copied+=got;
+    }
+    return copied;
+}
+
+uint64_t c3_copy_visible_shell_frame(void *dst,uint32_t pitch,uint32_t width,uint32_t height){
+    int i;
+    uint64_t copied=0;
+    if(!dst||!pitch||!width||!height||pitch<(uint64_t)width*4ULL)return 0;
+    for(i=0;i<C3_MEMFD_TRACK_MAX;++i){
+        const char *path;
+        if(!g_c3_memfds[i].used)continue;
+        path=g_c3_memfds[i].path;
+        if(!path||!c3_has_token(path,"ridux-visible-shell"))continue;
+        copied=c3_copy_memfd_frame(path,dst,pitch,width,height,false);
+        if(copied)break;
+    }
+    if(!copied)return 0;
+    for(i=0;i<C3_MEMFD_TRACK_MAX;++i){
+        const char *path;
+        if(!g_c3_memfds[i].used)continue;
+        path=g_c3_memfds[i].path;
+        if(!path||!c3_has_token(path,"ridux-panel"))continue;
+        (void)c3_copy_memfd_frame(path,dst,pitch,width,height,true);
+    }
+    return copied;
 }
 
 static int64_t c3_memfd_sparse_write(const char *path,uint64_t off,const void *buf,size_t count){
@@ -1594,7 +3271,65 @@ static int64_t c3_memfd_sparse_write(const char *path,uint64_t off,const void *b
     return (int64_t)done;
 }
 
+static void c3_wayfire_trace_visible_shell_memfd(const char *why){
+    static uint32_t trace_count;
+    int i;
+    if(trace_count>=24u)return;
+    for(i=0;i<C3_MEMFD_TRACK_MAX;++i){
+        const char *path;
+        uint64_t logical=0;
+        size_t got,want,j;
+        uint32_t nz=0,pages=0;
+        uint64_t sum=0,p0=0,p1=0;
+        if(!g_c3_memfds[i].used)continue;
+        path=g_c3_memfds[i].path;
+        if(!path||!c3_has_token(path,"ridux-visible-shell"))continue;
+        (void)c3_memfd_path_get_size(path,&logical);
+        want=(logical<(uint64_t)C3_VFS_FILE_MAX)?(size_t)logical:(size_t)C3_VFS_FILE_MAX;
+        got=c3_memfd_sparse_read(path,0,g_c3_vfs_file_scratch,want);
+        for(j=0;j<got;++j){
+            uint8_t v=g_c3_vfs_file_scratch[j];
+            if(v)++nz;
+            sum=(sum*1315423911ULL)^(uint64_t)v^((uint64_t)j<<7);
+        }
+        for(j=0;j<8&&j<got;++j)p0|=((uint64_t)g_c3_vfs_file_scratch[j])<<(j*8);
+        for(j=0;j<8&&(j+8)<got;++j)p1|=((uint64_t)g_c3_vfs_file_scratch[j+8])<<(j*8);
+        for(j=0;j<16&&((uint64_t)j*PAGE_SIZE)<logical;++j)
+            if(c3_file_page_find_slot(path,(uint64_t)j*PAGE_SIZE)>=0)++pages;
+        ++trace_count;
+        __boot_serial_force_puts("[wf-shell-memfd-sample!] #");
+        __boot_serial_force_putu32(trace_count);
+        __boot_serial_force_puts(" why=");
+        __boot_serial_force_puts(why?why:"?");
+        __boot_serial_force_puts(" size=");
+        __boot_serial_force_puthex64(logical);
+        __boot_serial_force_puts(" read=");
+        __boot_serial_force_putu32((uint32_t)got);
+        __boot_serial_force_puts(" nz=");
+        __boot_serial_force_putu32(nz);
+        __boot_serial_force_puts(" pages16=");
+        __boot_serial_force_putu32(pages);
+        __boot_serial_force_puts(" sum=");
+        __boot_serial_force_puthex64(sum);
+        __boot_serial_force_puts(" p0=");
+        __boot_serial_force_puthex64(p0);
+        __boot_serial_force_puts(" p1=");
+        __boot_serial_force_puthex64(p1);
+        __boot_serial_force_puts(" path=");
+        __boot_serial_force_puts(path);
+        __boot_serial_force_puts("\n");
+    }
+}
+
 static uint16_t c3_ntoh16(uint16_t v){return(uint16_t)((v>>8)|(v<<8));}
+static uint32_t c3_sockaddr_ip_read(const c3_sockaddr_in_t *sa){
+    const uint8_t *p=(const uint8_t*)sa+4;
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+static void c3_sockaddr_ip_write(c3_sockaddr_in_t *sa,uint32_t ip){
+    uint8_t *p=(uint8_t*)sa+4;
+    p[0]=(uint8_t)(ip>>24);p[1]=(uint8_t)(ip>>16);p[2]=(uint8_t)(ip>>8);p[3]=(uint8_t)ip;
+}
 
 static int c3_vfs_open_slot_alloc(const char *path){
     int i;
@@ -1634,7 +3369,10 @@ static void c3_vfs_open_slot_try_free(int ref){
     if(ref<0||ref>=C3_VFS_OPEN_MAX)return;
     if(c3_vfs_open_slot_ref_used_anywhere(ref))return;
     if(c3_starts_with(g_c3_vfs_open[ref].path,C3_DELETED_PREFIX)){
+        if(c3_mmap_backing_path_used_anywhere(g_c3_vfs_open[ref].path))
+            return;
         c3_file_page_invalidate_path(g_c3_vfs_open[ref].path);
+        c3_memfd_track_remove(g_c3_vfs_open[ref].path);
         kvfs_remove(g_c3_vfs_open[ref].path);
         c3_path_mode_remove(g_c3_vfs_open[ref].path);
     }
@@ -1787,15 +3525,76 @@ static bool c3_sysfs_builtin_dir(const char *path){
        c3_strcmp(path,"/sys/devices/system/cpu/cpu0")==0||c3_strcmp(path,"/sys/devices/system/cpu/cpu0/topology")==0||
        c3_strcmp(path,"/sys/devices/system/cpu/cpu0/cpufreq")==0||c3_strcmp(path,"/sys/devices/system/memory")==0||
        c3_strcmp(path,"/sys/devices/system/node")==0||c3_strcmp(path,"/sys/devices/virtual")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/driver")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/driver/module")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/card0")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128")==0||
        c3_strcmp(path,"/sys/devices/virtual/dmi")==0||c3_strcmp(path,"/sys/devices/virtual/dmi/id")==0)return true;
+    if(c3_strcmp(path,"/sys/bus")==0||c3_strcmp(path,"/sys/bus/input")==0||
+       c3_strcmp(path,"/sys/bus/pci")==0||c3_strcmp(path,"/sys/bus/pci/devices")==0||
+       c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0")==0||
+       c3_strcmp(path,"/sys/bus/pci/drivers")==0||
+       c3_strcmp(path,"/sys/bus/pci/drivers/vmwgfx")==0||
+       c3_strcmp(path,"/sys/bus/pci/drivers/vmwgfx/module")==0||
+       c3_strcmp(path,"/sys/bus/pci/drivers/virtio-pci")==0||
+       c3_strcmp(path,"/sys/bus/pci/drivers/virtio-pci/module")==0||
+       c3_strcmp(path,"/sys/bus/input/devices")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input0")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input0/event0")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input0/capabilities")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input0/id")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/event0")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input1")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input1/event1")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input1/capabilities")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/input1/id")==0||
+       c3_strcmp(path,"/sys/bus/input/devices/event1")==0)return true;
+    if(c3_strcmp(path,"/sys/dev")==0||c3_strcmp(path,"/sys/dev/char")==0||
+       c3_strcmp(path,"/sys/dev/char/226:0")==0||c3_strcmp(path,"/sys/dev/char/226:0/device")==0||
+       c3_strcmp(path,"/sys/dev/char/226:0/device/drm")==0||
+       c3_strcmp(path,"/sys/dev/char/226:0/device/drm/card0")==0||
+       c3_strcmp(path,"/sys/dev/char/226:0/device/drm/renderD128")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128")==0||c3_strcmp(path,"/sys/dev/char/226:128/device")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128/device/drm")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128/device/drm/card0")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128/device/drm/renderD128")==0||
+       c3_strcmp(path,"/sys/dev/char/13:64")==0||c3_strcmp(path,"/sys/dev/char/13:64/device")==0||
+       c3_strcmp(path,"/sys/dev/char/13:64/device/id")==0||
+       c3_strcmp(path,"/sys/dev/char/13:64/device/capabilities")==0||
+       c3_strcmp(path,"/sys/dev/char/13:65")==0||c3_strcmp(path,"/sys/dev/char/13:65/device")==0||
+       c3_strcmp(path,"/sys/dev/char/13:65/device/id")==0||
+       c3_strcmp(path,"/sys/dev/char/13:65/device/capabilities")==0)return true;
     if(c3_strcmp(path,"/sys/class")==0||c3_strcmp(path,"/sys/class/drm")==0||c3_strcmp(path,"/sys/class/drm/card0")==0||
        c3_strcmp(path,"/sys/class/drm/card0/device")==0||c3_strcmp(path,"/sys/class/drm/card0/device/driver")==0||
        c3_strcmp(path,"/sys/class/drm/card0/device/driver/module")==0||c3_strcmp(path,"/sys/class/drm/renderD128")==0||
-       c3_strcmp(path,"/sys/class/drm/renderD128/device")==0||c3_strcmp(path,"/sys/class/net")==0||
+       c3_strcmp(path,"/sys/class/drm/renderD128/device")==0||c3_strcmp(path,"/sys/class/drm/renderD128/device/driver")==0||
+       c3_strcmp(path,"/sys/class/drm/renderD128/device/driver/module")==0||c3_strcmp(path,"/sys/class/net")==0||
        c3_strcmp(path,"/sys/class/net/lo")==0||c3_strcmp(path,"/sys/class/net/eth0")==0||
+       c3_strcmp(path,"/sys/class/power_supply")==0||
        c3_strcmp(path,"/sys/class/graphics")==0||c3_strcmp(path,"/sys/class/graphics/fb0")==0||
        c3_strcmp(path,"/sys/class/dmi")==0||c3_strcmp(path,"/sys/class/dmi/id")==0||
-       c3_strcmp(path,"/sys/class/input")==0)return true;
+       c3_strcmp(path,"/sys/class/input")==0||c3_strcmp(path,"/sys/class/input/event0")==0||
+       c3_strcmp(path,"/sys/class/input/event0/device")==0||
+       c3_strcmp(path,"/sys/class/input/event0/device/id")==0||
+       c3_strcmp(path,"/sys/class/input/event0/device/capabilities")==0||
+       c3_strcmp(path,"/sys/class/input/event1")==0||
+       c3_strcmp(path,"/sys/class/input/event1/device")==0||
+       c3_strcmp(path,"/sys/class/input/event1/device/id")==0||
+       c3_strcmp(path,"/sys/class/input/event1/device/capabilities")==0||
+       c3_strcmp(path,"/sys/class/input/mice")==0||
+       c3_strcmp(path,"/sys/class/input/mice/device")==0)return true;
+    if(c3_strcmp(path,"/sys/devices/virtual/input")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input0")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input0/event0")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input0/id")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input0/capabilities")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input1")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input1/event1")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input1/id")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input1/capabilities")==0)return true;
     if(c3_strcmp(path,"/sys/fs")==0||c3_strcmp(path,"/sys/fs/cgroup")==0||c3_strcmp(path,"/sys/fs/selinux")==0||
        c3_strcmp(path,"/sys/module")==0||c3_strcmp(path,"/sys/module/i915")==0||
        c3_strcmp(path,"/sys/module/amdgpu")==0||c3_strcmp(path,"/sys/module/nvidia")==0||
@@ -1803,11 +3602,19 @@ static bool c3_sysfs_builtin_dir(const char *path){
     return false;
 }
 
+static uint8_t resolve_dev_kind(const char *path);
+
 static bool c3_virtual_path_exists(const char *path){
     int pid=-1;
     const char *tail=0;
     if(!path||!path[0])return false;
-    if(c3_starts_with(path,"/dev/"))return true;
+    if(c3_starts_with(path,"/dev/")){
+        if(resolve_dev_kind(path)!=FDKIND_NONE)return true;
+        if(c3_strcmp(path,"/dev")==0||c3_strcmp(path,"/dev/pts")==0||
+           c3_strcmp(path,"/dev/dri")==0||c3_strcmp(path,"/dev/input")==0||
+           c3_strcmp(path,"/dev/snd")==0||c3_strcmp(path,"/dev/shm")==0)return true;
+        return false;
+    }
     if(c3_starts_with(path,"/sys/"))return true;
     if(c3_starts_with(path,"/proc/")){
         if(c3_parse_proc_pid_path(path,&pid,&tail)){
@@ -1826,21 +3633,48 @@ static bool c3_path_is_builtin_dir(const char *path){
     if(!path||!path[0])return false;
     if(c3_sysfs_builtin_dir(path))return true;
     if(c3_strcmp(path,"/")==0)return true;
-    if(c3_strcmp(path,"/proc")==0||c3_strcmp(path,"/proc/self")==0||c3_strcmp(path,"/proc/self/fd")==0||
+    if(c3_strcmp(path,"/proc")==0||c3_strcmp(path,"/proc/self")==0||
+       c3_strcmp(path,"/proc/self/fd")==0||c3_strcmp(path,"/proc/self/fdinfo")==0||
        c3_strcmp(path,"/proc/net")==0||c3_strcmp(path,"/proc/sys")==0||c3_strcmp(path,"/proc/sys/kernel")==0||
        c3_strcmp(path,"/proc/sys/kernel/random")==0||c3_strcmp(path,"/proc/sys/vm")==0||
        c3_strcmp(path,"/proc/sys/fs")==0||c3_strcmp(path,"/proc/sys/fs/inotify")==0||
        c3_strcmp(path,"/proc/sys/net")==0||c3_strcmp(path,"/proc/sys/net/core")==0||
        c3_strcmp(path,"/proc/sys/net/ipv4")==0)return true;
-    if(c3_strcmp(path,"/dev")==0||c3_strcmp(path,"/dev/pts")==0||c3_strcmp(path,"/dev/dri")==0)return true;
+    if(c3_strcmp(path,"/dev")==0||c3_strcmp(path,"/dev/pts")==0||
+       c3_strcmp(path,"/dev/dri")==0||c3_strcmp(path,"/dev/input")==0||
+       c3_strcmp(path,"/dev/snd")==0||c3_strcmp(path,"/dev/shm")==0)return true;
     if(c3_strcmp(path,"/tmp")==0||c3_strcmp(path,"/tmp/.X11-unix")==0||
+       c3_strcmp(path,"/tmp/hypr")==0||
+       c3_strcmp(path,"/tmp/hyprland-home")==0||c3_strcmp(path,"/tmp/hyprland-home/config")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/config/hypr")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/config/waybar")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/config/nwg-dock-hyprland")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/config/xdg-desktop-portal")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/cache")==0||c3_strcmp(path,"/tmp/hyprland-home/share")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/share/xdg-desktop-portal")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/share/xdg-desktop-portal/portals")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/cache/fontconfig")==0||
+       c3_strcmp(path,"/tmp/hyprland-home/state")==0||
+       c3_strcmp(path,"/tmp/wayfire-home")==0||c3_strcmp(path,"/tmp/wayfire-home/config")==0||
+       c3_strcmp(path,"/tmp/wayfire-home/cache")==0||c3_strcmp(path,"/tmp/wayfire-home/share")==0||
+       c3_strcmp(path,"/tmp/wayfire-home/cache/fontconfig")==0||
+       c3_strcmp(path,"/tmp/wayfire-home/state")==0||c3_strcmp(path,"/tmp/fontconfig-cache")==0||
+       c3_strcmp(path,"/tmp/kde-home")==0||c3_strcmp(path,"/tmp/kde-home/config")==0||
+       c3_strcmp(path,"/tmp/kde-home/cache")==0||c3_strcmp(path,"/tmp/kde-home/share")==0||
+       c3_strcmp(path,"/tmp/kde-home/state")==0||c3_strcmp(path,"/tmp/kde-tmp")==0||
+       c3_strcmp(path,"/tmp/kde-var-tmp")==0||
        c3_strcmp(path,"/tmp/chromium")==0||c3_strcmp(path,"/tmp/chromium/Default")==0||
        c3_strcmp(path,"/tmp/chromium/BrowserMetrics")==0||c3_strcmp(path,"/tmp/chromium/Crash Reports")==0||
        c3_strcmp(path,"/tmp/chromium-profile")==0||c3_strcmp(path,"/tmp/chromium-profile/Default")==0||
        c3_strcmp(path,"/tmp/chromium-profile/BrowserMetrics")==0||c3_strcmp(path,"/tmp/chromium-profile/Crash Reports")==0)return true;
     if(c3_strcmp(path,"/run")==0||c3_strcmp(path,"/run/user")==0||c3_strcmp(path,"/run/user/0")==0||
+       c3_strcmp(path,"/run/user/1000")==0||c3_strcmp(path,"/run/user/1000/doc")==0||
+       c3_strcmp(path,"/run/user/1000/hypr")==0||
        c3_strcmp(path,"/run/dbus")==0)return true;
     if(c3_strcmp(path,"/home")==0||c3_strcmp(path,"/etc")==0)return true;
+    if(c3_strcmp(path,"/var")==0||c3_strcmp(path,"/var/cache")==0||
+       c3_strcmp(path,"/var/cache/fontconfig")==0||
+       c3_strcmp(path,"/var/lib")==0||c3_strcmp(path,"/var/lib/dbus")==0)return true;
     if(c3_strcmp(path,"/usr")==0||c3_strcmp(path,"/usr/bin")==0||c3_strcmp(path,"/usr/lib")==0||
        c3_strcmp(path,"/usr/lib64")==0||c3_strcmp(path,"/usr/local")==0||c3_strcmp(path,"/usr/local/lib")==0)return true;
     if(c3_strcmp(path,"/usr/share")==0||c3_strcmp(path,"/usr/share/X11")==0||
@@ -1851,12 +3685,28 @@ static bool c3_path_is_builtin_dir(const char *path){
     if(c3_strcmp(path,"/lib")==0||c3_strcmp(path,"/lib64")==0||
        c3_strcmp(path,"/lib/x86_64-linux-gnu")==0||c3_strcmp(path,"/usr/lib/x86_64-linux-gnu")==0)return true;
     if(c3_strcmp(path,"/opt")==0||c3_strcmp(path,"/opt/google")==0||c3_strcmp(path,"/opt/google/chrome")==0||
+       c3_strcmp(path,"/opt/hyprland")==0||c3_strcmp(path,"/opt/hyprland/bin")==0||
+       c3_strcmp(path,"/opt/hyprland/lib")==0||c3_strcmp(path,"/opt/hyprland/lib64")==0||
+       c3_strcmp(path,"/opt/hyprland/libexec")==0||c3_strcmp(path,"/opt/hyprland/share")==0||
+       c3_strcmp(path,"/opt/hyprland/usr")==0||c3_strcmp(path,"/opt/hyprland/usr/bin")==0||
+       c3_strcmp(path,"/opt/hyprland/usr/lib")==0||c3_strcmp(path,"/opt/hyprland/usr/share")==0||
+       c3_strcmp(path,"/opt/wayfire")==0||c3_strcmp(path,"/opt/wayfire/bin")==0||
+       c3_strcmp(path,"/opt/wayfire/lib")==0||c3_strcmp(path,"/opt/wayfire/lib64")==0||
+       c3_strcmp(path,"/opt/wayfire/libexec")==0||c3_strcmp(path,"/opt/wayfire/share")==0||
+       c3_strcmp(path,"/opt/wayfire/usr")==0||c3_strcmp(path,"/opt/wayfire/usr/bin")==0||
+       c3_strcmp(path,"/opt/wayfire/usr/lib")==0||c3_strcmp(path,"/opt/wayfire/usr/share")==0||
+       c3_strcmp(path,"/opt/kde-plasma")==0||c3_strcmp(path,"/opt/kde-plasma/bin")==0||
+       c3_strcmp(path,"/opt/kde-plasma/lib")==0||c3_strcmp(path,"/opt/kde-plasma/lib64")==0||
+       c3_strcmp(path,"/opt/kde-plasma/libexec")==0||c3_strcmp(path,"/opt/kde-plasma/share")==0||
+       c3_strcmp(path,"/opt/kde-plasma/usr")==0||c3_strcmp(path,"/opt/kde-plasma/usr/bin")==0||
+       c3_strcmp(path,"/opt/kde-plasma/usr/lib")==0||c3_strcmp(path,"/opt/kde-plasma/usr/share")==0||
        c3_strcmp(path,"/opt/chromium")==0||c3_strcmp(path,"/memfd")==0)return true;
     if(c3_parse_proc_pid_path(path,&proc_pid,&proc_tail)){
         task_t *pt=c3_task_by_pid(proc_pid);
         if(!pt)return false;
         if(!proc_tail||proc_tail[0]==0)return true;
         if(c3_strcmp(proc_tail,"/fd")==0)return true;
+        if(c3_strcmp(proc_tail,"/fdinfo")==0)return true;
     }
     {
         int task_tid=-1;
@@ -1867,6 +3717,7 @@ static bool c3_path_is_builtin_dir(const char *path){
             if(!tt)return false;
             if(!task_tail||task_tail[0]==0)return true;
             if(c3_strcmp(task_tail,"/fd")==0)return true;
+            if(c3_strcmp(task_tail,"/fdinfo")==0)return true;
         }
     }
     return false;
@@ -1886,12 +3737,23 @@ static bool c3_dirent_is_marker(const char *name){
     return name&&c3_strcmp(name,C3_DIR_MARKER)==0;
 }
 
+static void c3_rewrite_thread_self_path(task_t *cur,const char *in,char *out,size_t cap);
+
 static int c3_resolve_user_path(task_t *cur,int dirfd,const char *path,char *out,size_t cap){
     char base[VFS_PATH_MAX];
     char tmp[VFS_PATH_MAX*2];
+    char upath[VFS_PATH_MAX];
+    int copy_rc;
     if(!cur||!path||!out||cap==0)return -EFAULT;
-    if(path[0]=='/'){
-        c3_path_normalize_abs(path,out,cap);
+    if(g_c3_trusted_kernel_path_depth){
+        c3_strlcpy(upath,path,sizeof(upath));
+    }else{
+        copy_rc=c3_copy_user_cstr_current(cur,path,upath,sizeof(upath),"path");
+        if(copy_rc<0)return copy_rc;
+    }
+    if(upath[0]=='/'){
+        c3_path_normalize_abs(upath,tmp,sizeof(tmp));
+        c3_rewrite_thread_self_path(cur,tmp,out,cap);
         return 0;
     }
     if(dirfd==AT_FDCWD){
@@ -1907,8 +3769,9 @@ static int c3_resolve_user_path(task_t *cur,int dirfd,const char *path,char *out
         if(kind==FDKIND_DIR)c3_strlcpy(base,fdp,sizeof(base));
         else c3_path_dirname(fdp,base,sizeof(base));
     }
-    c3_path_build(base,path,tmp,sizeof(tmp));
-    c3_path_normalize_abs(tmp,out,cap);
+    c3_path_build(base,upath,tmp,sizeof(tmp));
+    c3_path_normalize_abs(tmp,base,sizeof(base));
+    c3_rewrite_thread_self_path(cur,base,out,cap);
     return 0;
 }
 
@@ -1957,6 +3820,33 @@ static int c3_proc_fd_target(task_t *cur,const char *path,task_t **owner_out,int
     return 1;
 }
 
+static void c3_rewrite_thread_self_path(task_t *cur,const char *in,char *out,size_t cap){
+    const char *pfx="/proc/thread-self";
+    const char *tail;
+    size_t l=0;
+    if(!out||cap==0)return;
+    out[0]=0;
+    if(!in)return;
+    if(!c3_starts_with(in,pfx)){
+        c3_strlcpy(out,in,cap);
+        return;
+    }
+    tail=in+c3_strlen(pfx);
+    if(*tail&&*tail!='/'){
+        c3_strlcpy(out,in,cap);
+        return;
+    }
+    if(c3_strcmp(tail,"/fd")==0||c3_starts_with(tail,"/fd/")||
+       c3_strcmp(tail,"/exe")==0||c3_strcmp(tail,"/cwd")==0){
+        c3_append_str(out,&l,cap,"/proc/self");
+        c3_append_str(out,&l,cap,tail);
+        return;
+    }
+    c3_append_str(out,&l,cap,"/proc/self/task/");
+    c3_append_u32(out,&l,cap,(uint32_t)(cur?cur->pid:0));
+    c3_append_str(out,&l,cap,tail);
+}
+
 static int c3_sockaddr_ip_port(const void *addr,uint32_t addrlen,uint32_t *ip,uint16_t *port){
     const c3_sockaddr_in_t *sa;
     if(ip)*ip=0;
@@ -1964,7 +3854,7 @@ static int c3_sockaddr_ip_port(const void *addr,uint32_t addrlen,uint32_t *ip,ui
     if(!addr||addrlen<sizeof(c3_sockaddr_in_t))return -EINVAL;
     sa=(const c3_sockaddr_in_t*)addr;
     if(sa->sin_family!=2)return -EINVAL;
-    if(ip)*ip=sa->sin_addr;
+    if(ip)*ip=c3_sockaddr_ip_read(sa);
     if(port)*port=c3_ntoh16(sa->sin_port);
     return 0;
 }
@@ -2007,11 +3897,48 @@ static void c3_unix_path_to_loopback(const char *upath,uint32_t *ip,uint16_t *po
     if(ip)*ip=0x7F000001u;
     if(port)*port=39000;
     if(!upath)return;
+    if(c3_starts_with(upath,"wayland-proxy-")||c3_has_token(upath,"/wayland-proxy-")){
+        if(port)*port=39099;
+        return;
+    }
+    if((c3_has_token(upath,"/tmp/hypr/")||c3_has_token(upath,"/run/user/1000/hypr/"))&&
+       c3_has_token(upath,"/.socket2.sock")){
+        if(port)*port=39031;
+        return;
+    }
+    if((c3_has_token(upath,"/tmp/hypr/")||c3_has_token(upath,"/run/user/1000/hypr/"))&&
+       c3_has_token(upath,"/.socket.sock")){
+        if(port)*port=39030;
+        return;
+    }
+    if(c3_starts_with(upath,"wayland-")||c3_has_token(upath,"/wayland-")){
+        if(port)*port=39010;
+        return;
+    }
+    if(c3_strcmp(upath,"system_bus_socket")==0||
+       c3_strcmp(upath,"dbus-ridux-system")==0||
+       c3_strcmp(upath,"ridux-no-system-dbus")==0){
+        if(port)*port=39021;
+        return;
+    }
+    if(c3_strcmp(upath,"dbus-ridux-waybar")==0){
+        if(port)*port=39022;
+        return;
+    }
+    if(c3_strcmp(upath,"bus")==0||
+       c3_strcmp(upath,"dbus-ridux-session")==0||
+       (c3_starts_with(upath,"dbus-")&&!c3_has_token(upath,"system"))){
+        if(port)*port=39020;
+        return;
+    }
     if(c3_starts_with(upath,"@")){
         if(c3_has_token(upath,"X11-unix")){if(port)*port=6000;return;}
         if(c3_starts_with(upath,"@wayland-proxy-")||c3_has_token(upath,"/wayland-proxy-")){if(port)*port=39099;return;}
         if(c3_starts_with(upath,"@wayland-")||c3_has_token(upath,"/wayland-")){if(port)*port=39010;return;}
-        if(c3_has_token(upath,"dbus")||c3_has_token(upath,"bus")){if(port)*port=39020;return;}
+        if(c3_has_token(upath,"system_bus_socket")||c3_has_token(upath,"dbus-ridux-system")){if(port)*port=39021;return;}
+        if(c3_has_token(upath,"dbus-ridux-waybar")){if(port)*port=39022;return;}
+        if(c3_starts_with(upath,"@dbus-")||
+           c3_has_token(upath,"dbus-ridux-session")){if(port)*port=39020;return;}
     }
     if(c3_starts_with(upath,"/tmp/.X11-unix/")){
         if(port)*port=6000;
@@ -2028,7 +3955,8 @@ static void c3_unix_path_to_loopback(const char *upath,uint32_t *ip,uint16_t *po
             if(port)*port=39010;
             return;
         }
-        if(*p=='/'&&(c3_starts_with(p+1,"bus")||c3_starts_with(p+1,"dbus-"))){
+        if(*p=='/'&&(c3_strcmp(p+1,"bus")==0||
+                     c3_strcmp(p+1,"dbus-ridux-session")==0)){
             if(port)*port=39020;
             return;
         }
@@ -2037,7 +3965,22 @@ static void c3_unix_path_to_loopback(const char *upath,uint32_t *ip,uint16_t *po
         if(port)*port=39010;
         return;
     }
-    if(c3_starts_with(upath,"/run/dbus/")||c3_starts_with(upath,"/tmp/dbus-")||c3_has_token(upath,"/bus")){
+    if(c3_strcmp(upath,"/run/dbus/system_bus_socket")==0||
+       c3_strcmp(upath,"/var/run/dbus/system_bus_socket")==0||
+       c3_strcmp(upath,"/tmp/dbus-ridux-system")==0||
+       c3_strcmp(upath,"/tmp/dbus-system_bus_socket")==0||
+       c3_strcmp(upath,"/tmp/ridux-no-system-dbus")==0){
+        if(port)*port=39021;
+        return;
+    }
+    if(c3_strcmp(upath,"/tmp/dbus-ridux-waybar")==0||
+       c3_strcmp(upath,"/run/dbus/dbus-ridux-waybar")==0){
+        if(port)*port=39022;
+        return;
+    }
+    if(c3_starts_with(upath,"/run/dbus/")||
+       c3_strcmp(upath,"/tmp/dbus-ridux-session")==0||
+       c3_strcmp(upath,"/tmp/dbus-session_bus_socket")==0){
         if(port)*port=39020;
         return;
     }
@@ -2051,16 +3994,122 @@ static void c3_unix_path_to_loopback(const char *upath,uint32_t *ip,uint16_t *po
     }
 }
 
+static char g_c3_unix_bound_paths[SOCK_MAX][108];
+
+static void c3_unix_bound_path_set(int ref,const char *path){
+    if(ref<0||ref>=SOCK_MAX)return;
+    if(path&&*path)c3_strlcpy(g_c3_unix_bound_paths[ref],path,sizeof(g_c3_unix_bound_paths[ref]));
+    else g_c3_unix_bound_paths[ref][0]=0;
+}
+
+static bool c3_unix_bound_path_is_listener(int ref){
+    const socket_t *s;
+    if(ref<0||ref>=SOCK_MAX)return false;
+    s=&g_sockets[ref];
+    return s->used&&s->domain==1&&s->type==1&&s->tcp_state==TCP_LISTEN&&
+           g_c3_unix_bound_paths[ref][0];
+}
+
+static bool c3_unix_socket_path_bound_exact(const char *path){
+    int i;
+    if(!path||!*path)return false;
+    for(i=0;i<SOCK_MAX;++i){
+        if(!c3_unix_bound_path_is_listener(i))continue;
+        if(c3_strcmp(g_c3_unix_bound_paths[i],path)==0)return true;
+    }
+    return false;
+}
+
+static bool c3_unix_socket_path_bound_any_exact(const char *path){
+    int i;
+    if(!path||!*path)return false;
+    for(i=0;i<SOCK_MAX;++i){
+        if(!g_sockets[i].used)continue;
+        if(g_sockets[i].domain!=1)continue;
+        if(!g_c3_unix_bound_paths[i][0])continue;
+        if(c3_strcmp(g_c3_unix_bound_paths[i],path)==0)return true;
+    }
+    return false;
+}
+
+static const char *c3_unix_bound_socket_child_name(const char *dir,const char *path){
+    size_t dl;
+    const char *name;
+    if(!dir||!*dir||!path||!*path)return 0;
+    dl=c3_strlen(dir);
+    if(dl==1&&dir[0]=='/'){
+        if(path[0]!='/')return 0;
+        name=path+1;
+    }else{
+        if(c3_strncmp(path,dir,dl)!=0||path[dl]!='/')return 0;
+        name=path+dl+1;
+    }
+    if(!*name||c3_has_token(name,"/"))return 0;
+    return name;
+}
+
+static bool c3_unix_listener_on_port(uint16_t port){
+    int i;
+    if(!port)return false;
+    for(i=0;i<SOCK_MAX;++i){
+        const socket_t *s=&g_sockets[i];
+        if(!s->used)continue;
+        if(s->domain!=1||s->type!=1)continue;
+        if(s->local_port!=port)continue;
+        if(s->tcp_state==TCP_LISTEN)return true;
+    }
+    return false;
+}
+
+static bool c3_wayland_socket_path_visible(const char *path){
+    int i;
+    uint32_t ip=0;
+    uint16_t port=0;
+    bool saw_tracked_wayland=false;
+    if(!path||!*path)return false;
+    c3_unix_path_to_loopback(path,&ip,&port);
+    (void)ip;
+    if(port!=39099&&(port<39010||port>39019))return false;
+    for(i=0;i<SOCK_MAX;++i){
+        if(!c3_unix_bound_path_is_listener(i))continue;
+        if(!(c3_has_token(g_c3_unix_bound_paths[i],"/wayland-")||
+             c3_has_token(g_c3_unix_bound_paths[i],"/wayland-proxy-")))continue;
+        saw_tracked_wayland=true;
+        if(c3_strcmp(g_c3_unix_bound_paths[i],path)==0)return true;
+    }
+    if(saw_tracked_wayland)return false;
+    return c3_unix_listener_on_port(port);
+}
+
+static bool c3_unix_path_is_wayland_display(const char *path){
+    const char *p;
+    if(!path||!*path)return false;
+    if(c3_starts_with(path,"wayland-"))return true;
+    if(c3_starts_with(path,"/run/wayland/wayland-"))return true;
+    if(c3_starts_with(path,"/run/user/")){
+        p=path+10;
+        while(*p>='0'&&*p<='9')++p;
+        return *p=='/'&&c3_starts_with(p+1,"wayland-");
+    }
+    return c3_has_token(path,"/wayland-");
+}
+
 static bool c3_is_known_ipc_socket_path(const char *path){
     const char *p;
     if(!path||!*path)return false;
     if(c3_starts_with(path,"/tmp/.X11-unix/X"))return true;
+    if(c3_hypr_ipc_path_interesting(path)&&
+       (c3_has_token(path,"/.socket.sock")||c3_has_token(path,"/.socket2.sock")))
+        return c3_unix_socket_path_bound_exact(path);
     if(c3_starts_with(path,"/run/dbus/")||c3_starts_with(path,"/tmp/dbus-"))return true;
+    if(c3_strcmp(path,"/run/udev/control")==0)return true;
+    if(c3_unix_socket_path_bound_any_exact(path))return true;
     if(c3_starts_with(path,"/run/user/")){
         p=path+10;
         while(*p>='0'&&*p<='9')++p;
-        if(*p=='/'&&c3_starts_with(p+1,"wayland-"))return true;
-        if(*p=='/'&&(c3_starts_with(p+1,"bus")||c3_starts_with(p+1,"dbus-")))return true;
+        if(*p=='/'&&c3_starts_with(p+1,"wayland-"))return c3_wayland_socket_path_visible(path);
+        if(*p=='/'&&(c3_strcmp(p+1,"bus")==0||
+                     c3_strcmp(p+1,"dbus-ridux-session")==0))return true;
     }
     return false;
 }
@@ -2084,30 +4133,45 @@ static uint32_t c3_socket_used_count(void){
 
 static void c3_trace_unix_socket_addr(const char *op,int fd,int ref,const char *path,uint16_t port,int64_t rc){
     static uint32_t trace_count=0;
-    if(trace_count>=32)return;
+    task_t *cur=task_current();
+    bool focused_hypr_trace=cur&&c3_dbus_debug_trace_enabled()&&
+        (c3_task_is_hyprland_compositor(cur)||
+         c3_task_is_hypr_portal_backend(cur)||
+         c3_hypr_ipc_path_interesting(path));
+    if(!c3_syscall_debug_trace_enabled()&&!focused_hypr_trace)return;
+    if(trace_count>=(focused_hypr_trace?160u:32u))return;
     ++trace_count;
-    __boot_serial_puts("[unix-");
-    __boot_serial_puts(op?op:"?");
-    __boot_serial_puts("] fd=");
-    __boot_serial_putu32(fd<0?0xFFFFFFFFu:(uint32_t)fd);
-    __boot_serial_puts(" pid=");
-    __boot_serial_putu32((uint32_t)(task_current()?task_current()->pid:0));
-    __boot_serial_puts(" ref=");
-    __boot_serial_putu32(ref<0?0xFFFFFFFFu:(uint32_t)ref);
-    __boot_serial_puts(" port=");
-    __boot_serial_putu32((uint32_t)port);
-    __boot_serial_puts(" used=");
-    __boot_serial_putu32(c3_socket_used_count());
-    __boot_serial_puts(" rc=");
-    if(rc<0){
-        __boot_serial_puts("-");
-        __boot_serial_putu32((uint32_t)(-rc));
+    if(focused_hypr_trace){
+        __boot_serial_force_puts("[hypr-unix!] #");
+        __boot_serial_force_putu32(trace_count);
+        __boot_serial_force_puts(" op=");
+        __boot_serial_force_puts(op?op:"?");
     }else{
-        __boot_serial_puthex64((uint64_t)rc);
+        __boot_serial_force_puts("[unix-");
+        __boot_serial_force_puts(op?op:"?");
+        __boot_serial_force_puts("]");
     }
-    __boot_serial_puts(" path=");
-    __boot_serial_puts(path&&path[0]?path:"(empty)");
-    __boot_serial_puts("\n");
+    __boot_serial_force_puts(" fd=");
+    __boot_serial_force_putu32(fd<0?0xFFFFFFFFu:(uint32_t)fd);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    if(focused_hypr_trace)c3_force_task_name(cur);
+    __boot_serial_force_puts(" ref=");
+    __boot_serial_force_putu32(ref<0?0xFFFFFFFFu:(uint32_t)ref);
+    __boot_serial_force_puts(" port=");
+    __boot_serial_force_putu32((uint32_t)port);
+    __boot_serial_force_puts(" used=");
+    __boot_serial_force_putu32(c3_socket_used_count());
+    __boot_serial_force_puts(" rc=");
+    if(rc<0){
+        __boot_serial_force_puts("-");
+        __boot_serial_force_putu32((uint32_t)(-rc));
+    }else{
+        __boot_serial_force_puthex64((uint64_t)rc);
+    }
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(path&&path[0]?path:"(empty)");
+    __boot_serial_force_puts("\n");
 }
 
 /* Resolve /dev, /proc, /sys paths to FD kinds */
@@ -2115,9 +4179,17 @@ static uint8_t resolve_dev_kind(const char *path){
     if(c3_strcmp(path,"/dev/null")==0)return FDKIND_DEVNULL;
     if(c3_strcmp(path,"/dev/zero")==0)return FDKIND_DEVZERO;
     if(c3_strcmp(path,"/dev/random")==0||c3_strcmp(path,"/dev/urandom")==0)return FDKIND_DEVRANDOM;
+    if(c3_strcmp(path,"/dev/fuse")==0)return FDKIND_DEVFUSE;
     if(c3_strcmp(path,"/dev/fb0")==0)return FDKIND_DEVFB;
     if(c3_strcmp(path,"/dev/dri/card0")==0||c3_strcmp(path,"/dev/dri/renderD128")==0)return FDKIND_DEVFB;
-    if(c3_strcmp(path,"/dev/tty")==0||c3_strcmp(path,"/dev/tty0")==0||c3_strcmp(path,"/dev/console")==0)return FDKIND_DEVTTY;
+    if(c3_strcmp(path,"/dev/input/event0")==0||
+       c3_strcmp(path,"/dev/input/event1")==0||
+       c3_strcmp(path,"/dev/input/mice")==0)return FDKIND_DEVINPUT;
+    if(c3_strcmp(path,"/dev/snd/timer")==0||
+       c3_strcmp(path,"/dev/snd/controlC0")==0||
+       c3_strcmp(path,"/dev/snd/pcmC0D0p")==0)return FDKIND_DEVSND;
+    if(c3_strcmp(path,"/dev/tty")==0||c3_strcmp(path,"/dev/tty0")==0||
+       c3_strcmp(path,"/dev/tty1")==0||c3_strcmp(path,"/dev/console")==0)return FDKIND_DEVTTY;
     if(c3_strcmp(path,"/dev/ptmx")==0||c3_starts_with(path,"/dev/pts/"))return FDKIND_DEVPTMX;
     if(c3_starts_with(path,"/dev/stdin"))return FDKIND_DEVTTY;
     if(c3_starts_with(path,"/dev/stdout"))return FDKIND_DEVTTY;
@@ -2125,6 +4197,297 @@ static uint8_t resolve_dev_kind(const char *path){
     if(c3_starts_with(path,"/proc/"))return FDKIND_PROC;
     if(c3_starts_with(path,"/sys/"))return FDKIND_PROC;
     return FDKIND_NONE;
+}
+
+static int c3_dev_ref_from_path(const char *path,uint8_t kind){
+    if(kind==FDKIND_DEVFB){
+        if(c3_strcmp(path,"/dev/dri/card0")==0)return 1;
+        if(c3_strcmp(path,"/dev/dri/renderD128")==0)return 2;
+        return 0;
+    }
+    if(kind==FDKIND_DEVINPUT){
+        if(c3_strcmp(path,"/dev/input/event0")==0)return 0;
+        if(c3_strcmp(path,"/dev/input/event1")==0)return 1;
+        if(c3_strcmp(path,"/dev/input/mice")==0)return 2;
+    }
+    if(kind==FDKIND_DEVSND){
+        if(c3_strcmp(path,"/dev/snd/controlC0")==0)return 0;
+        if(c3_strcmp(path,"/dev/snd/pcmC0D0p")==0)return 1;
+        if(c3_strcmp(path,"/dev/snd/timer")==0)return 2;
+    }
+    if(kind==FDKIND_DEVTTY){
+        if(c3_strcmp(path,"/dev/tty0")==0)return 1;
+        if(c3_strcmp(path,"/dev/tty1")==0)return 2;
+        if(c3_strcmp(path,"/dev/console")==0)return 3;
+    }
+    return 0;
+}
+
+static uint64_t c3_linux_makedev(uint32_t major,uint32_t minor){
+    return ((uint64_t)(minor&0xFFu))|
+           ((uint64_t)(major&0xFFFu)<<8)|
+           (((uint64_t)minor&~0xFFull)<<12)|
+           (((uint64_t)major&~0xFFFull)<<32);
+}
+
+static uint64_t c3_dev_rdev_from_kind_ref(uint8_t kind,int ref){
+    if(kind==FDKIND_DEVFB){
+        if(ref==1)return c3_linux_makedev(226,0);
+        if(ref==2)return c3_linux_makedev(226,128);
+        return c3_linux_makedev(29,0);
+    }
+    if(kind==FDKIND_DEVINPUT){
+        if(ref==1)return c3_linux_makedev(13,65);
+        if(ref==2)return c3_linux_makedev(13,63);
+        return c3_linux_makedev(13,64);
+    }
+    if(kind==FDKIND_DEVSND){
+        if(ref==1)return c3_linux_makedev(116,16);
+        if(ref==2)return c3_linux_makedev(116,33);
+        return c3_linux_makedev(116,0);
+    }
+    if(kind==FDKIND_DEVNULL)return c3_linux_makedev(1,3);
+    if(kind==FDKIND_DEVZERO)return c3_linux_makedev(1,5);
+    if(kind==FDKIND_DEVRANDOM)return c3_linux_makedev(1,9);
+    if(kind==FDKIND_DEVFUSE)return c3_linux_makedev(10,229);
+    if(kind==FDKIND_DEVTTY){
+        if(ref==1)return c3_linux_makedev(4,0);
+        if(ref==2)return c3_linux_makedev(4,1);
+        if(ref==3)return c3_linux_makedev(5,1);
+        return c3_linux_makedev(5,0);
+    }
+    if(kind==FDKIND_DEVPTMX)return c3_linux_makedev(5,2);
+    return c3_linux_makedev(0,0);
+}
+
+static uint32_t c3_ioctl_type(uint64_t request){return(uint32_t)((request>>8)&0xFFu);}
+static uint32_t c3_ioctl_nr(uint64_t request){return(uint32_t)(request&0xFFu);}
+static uint32_t c3_ioctl_size(uint64_t request){return(uint32_t)((request>>16)&0x3FFFu);}
+
+static void c3_bitset_set(uint8_t *bits,uint32_t bytes,uint32_t bit){
+    if(!bits)return;
+    if((bit>>3)>=bytes)return;
+    bits[bit>>3]|=(uint8_t)(1u<<(bit&7u));
+}
+
+static int c3_ioctl_write_name(void *arg,uint32_t size,const char *name){
+    size_t len;
+    if(!arg)return -EFAULT;
+    if(size==0)return 0;
+    if(size>256u)size=256u;
+    c3_memset(arg,0,size);
+    len=c3_strlen(name);
+    if(len>=(size_t)size)len=(size_t)size-1u;
+    c3_memcpy(arg,name,len);
+    return (int)(len+1u);
+}
+
+static int c3_evdev_fill_bits(int ref,uint32_t nr,void *arg,uint32_t size){
+    uint8_t *bits=(uint8_t*)arg;
+    static const uint16_t keyboard_keys[]={
+        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        16,17,18,19,20,21,22,23,24,25,26,27,28,
+        29,30,31,32,33,34,35,36,37,38,39,40,41,
+        42,43,44,45,46,47,48,49,50,51,52,53,54,
+        56,57,58,97,100,102,103,104,105,106,107,108,109,111
+    };
+    size_t i;
+    if(!arg)return -EFAULT;
+    if(size>1024u)size=1024u;
+    c3_memset(arg,0,size);
+    if(nr==0x20u){
+        c3_bitset_set(bits,size,EV_SYN);
+        if(ref==1||ref==2){
+            c3_bitset_set(bits,size,EV_KEY);
+            c3_bitset_set(bits,size,EV_REL);
+        }else{
+            c3_bitset_set(bits,size,EV_KEY);
+        }
+        return (int)size;
+    }
+    if(nr==0x21u&&ref==0){
+        for(i=0;i<sizeof(keyboard_keys)/sizeof(keyboard_keys[0]);++i)
+            c3_bitset_set(bits,size,keyboard_keys[i]);
+        return (int)size;
+    }
+    if(nr==0x22u&&(ref==1||ref==2)){
+        c3_bitset_set(bits,size,0); /* REL_X */
+        c3_bitset_set(bits,size,1); /* REL_Y */
+        c3_bitset_set(bits,size,8); /* REL_WHEEL */
+        return (int)size;
+    }
+    if(nr==0x21u&&(ref==1||ref==2)){
+        c3_bitset_set(bits,size,272); /* BTN_LEFT */
+        c3_bitset_set(bits,size,273); /* BTN_RIGHT */
+        c3_bitset_set(bits,size,274); /* BTN_MIDDLE */
+        return (int)size;
+    }
+    return (int)size;
+}
+
+static int c3_devinput_ioctl_handler(int ref,uint64_t request,void *arg){
+    uint32_t type=c3_ioctl_type(request);
+    uint32_t nr=c3_ioctl_nr(request);
+    uint32_t size=c3_ioctl_size(request);
+    if(type!='E')return -ENOTTY;
+    if(nr==0x01u){
+        if(!arg)return -EFAULT;
+        *(uint32_t*)arg=0x00010001u;
+        return 0;
+    }
+    if(nr==0x02u){
+        uint16_t *id=(uint16_t*)arg;
+        if(!arg)return -EFAULT;
+        id[0]=0x03u;
+        id[1]=0x1209u;
+        id[2]=(uint16_t)(ref==1?0xD002u:0xD001u);
+        id[3]=0x0100u;
+        return 0;
+    }
+    if(nr==0x06u){
+        return c3_ioctl_write_name(arg,size,(ref==1||ref==2)?"RiduxOS Mouse":"RiduxOS Keyboard");
+    }
+    if(nr==0x07u){
+        return c3_ioctl_write_name(arg,size,(ref==1||ref==2)?"ridux/input1":"ridux/input0");
+    }
+    if(nr==0x08u){
+        return c3_ioctl_write_name(arg,size,(ref==1||ref==2)?"ridux-mouse":"ridux-keyboard");
+    }
+    if(nr==0x09u||nr==0x18u||nr==0x19u||nr==0x1Au||nr==0x1Bu){
+        if(arg&&size){
+            if(size>1024u)size=1024u;
+            c3_memset(arg,0,size);
+        }
+        return (int)size;
+    }
+    if(nr>=0x20u&&nr<=0x3Fu)return c3_evdev_fill_bits(ref,nr,arg,size);
+    if(nr>=0x40u&&nr<=0x7Fu){
+        if(arg&&size)c3_memset(arg,0,size>24u?24u:size);
+        return 0;
+    }
+    if(nr>=0x80u)return 0;
+    return -ENOTTY;
+}
+
+static int64_t c3_devinput_read(task_t *cur,int ref,void *buf,size_t count,int nonblock){
+    evdev_device_t *dev;
+    input_event_t *out=(input_event_t*)buf;
+    size_t cap=count/sizeof(input_event_t);
+    size_t n=0;
+    bool trace_this=false;
+    uint32_t trace_no=0;
+    int head0=0,tail0=0;
+    if(ref==2)return nonblock?-EAGAIN:0;
+    if(cap==0)return -EINVAL;
+    dev=(ref==1)?&g_evdev_mouse:&g_evdev_kbd;
+    head0=dev->head;
+    tail0=dev->tail;
+    if(cur&&c3_input_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t devinput_trace;
+        if(devinput_trace<128u){
+            trace_this=true;
+            trace_no=++devinput_trace;
+            __boot_serial_force_puts("[devinput-read!] #");
+            __boot_serial_force_putu32(trace_no);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" count=");
+            __boot_serial_force_putu32((uint32_t)count);
+            __boot_serial_force_puts(" cap=");
+            __boot_serial_force_putu32((uint32_t)cap);
+            __boot_serial_force_puts(" nb=");
+            __boot_serial_force_putu32((uint32_t)(nonblock!=0));
+            __boot_serial_force_puts(" head=");
+            __boot_serial_force_putu32((uint32_t)head0);
+            __boot_serial_force_puts(" tail=");
+            __boot_serial_force_putu32((uint32_t)tail0);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    while(dev->tail==dev->head){
+        if(nonblock){
+            if(trace_this){
+                __boot_serial_force_puts("[devinput-read-ret!] #");
+                __boot_serial_force_putu32(trace_no);
+                __boot_serial_force_puts(" rc=-11 empty=1\n");
+            }
+            return -EAGAIN;
+        }
+        if(trace_this){
+            __boot_serial_force_puts("[devinput-read-wait!] #");
+            __boot_serial_force_putu32(trace_no);
+            __boot_serial_force_puts(" head=");
+            __boot_serial_force_putu32((uint32_t)dev->head);
+            __boot_serial_force_puts(" tail=");
+            __boot_serial_force_putu32((uint32_t)dev->tail);
+            __boot_serial_force_puts("\n");
+        }
+        c3_poll_wait_slice(cur,0);
+    }
+    {
+        size_t soft_limit=cap;
+        size_t hard_limit=cap;
+        if(ref==1&&cap>24u){
+            soft_limit=24u;
+            hard_limit=(cap>48u)?48u:cap;
+        }
+        while(n<cap&&dev->tail!=dev->head){
+            bool end_report;
+            if(ref==1&&n>=hard_limit)break;
+            out[n++]=dev->events[dev->tail];
+            dev->tail=(dev->tail+1)%INPUT_EVENT_RING;
+            end_report=(out[n-1].type==EV_SYN&&out[n-1].code==SYN_REPORT);
+            if(ref==1&&n>=soft_limit&&end_report)break;
+        }
+    }
+    if(trace_this){
+        __boot_serial_force_puts("[devinput-read-ret!] #");
+        __boot_serial_force_putu32(trace_no);
+        __boot_serial_force_puts(" events=");
+        __boot_serial_force_putu32((uint32_t)n);
+        __boot_serial_force_puts(" bytes=");
+        __boot_serial_force_putu32((uint32_t)(n*sizeof(input_event_t)));
+        __boot_serial_force_puts(" head=");
+        __boot_serial_force_putu32((uint32_t)dev->head);
+        __boot_serial_force_puts(" tail=");
+        __boot_serial_force_putu32((uint32_t)dev->tail);
+        __boot_serial_force_puts("\n");
+    }
+    return(int64_t)(n*sizeof(input_event_t));
+}
+
+static int c3_snd_ioctl_handler(int ref,uint64_t request,void *arg){
+    uint32_t type=c3_ioctl_type(request);
+    uint32_t nr=c3_ioctl_nr(request);
+    uint32_t size=c3_ioctl_size(request);
+    if(type!='A')return -ENOTTY;
+    if(arg&&size){
+        uint32_t clear=size;
+        if(clear>2048u)clear=2048u;
+        c3_memset(arg,0,clear);
+    }
+    if(nr==0x00u&&arg) *(uint32_t*)arg=0x0002000Fu;
+    if(ref==0&&nr==0x01u&&arg){
+        char *p=(char*)arg;
+        if(size>64u){
+            c3_strlcpy(p+8,"RiduxOS",32);
+            c3_strlcpy(p+40,"RiduxOS Audio",32);
+        }
+    }
+    return 0;
+}
+
+static int64_t c3_snd_read(int ref,void *buf,size_t count,int nonblock){
+    (void)ref;(void)buf;(void)count;
+    return nonblock?-EAGAIN:0;
+}
+
+static int64_t c3_snd_write(int ref,const void *buf,size_t count){
+    (void)ref;(void)buf;
+    return(int64_t)count;
 }
 
 static char c3_proc_task_state_char(const task_t *t){
@@ -2164,11 +4527,11 @@ static int c3_proc_append_task_status(char *buf,int mx,const task_t *t){
     c3_append_str(buf,&l,(size_t)mx,"\nPPid:\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->ppid);
     c3_append_str(buf,&l,(size_t)mx,"\nUid:\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->uid);
     c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->euid);
-    c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->uid);
+    c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->suid);
     c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->euid);
     c3_append_str(buf,&l,(size_t)mx,"\nGid:\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->gid);
     c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->egid);
-    c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->gid);
+    c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->sgid);
     c3_append_str(buf,&l,(size_t)mx,"\t");c3_append_u32(buf,&l,(size_t)mx,(uint32_t)t->egid);
     c3_append_str(buf,&l,(size_t)mx,"\nVmPeak:\t262144 kB\nVmSize:\t262144 kB\nVmRSS:\t32768 kB\nRssAnon:\t24576 kB\nRssFile:\t8192 kB\n");
     c3_append_str(buf,&l,(size_t)mx,"FDSize:\t512\nThreads:\t");c3_append_u32(buf,&l,(size_t)mx,c3_proc_task_thread_count(t));
@@ -2237,8 +4600,8 @@ static int c3_proc_append_task_stat(char *buf,int mx,const task_t *t){
     C3_PROC_STAT_U(0);
     C3_PROC_STAT_I(0);
     C3_PROC_STAT_U(startcode);
-    C3_PROC_STAT_U(t->brk_start?t->brk_start:0x800000ULL);
-    C3_PROC_STAT_U(t->brk_start?t->brk_start:0x800000ULL);
+    C3_PROC_STAT_U(t->brk_start?t->brk_start:C3_USER_LOW_SAFE);
+    C3_PROC_STAT_U(t->brk_start?t->brk_start:C3_USER_LOW_SAFE);
     C3_PROC_STAT_U(arg_start);
     C3_PROC_STAT_U(arg_end);
     C3_PROC_STAT_U(env_start);
@@ -2247,6 +4610,30 @@ static int c3_proc_append_task_stat(char *buf,int mx,const task_t *t){
     c3_append_ch(buf,&l,(size_t)mx,'\n');
 #undef C3_PROC_STAT_U
 #undef C3_PROC_STAT_I
+    return (int)l;
+}
+
+static int c3_proc_append_fdinfo(char *buf,int mx,const task_t *owner,int fdn){
+    const real_fd_t *fd;
+    size_t l=0;
+    if(!buf||mx<=0)return -EFAULT;
+    if(!owner||fdn<0||fdn>=TASK_FD_MAX)return -EBADF;
+    fd=&owner->fdt.fds[fdn];
+    if(fd->kind==FDKIND_NONE)return -EBADF;
+    buf[0]=0;
+    c3_append_str(buf,&l,(size_t)mx,"pos:\t");
+    c3_append_u64(buf,&l,(size_t)mx,fd->offset);
+    c3_append_str(buf,&l,(size_t)mx,"\nflags:\t02\nmnt_id:\t1\n");
+    if(fd->kind==FDKIND_PIDFD){
+        int pid=fd->ref;
+        c3_append_str(buf,&l,(size_t)mx,"Pid:\t");
+        if(pid>0)c3_append_u32(buf,&l,(size_t)mx,(uint32_t)pid);
+        else c3_append_i64(buf,&l,(size_t)mx,-1);
+        c3_append_str(buf,&l,(size_t)mx,"\nNSpid:\t");
+        if(pid>0)c3_append_u32(buf,&l,(size_t)mx,(uint32_t)pid);
+        else c3_append_i64(buf,&l,(size_t)mx,-1);
+        c3_append_ch(buf,&l,(size_t)mx,'\n');
+    }
     return (int)l;
 }
 
@@ -2262,8 +4649,23 @@ static int proc_generate(const char *path, char *buf, int mx){
         task_t *tt=c3_task_by_pid(task_tid);
         if(!tt)return -ESRCH;
         if(!task_tail||task_tail[0]==0){
-            c3_append_str(buf,&l,(size_t)mx,"status\nstat\ncomm\nmaps\nstatm\ncmdline\nfd\n");
+            c3_append_str(buf,&l,(size_t)mx,"status\nstat\ncomm\nmaps\nstatm\ncmdline\nfd\nfdinfo\n");
             return(int)l;
+        }
+        if(c3_strcmp(task_tail,"/fdinfo")==0){
+            int i;
+            for(i=0;i<TASK_FD_MAX;++i){
+                if(tt->fdt.fds[i].kind==FDKIND_NONE)continue;
+                c3_append_u32(buf,&l,(size_t)mx,(uint32_t)i);
+                c3_append_ch(buf,&l,(size_t)mx,'\n');
+            }
+            return(int)l;
+        }
+        if(c3_starts_with(task_tail,"/fdinfo/")){
+            int fdn=-1;
+            int pr=c3_parse_fd_number_tail(task_tail+8,&fdn);
+            if(pr<0)return pr;
+            return c3_proc_append_fdinfo(buf,mx,tt,fdn);
         }
         if(c3_strcmp(task_tail,"/status")==0)return c3_proc_append_task_status(buf,mx,tt);
         if(c3_strcmp(task_tail,"/stat")==0)return c3_proc_append_task_stat(buf,mx,tt);
@@ -2302,6 +4704,21 @@ static int proc_generate(const char *path, char *buf, int mx){
             c3_append_str(self_alias,&al,sizeof(self_alias),"/proc/self");
             c3_append_str(self_alias,&al,sizeof(self_alias),pid_tail);
             return proc_generate(self_alias,buf,mx);
+        }
+        if(c3_starts_with(pid_tail,"/fdinfo/")){
+            int fdn=-1;
+            int pr=c3_parse_fd_number_tail(pid_tail+8,&fdn);
+            if(pr<0)return pr;
+            return c3_proc_append_fdinfo(buf,mx,pt,fdn);
+        }
+        if(c3_strcmp(pid_tail,"/fdinfo")==0){
+            int i;
+            for(i=0;i<TASK_FD_MAX;++i){
+                if(pt->fdt.fds[i].kind==FDKIND_NONE)continue;
+                c3_append_u32(buf,&l,(size_t)mx,(uint32_t)i);
+                c3_append_ch(buf,&l,(size_t)mx,'\n');
+            }
+            return(int)l;
         }
         if(c3_strcmp(pid_tail,"/status")==0)return c3_proc_append_task_status(buf,mx,pt);
         if(c3_strcmp(pid_tail,"/stat")==0)return c3_proc_append_task_stat(buf,mx,pt);
@@ -2374,6 +4791,18 @@ static int proc_generate(const char *path, char *buf, int mx){
         c3_append_str(buf,&l,(size_t)mx,"16384 8192 4096 2048 0 2048 0\n");
     } else if(c3_strcmp(path,"/proc/self/cmdline")==0){
         c3_append_str(buf,&l,(size_t)mx,cur->name);c3_append_ch(buf,&l,(size_t)mx,'\0');
+    } else if(c3_strcmp(path,"/proc/self/fdinfo")==0){
+        int i;
+        for(i=0;i<TASK_FD_MAX;++i){
+            if(cur->fdt.fds[i].kind==FDKIND_NONE)continue;
+            c3_append_u32(buf,&l,(size_t)mx,(uint32_t)i);
+            c3_append_ch(buf,&l,(size_t)mx,'\n');
+        }
+    } else if(c3_starts_with(path,"/proc/self/fdinfo/")){
+        int fdn=-1;
+        int pr=c3_parse_fd_number_tail(path+c3_strlen("/proc/self/fdinfo/"),&fdn);
+        if(pr<0)return pr;
+        return c3_proc_append_fdinfo(buf,mx,cur,fdn);
     } else if(c3_strcmp(path,"/proc/self/environ")==0){
         static const char env_blob[]=
             "USER=root\0HOME=/root\0PATH=/usr/bin:/bin\0LANG=en_US.UTF-8\0LC_ALL=en_US.UTF-8\0"
@@ -2450,10 +4879,22 @@ static int proc_generate(const char *path, char *buf, int mx){
             "eth0\t00000000\t0202000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
             "eth0\t0002000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n");
     } else if(c3_strcmp(path,"/proc/net/unix")==0){
+        int si;
+        uint32_t inode=2;
         c3_append_str(buf,&l,(size_t)mx,"Num       RefCount Protocol Flags    Type St Inode Path\n");
         c3_append_str(buf,&l,(size_t)mx,"00000000: 00000002 00000000 00010000 0001 01 1 /tmp/.X11-unix/X0\n");
-        c3_append_str(buf,&l,(size_t)mx,"00000001: 00000002 00000000 00010000 0001 01 2 /run/user/0/wayland-0\n");
-        c3_append_str(buf,&l,(size_t)mx,"00000002: 00000002 00000000 00010000 0001 01 3 /run/user/1000/wayland-0\n");
+        for(si=0;si<SOCK_MAX;++si){
+            if(!c3_unix_bound_path_is_listener(si))continue;
+            if(!(c3_has_token(g_c3_unix_bound_paths[si],"/wayland-")||
+                 c3_has_token(g_c3_unix_bound_paths[si],"/wayland-proxy-")))continue;
+            c3_append_hex64(buf,&l,(size_t)mx,(uint64_t)inode);
+            c3_append_str(buf,&l,(size_t)mx,": 00000002 00000000 00010000 0001 01 ");
+            c3_append_u32(buf,&l,(size_t)mx,inode);
+            c3_append_ch(buf,&l,(size_t)mx,' ');
+            c3_append_str(buf,&l,(size_t)mx,g_c3_unix_bound_paths[si]);
+            c3_append_ch(buf,&l,(size_t)mx,'\n');
+            ++inode;
+        }
         c3_append_str(buf,&l,(size_t)mx,"00000003: 00000002 00000000 00010000 0001 01 4 /run/user/0/bus\n");
         c3_append_str(buf,&l,(size_t)mx,"00000004: 00000002 00000000 00010000 0001 01 5 /run/dbus/system_bus_socket\n");
     } else if(c3_strcmp(path,"/proc/sys/kernel/ostype")==0){
@@ -2523,22 +4964,212 @@ static int proc_generate(const char *path, char *buf, int mx){
     } else if(c3_strcmp(path,"/sys/devices/virtual/dmi/id/board_name")==0||
               c3_strcmp(path,"/sys/class/dmi/id/board_name")==0){
         c3_append_str(buf,&l,(size_t)mx,"RiduxBoard\n");
-    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/vendor")==0){
-        c3_append_str(buf,&l,(size_t)mx,"0x1234\n");
-    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/device")==0){
-        c3_append_str(buf,&l,(size_t)mx,"0x1111\n");
-    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/subsystem_vendor")==0){
-        c3_append_str(buf,&l,(size_t)mx,"0x1af4\n");
-    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/subsystem_device")==0){
-        c3_append_str(buf,&l,(size_t)mx,"0x1100\n");
-    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/driver/module/version")==0){
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/vendor")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/vendor")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/vendor")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/vendor")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/vendor")==0||
+              c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0/vendor")==0){
+        c3_append_str(buf,&l,(size_t)mx,c3_vbox_gpu_mode()?"0x15ad\n":"0x1af4\n");
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/device")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/device")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/device")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/device")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/device")==0||
+              c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0/device")==0){
+        c3_append_str(buf,&l,(size_t)mx,c3_vbox_gpu_mode()?"0x0405\n":"0x1050\n");
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/subsystem_vendor")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/subsystem_vendor")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/subsystem_vendor")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/subsystem_vendor")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/subsystem_vendor")==0||
+              c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0/subsystem_vendor")==0){
+        c3_append_str(buf,&l,(size_t)mx,c3_vbox_gpu_mode()?"0x15ad\n":"0x1af4\n");
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/subsystem_device")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/subsystem_device")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/subsystem_device")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/subsystem_device")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/subsystem_device")==0||
+              c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0/subsystem_device")==0){
+        c3_append_str(buf,&l,(size_t)mx,c3_vbox_gpu_mode()?"0x0405\n":"0x1050\n");
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/class")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/class")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/class")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/class")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/class")==0||
+              c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0/class")==0){
+        c3_append_str(buf,&l,(size_t)mx,"0x030000\n");
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/revision")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/revision")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/revision")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/revision")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/revision")==0||
+              c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0/revision")==0){
+        c3_append_str(buf,&l,(size_t)mx,"0x00\n");
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/driver/module/version")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/driver/module/version")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/driver/module/version")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/driver/module/version")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/driver/module/version")==0||
+              c3_strcmp(path,"/sys/bus/pci/drivers/vmwgfx/module/version")==0||
+              c3_strcmp(path,"/sys/bus/pci/drivers/virtio-pci/module/version")==0){
         c3_append_str(buf,&l,(size_t)mx,"1.0.0-ridux\n");
-    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/uevent")==0){
+    } else if(c3_strcmp(path,"/sys/class/drm/card0/device/uevent")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/device/uevent")==0||
+              c3_strcmp(path,"/sys/dev/char/226:0/device/uevent")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/uevent")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/uevent")==0||
+              c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,c3_vbox_gpu_mode()?
+            "DRIVER=vmwgfx\nPCI_CLASS=30000\nPCI_ID=15AD:0405\nPCI_SUBSYS_ID=15AD:0405\nPCI_SLOT_NAME=0000:00:02.0\n"
+            "MODALIAS=pci:v000015ADd00000405sv000015ADsd00000405bc03sc00i00\n":
+            "DRIVER=virtio_gpu\nPCI_CLASS=30000\nPCI_ID=1AF4:1050\nPCI_SUBSYS_ID=1AF4:1050\nPCI_SLOT_NAME=0000:00:02.0\n"
+            "MODALIAS=pci:v00001AF4d00001050sv00001AF4sd00001050bc03sc00i00\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:0/dev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"226:0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:128/dev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"226:128\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:0/uevent")==0){
         c3_append_str(buf,&l,(size_t)mx,
-            "DRIVER=virtio_gpu\nPCI_CLASS=30000\nPCI_ID=1234:1111\nPCI_SUBSYS_ID=1AF4:1100\n");
-    } else if(c3_strcmp(path,"/sys/class/drm/renderD128/device/uevent")==0){
+            "DEVNAME=dri/card0\nSUBSYSTEM=drm\nDEVTYPE=drm_minor\nMAJOR=226\nMINOR=0\nID_SEAT=seat0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:128/uevent")==0){
         c3_append_str(buf,&l,(size_t)mx,
-            "DEVNAME=dri/renderD128\nSUBSYSTEM=dri\nDEVTYPE=drm_minor\n");
+            "DEVNAME=dri/renderD128\nSUBSYSTEM=drm\nDEVTYPE=drm_minor\nMAJOR=226\nMINOR=128\nID_SEAT=seat0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:0/device/drm/card0/dev")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/drm/card0/dev")==0||
+              c3_strcmp(path,"/sys/class/drm/card0/dev")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/card0/dev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"226:0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:0/device/drm/renderD128/dev")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/drm/renderD128/dev")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/dev")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/dev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"226:128\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:0/device/drm/card0/uevent")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/drm/card0/uevent")==0||
+              c3_strcmp(path,"/sys/class/drm/card0/uevent")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/card0/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=dri/card0\nSUBSYSTEM=drm\nDEVTYPE=drm_minor\nMAJOR=226\nMINOR=0\nID_SEAT=seat0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/226:0/device/drm/renderD128/uevent")==0||
+              c3_strcmp(path,"/sys/dev/char/226:128/device/drm/renderD128/uevent")==0||
+              c3_strcmp(path,"/sys/class/drm/renderD128/uevent")==0||
+              c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=dri/renderD128\nSUBSYSTEM=drm\nDEVTYPE=drm_minor\nMAJOR=226\nMINOR=128\nID_SEAT=seat0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:64/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=input/event0\nSUBSYSTEM=input\nDEVTYPE=input_event\nMAJOR=13\nMINOR=64\n"
+            "ID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\nID_SEAT=seat0\nTAGS=:seat:\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:65/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=input/event1\nSUBSYSTEM=input\nDEVTYPE=input_event\nMAJOR=13\nMINOR=65\n"
+            "ID_INPUT=1\nID_INPUT_MOUSE=1\nID_SEAT=seat0\nTAGS=:seat:\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:64/device/name")==0||
+              c3_strcmp(path,"/sys/class/input/event0/device/name")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input0/name")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input0/name")==0){
+        c3_append_str(buf,&l,(size_t)mx,"RiduxOS Keyboard\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:65/device/name")==0||
+              c3_strcmp(path,"/sys/class/input/event1/device/name")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input1/name")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input1/name")==0){
+        c3_append_str(buf,&l,(size_t)mx,"RiduxOS Mouse\n");
+    } else if((c3_has_token(path,"/input0/id/bustype")||
+               c3_strcmp(path,"/sys/dev/char/13:64/device/id/bustype")==0)){
+        c3_append_str(buf,&l,(size_t)mx,"0011\n");
+    } else if((c3_has_token(path,"/input1/id/bustype")||
+               c3_strcmp(path,"/sys/dev/char/13:65/device/id/bustype")==0)){
+        c3_append_str(buf,&l,(size_t)mx,"0003\n");
+    } else if(c3_has_token(path,"/input0/id/vendor")||
+              c3_strcmp(path,"/sys/dev/char/13:64/device/id/vendor")==0){
+        c3_append_str(buf,&l,(size_t)mx,"1209\n");
+    } else if(c3_has_token(path,"/input1/id/vendor")||
+              c3_strcmp(path,"/sys/dev/char/13:65/device/id/vendor")==0){
+        c3_append_str(buf,&l,(size_t)mx,"1209\n");
+    } else if(c3_has_token(path,"/input0/id/product")||
+              c3_strcmp(path,"/sys/dev/char/13:64/device/id/product")==0){
+        c3_append_str(buf,&l,(size_t)mx,"d001\n");
+    } else if(c3_has_token(path,"/input1/id/product")||
+              c3_strcmp(path,"/sys/dev/char/13:65/device/id/product")==0){
+        c3_append_str(buf,&l,(size_t)mx,"d002\n");
+    } else if(c3_has_token(path,"/input0/id/version")||
+              c3_strcmp(path,"/sys/dev/char/13:64/device/id/version")==0||
+              c3_has_token(path,"/input1/id/version")||
+              c3_strcmp(path,"/sys/dev/char/13:65/device/id/version")==0){
+        c3_append_str(buf,&l,(size_t)mx,"0100\n");
+    } else if(c3_has_token(path,"/input0/phys")||
+              c3_strcmp(path,"/sys/dev/char/13:64/device/phys")==0){
+        c3_append_str(buf,&l,(size_t)mx,"ridux/input0\n");
+    } else if(c3_has_token(path,"/input1/phys")||
+              c3_strcmp(path,"/sys/dev/char/13:65/device/phys")==0){
+        c3_append_str(buf,&l,(size_t)mx,"ridux/input1\n");
+    } else if(c3_has_token(path,"/input0/uniq")||
+              c3_strcmp(path,"/sys/dev/char/13:64/device/uniq")==0||
+              c3_has_token(path,"/input1/uniq")||
+              c3_strcmp(path,"/sys/dev/char/13:65/device/uniq")==0){
+        c3_append_str(buf,&l,(size_t)mx,"\n");
+    } else if(c3_has_token(path,"/input0/properties")||
+              c3_strcmp(path,"/sys/dev/char/13:64/device/properties")==0||
+              c3_has_token(path,"/input1/properties")||
+              c3_strcmp(path,"/sys/dev/char/13:65/device/properties")==0){
+        c3_append_str(buf,&l,(size_t)mx,"0\n");
+    } else if(c3_has_token(path,"/input0/modalias")||
+              c3_strcmp(path,"/sys/dev/char/13:64/device/modalias")==0){
+        c3_append_str(buf,&l,(size_t)mx,"input:b0011v1209pD001e0100-e0,1,4,11,14,k71,72,73,74,75,76,77,78,79,7A,7B,ramlsfw\n");
+    } else if(c3_has_token(path,"/input1/modalias")||
+              c3_strcmp(path,"/sys/dev/char/13:65/device/modalias")==0){
+        c3_append_str(buf,&l,(size_t)mx,"input:b0003v1209pD002e0100-e0,1,2,k110,111,112,r0,1,8,amlsfw\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:64/device/uevent")==0||
+              c3_strcmp(path,"/sys/class/input/event0/device/uevent")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input0/uevent")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input0/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "PRODUCT=3/1209/d001/100\nNAME=\"RiduxOS Keyboard\"\nPHYS=\"ridux/input0\"\n"
+            "PROP=0\nEV=120013\nKEY=402000000 3803078f800d001 feffffdfffefffff fffffffffffffffe\n"
+            "MODALIAS=input:b0011v1209pD001e0100-e0,1,4,11,14,k71,72,73,74,75,76,77,78,79,7A,7B,ramlsfw\n"
+            "ID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\nID_SEAT=seat0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:65/device/uevent")==0||
+              c3_strcmp(path,"/sys/class/input/event1/device/uevent")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input1/uevent")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input1/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "PRODUCT=3/1209/d002/100\nNAME=\"RiduxOS Mouse\"\nPHYS=\"ridux/input1\"\n"
+            "PROP=0\nEV=17\nKEY=70000 0 0 0 0\nREL=903\n"
+            "MODALIAS=input:b0003v1209pD002e0100-e0,1,2,k110,111,112,r0,1,8,amlsfw\n"
+            "ID_INPUT=1\nID_INPUT_MOUSE=1\nID_SEAT=seat0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:64/device/capabilities/ev")==0||
+              c3_strcmp(path,"/sys/class/input/event0/device/capabilities/ev")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input0/capabilities/ev")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input0/capabilities/ev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"120013\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:65/device/capabilities/ev")==0||
+              c3_strcmp(path,"/sys/class/input/event1/device/capabilities/ev")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input1/capabilities/ev")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input1/capabilities/ev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"17\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:64/device/capabilities/key")==0||
+              c3_strcmp(path,"/sys/class/input/event0/device/capabilities/key")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input0/capabilities/key")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input0/capabilities/key")==0){
+        c3_append_str(buf,&l,(size_t)mx,"402000000 3803078f800d001 feffffdfffefffff fffffffffffffffe\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:65/device/capabilities/key")==0||
+              c3_strcmp(path,"/sys/class/input/event1/device/capabilities/key")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input1/capabilities/key")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input1/capabilities/key")==0){
+        c3_append_str(buf,&l,(size_t)mx,"70000 0 0 0 0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:64/device/capabilities/rel")==0||
+              c3_strcmp(path,"/sys/class/input/event0/device/capabilities/rel")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input0/capabilities/rel")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input0/capabilities/rel")==0){
+        c3_append_str(buf,&l,(size_t)mx,"0\n");
+    } else if(c3_strcmp(path,"/sys/dev/char/13:65/device/capabilities/rel")==0||
+              c3_strcmp(path,"/sys/class/input/event1/device/capabilities/rel")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input1/capabilities/rel")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input1/capabilities/rel")==0){
+        c3_append_str(buf,&l,(size_t)mx,"903\n");
+    } else if(c3_has_token(path,"/capabilities/abs")||c3_has_token(path,"/capabilities/prop")){
+        c3_append_str(buf,&l,(size_t)mx,"0\n");
     } else if(c3_strcmp(path,"/sys/class/net/lo/address")==0){
         c3_append_str(buf,&l,(size_t)mx,"00:00:00:00:00:00\n");
     } else if(c3_strcmp(path,"/sys/class/net/lo/operstate")==0){
@@ -2560,11 +5191,52 @@ static int proc_generate(const char *path, char *buf, int mx){
     } else if(c3_strcmp(path,"/sys/class/graphics/fb0/name")==0){
         c3_append_str(buf,&l,(size_t)mx,"riduxfb\n");
     } else if(c3_strcmp(path,"/sys/class/graphics/fb0/modes")==0){
-        c3_append_str(buf,&l,(size_t)mx,"U:1024x768p-60\n");
+        c3_append_str(buf,&l,(size_t)mx,"U:1024x768p-");
+        c3_append_u32(buf,&l,(size_t)mx,c3_display_refresh_hz());
+        c3_append_ch(buf,&l,(size_t)mx,'\n');
     } else if(c3_strcmp(path,"/sys/class/graphics/fb0/virtual_size")==0){
         c3_append_str(buf,&l,(size_t)mx,"1024,768\n");
     } else if(c3_strcmp(path,"/sys/class/graphics/fb0/bits_per_pixel")==0){
         c3_append_str(buf,&l,(size_t)mx,"32\n");
+    } else if(c3_strcmp(path,"/sys/class/input/event0/name")==0){
+        c3_append_str(buf,&l,(size_t)mx,"RiduxOS Keyboard\n");
+    } else if(c3_strcmp(path,"/sys/class/input/event1/name")==0||
+              c3_strcmp(path,"/sys/class/input/mice/name")==0){
+        c3_append_str(buf,&l,(size_t)mx,"RiduxOS Mouse\n");
+    } else if(c3_strcmp(path,"/sys/class/input/event0/dev")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input0/event0/dev")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/event0/dev")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input0/event0/dev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"13:64\n");
+    } else if(c3_strcmp(path,"/sys/class/input/event1/dev")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/input1/event1/dev")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/event1/dev")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input1/event1/dev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"13:65\n");
+    } else if(c3_strcmp(path,"/sys/class/input/mice/dev")==0){
+        c3_append_str(buf,&l,(size_t)mx,"13:63\n");
+    } else if(c3_strcmp(path,"/sys/class/input/event0/uevent")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input0/event0/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=input/event0\nSUBSYSTEM=input\nDEVTYPE=input_event\nMAJOR=13\nMINOR=64\n"
+            "ID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\nID_SEAT=seat0\nTAGS=:seat:\n");
+    } else if(c3_strcmp(path,"/sys/bus/input/devices/input0/event0/uevent")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/event0/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=input/event0\nSUBSYSTEM=input\nDEVTYPE=input_event\nMAJOR=13\nMINOR=64\n"
+            "ID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\nID_SEAT=seat0\nTAGS=:seat:\n");
+    } else if(c3_strcmp(path,"/sys/class/input/event1/uevent")==0||
+              c3_strcmp(path,"/sys/devices/virtual/input/input1/event1/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=input/event1\nSUBSYSTEM=input\nDEVTYPE=input_event\nMAJOR=13\nMINOR=65\n"
+            "ID_INPUT=1\nID_INPUT_MOUSE=1\nID_SEAT=seat0\nTAGS=:seat:\n");
+    } else if(c3_strcmp(path,"/sys/bus/input/devices/input1/event1/uevent")==0||
+              c3_strcmp(path,"/sys/bus/input/devices/event1/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,
+            "DEVNAME=input/event1\nSUBSYSTEM=input\nDEVTYPE=input_event\nMAJOR=13\nMINOR=65\n"
+            "ID_INPUT=1\nID_INPUT_MOUSE=1\nID_SEAT=seat0\nTAGS=:seat:\n");
+    } else if(c3_strcmp(path,"/sys/class/input/mice/uevent")==0){
+        c3_append_str(buf,&l,(size_t)mx,"DEVNAME=input/mice\nSUBSYSTEM=input\nMAJOR=13\nMINOR=63\nID_INPUT=1\nID_SEAT=seat0\n");
     } else if(c3_strcmp(path,"/sys/fs/cgroup/cgroup.controllers")==0){
         c3_append_str(buf,&l,(size_t)mx,"cpuset cpu io memory pids\n");
     } else if(c3_strcmp(path,"/sys/fs/cgroup/cgroup.subtree_control")==0){
@@ -2579,7 +5251,7 @@ static int proc_generate(const char *path, char *buf, int mx){
               c3_strcmp(path,"/sys/module/nvidia/version")==0){
         c3_append_str(buf,&l,(size_t)mx,"0.0-ridux\n");
     } else if(c3_strcmp(path,"/proc/filesystems")==0){
-        c3_append_str(buf,&l,(size_t)mx,"\text2\n\text4\n\tfat32\n\tvfat\nnodev\ttmpfs\nnodev\tproc\nnodev\tsysfs\nnodev\tdevtmpfs\n");
+        c3_append_str(buf,&l,(size_t)mx,"\text2\n\text4\n\tfat32\n\tvfat\nnodev\ttmpfs\nnodev\tproc\nnodev\tsysfs\nnodev\tdevtmpfs\nnodev\tfuse\nnodev\tfuse.portal\n");
     } else if(c3_strcmp(path,"/proc/loadavg")==0){
         c3_append_str(buf,&l,(size_t)mx,"0.10 0.05 0.01 1/32 100\n");
     } else if(c3_strcmp(path,"/proc/self/fd")==0){
@@ -2594,13 +5266,21 @@ static int proc_generate(const char *path, char *buf, int mx){
 /* Stored proc data for reads after open */
 #define PROC_BUF_MAX 16
 #define PROC_BUF_BYTES (256u*1024u)
-typedef struct { bool used; int fd; char data[PROC_BUF_BYTES]; uint32_t size; } proc_buf_t;
+typedef struct { bool used; int fd; char path[VFS_PATH_MAX]; char data[PROC_BUF_BYTES]; uint32_t size; } proc_buf_t;
 static proc_buf_t g_proc_bufs[PROC_BUF_MAX];
 static uint32_t g_c3_openat_trace_count=0;
 static uint32_t g_c3_libxi_read_trace_count=0;
 static uint32_t g_c3_profile_trace_count=0;
+static uint32_t g_c3_wayfire_proc_read_trace_count=0;
 static uint32_t g_c3_firefox_trace_count=0;
 static uint32_t g_c3_firefox_read_trace_count=0;
+static uint32_t g_c3_wayfire_path_trace_count=0;
+static uint32_t g_c3_wayfire_module_trace_count=0;
+static uint32_t g_c3_wayfire_dents_trace_count=0;
+static uint32_t g_c3_qt_path_trace_count=0;
+static uint32_t g_c3_qt_dents_trace_count=0;
+static uint32_t g_c3_vulkan_path_trace_count=0;
+static uint32_t g_c3_vulkan_dents_trace_count=0;
 #ifndef C3_OPENAT_TRACE_MAX
 #define C3_OPENAT_TRACE_MAX 32
 #endif
@@ -2638,8 +5318,9 @@ static bool c3_trace_profile_path(const char *path){
 
 static void c3_trace_path_rc(const char *op,const char *path,int64_t rc,uint64_t a,uint64_t b){
     task_t *cur;
+    if(!c3_syscall_debug_trace_enabled())return;
     if(!c3_trace_profile_path(path))return;
-    if(g_c3_profile_trace_count>=512)return;
+    if(g_c3_profile_trace_count>=48)return;
     ++g_c3_profile_trace_count;
     cur=task_current();
     __boot_serial_puts("[profile-fs] #");
@@ -2694,7 +5375,7 @@ static bool c3_trace_firefox_path_needed(const char *path){
 static void c3_trace_firefox_path_rc(const char *op,const char *path,int64_t rc,uint64_t a,uint64_t b){
     task_t *cur;
     if(!c3_trace_firefox_path_needed(path))return;
-    if(g_c3_firefox_trace_count>=384)return;
+    if(g_c3_firefox_trace_count>=64)return;
     cur=task_current();
     if(!c3_task_is_firefox_runtime(cur))return;
     ++g_c3_firefox_trace_count;
@@ -2719,6 +5400,210 @@ static void c3_trace_firefox_path_rc(const char *op,const char *path,int64_t rc,
     __boot_serial_puts(" path=");
     __boot_serial_puts(path);
     __boot_serial_puts("\n");
+}
+
+static void c3_force_wayfire_path_rc(const char *op,const char *path,int64_t rc,uint64_t a,uint64_t b){
+    task_t *cur;
+    bool backend_path;
+    bool module_path;
+    if(!path||!path[0])return;
+    if(!c3_wayfire_debug_trace_enabled())return;
+    backend_path=c3_has_token(path,"/dev/dri")||c3_has_token(path,"/dev/input")||
+                 c3_has_token(path,"/sys/")||c3_has_token(path,"/run/udev")||
+                 c3_has_token(path,"/dev/tty")||c3_has_token(path,"/dev/console");
+    module_path=(c3_has_token(path,".so")&&
+                 (c3_has_token(path,"/opt/wayfire/")||
+                  c3_has_token(path,"/lib64/")||
+                  c3_has_token(path,"/usr/lib/")));
+    (void)module_path;
+    if(g_c3_wayfire_path_trace_count>=360u&&!backend_path)return;
+    if(g_c3_wayfire_path_trace_count>=900u)return;
+    cur=task_current();
+    if(!c3_task_is_wayfire_runtime(cur))return;
+    ++g_c3_wayfire_path_trace_count;
+    __boot_serial_force_puts("[wayfire-fs!] #");
+    __boot_serial_force_putu32(g_c3_wayfire_path_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" op=");
+    __boot_serial_force_puts(op?op:"?");
+    __boot_serial_force_puts(" a=");
+    __boot_serial_force_puthex64(a);
+    __boot_serial_force_puts(" b=");
+    __boot_serial_force_puthex64(b);
+    __boot_serial_force_puts(" rc=");
+    c3_force_rc(rc);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(path);
+    __boot_serial_force_puts("\n");
+}
+
+static void c3_force_hyprland_gpu_path_rc(const char *op,const char *path,int64_t rc,uint64_t a,uint64_t b){
+    task_t *cur;
+    static uint32_t hypr_gpu_path_trace_count;
+    if(!c3_wayfire_debug_trace_enabled())return;
+    if(!path||!path[0])return;
+    if(!(c3_has_token(path,"/dev/dri")||
+         c3_has_token(path,"/sys/class/drm")||
+         c3_has_token(path,"/sys/dev/char/226")||
+         c3_has_token(path,"/sys/devices/pci0000:00/0000:00:02.0")||
+         c3_has_token(path,"/run/udev/data/c226")||
+         c3_has_token(path,"/usr/lib/x86_64-linux-gnu/dri")||
+         c3_has_token(path,"/lib/x86_64-linux-gnu/dri")||
+         c3_has_token(path,"/opt/hyprland/lib/dri")||
+         c3_has_token(path,"virtio_gpu")||
+         c3_has_token(path,"libdril")||
+         c3_has_token(path,"libgallium")||
+         c3_has_token(path,"libgbm")||
+         c3_has_token(path,"libEGL")||
+         c3_has_token(path,"libGLES")||
+         c3_has_token(path,"libGL")||
+         c3_has_token(path,"libglapi")))return;
+    cur=task_current();
+    if(!c3_task_is_hyprland_compositor(cur))return;
+    if(hypr_gpu_path_trace_count>=420u)return;
+    ++hypr_gpu_path_trace_count;
+    __boot_serial_force_puts("[hypr-gpu-fs] #");
+    __boot_serial_force_putu32(hypr_gpu_path_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" op=");
+    __boot_serial_force_puts(op?op:"?");
+    __boot_serial_force_puts(" a=");
+    __boot_serial_force_puthex64(a);
+    __boot_serial_force_puts(" b=");
+    __boot_serial_force_puthex64(b);
+    __boot_serial_force_puts(" rc=");
+    c3_force_rc(rc);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(path);
+    __boot_serial_force_puts("\n");
+}
+
+static void c3_force_hypr_portal_path_rc(const char *op,const char *path,int64_t rc,uint64_t a,uint64_t b){
+    task_t *cur;
+    static uint32_t hypr_portal_path_trace_count;
+    if(!c3_dbus_debug_trace_enabled())return;
+    if(!path||!path[0])return;
+    if(!c3_hypr_ipc_path_interesting(path))return;
+    cur=task_current();
+    if(!c3_task_is_hypr_portal_backend(cur)&&
+       !c3_task_is_hyprland_compositor(cur)&&
+       !c3_hypr_ipc_path_interesting(path))return;
+    if(hypr_portal_path_trace_count>=220u)return;
+    ++hypr_portal_path_trace_count;
+    __boot_serial_force_puts("[hypr-portal-fs!] #");
+    __boot_serial_force_putu32(hypr_portal_path_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" op=");
+    __boot_serial_force_puts(op?op:"?");
+    __boot_serial_force_puts(" a=");
+    __boot_serial_force_puthex64(a);
+    __boot_serial_force_puts(" b=");
+    __boot_serial_force_puthex64(b);
+    __boot_serial_force_puts(" rc=");
+    c3_force_rc(rc);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(path);
+    __boot_serial_force_puts("\n");
+}
+
+static bool c3_trace_qt_path_needed(const char *path,int64_t rc){
+    bool interesting=false;
+    if(!path||!path[0])return false;
+    (void)rc;
+    interesting=interesting||c3_has_token(path,"/usr/share/riduxui");
+    interesting=interesting||c3_has_token(path,"/usr/lib/x86_64-linux-gnu/qt6");
+    interesting=interesting||c3_has_token(path,"/usr/lib/qt6");
+    interesting=interesting||c3_has_token(path,"/usr/share/qt6");
+    interesting=interesting||c3_has_token(path,"/lib/x86_64-linux-gnu/libQt6");
+    interesting=interesting||c3_has_token(path,"/usr/lib/x86_64-linux-gnu/libQt6");
+    interesting=interesting||c3_has_token(path,"/usr/share/icons");
+    interesting=interesting||c3_has_token(path,"/usr/share/fonts");
+    interesting=interesting||c3_has_token(path,"fontconfig");
+    interesting=interesting||c3_has_token(path,"Adwaita");
+    interesting=interesting||c3_has_token(path,"adwaita");
+    interesting=interesting||c3_has_token(path,".qml");
+    interesting=interesting||c3_has_token(path,"QtQuick");
+    interesting=interesting||c3_has_token(path,"/qml");
+    interesting=interesting||c3_has_token(path,"/plugins");
+    interesting=interesting||c3_has_token(path,"/dev/dri");
+    interesting=interesting||c3_has_token(path,"/proc/self/fd");
+    interesting=interesting||c3_has_token(path,"/proc/thread-self");
+    return interesting;
+}
+
+static void c3_force_qt_path_rc(const char *op,const char *path,int64_t rc,uint64_t a,uint64_t b){
+    task_t *cur;
+    if(!c3_trace_qt_path_needed(path,rc))return;
+    if(g_c3_qt_path_trace_count>=420u)return;
+    cur=task_current();
+    if(!c3_task_is_ridux_qt_runtime(cur))return;
+    ++g_c3_qt_path_trace_count;
+    __boot_serial_force_puts("[qt-fs!] #");
+    __boot_serial_force_putu32(g_c3_qt_path_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" op=");
+    __boot_serial_force_puts(op?op:"?");
+    __boot_serial_force_puts(" a=");
+    __boot_serial_force_puthex64(a);
+    __boot_serial_force_puts(" b=");
+    __boot_serial_force_puthex64(b);
+    __boot_serial_force_puts(" rc=");
+    c3_force_rc(rc);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(path?path:"");
+    __boot_serial_force_puts("\n");
+}
+
+static bool c3_trace_vulkan_path_needed(const char *path,int64_t rc){
+    bool interesting=false;
+    (void)rc;
+    if(!path||!path[0])return false;
+    interesting=interesting||c3_has_token(path,"/dev/dri");
+    interesting=interesting||c3_has_token(path,"/sys/class/drm");
+    interesting=interesting||c3_has_token(path,"/sys/dev/char/226");
+    interesting=interesting||c3_has_token(path,"/sys/devices/pci0000:00/0000:00:02.0");
+    interesting=interesting||c3_has_token(path,"/sys/bus/pci");
+    interesting=interesting||c3_has_token(path,"/run/udev/data/c226");
+    interesting=interesting||c3_has_token(path,"/usr/share/vulkan");
+    interesting=interesting||c3_has_token(path,"/etc/vulkan");
+    interesting=interesting||c3_has_token(path,"libvulkan");
+    interesting=interesting||c3_has_token(path,"virtio_icd");
+    interesting=interesting||c3_has_token(path,"virtio_gpu");
+    interesting=interesting||c3_has_token(path,"renderD128");
+    return interesting;
+}
+
+static void c3_force_vulkan_path_rc(const char *op,const char *path,int64_t rc,uint64_t a,uint64_t b){
+    task_t *cur;
+    if(!c3_trace_vulkan_path_needed(path,rc))return;
+    if(g_c3_vulkan_path_trace_count>=520u)return;
+    cur=task_current();
+    if(!c3_task_is_vulkan_probe_runtime(cur))return;
+    ++g_c3_vulkan_path_trace_count;
+    __boot_serial_force_puts("[vulkan-fs!] #");
+    __boot_serial_force_putu32(g_c3_vulkan_path_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" op=");
+    __boot_serial_force_puts(op?op:"?");
+    __boot_serial_force_puts(" a=");
+    __boot_serial_force_puthex64(a);
+    __boot_serial_force_puts(" b=");
+    __boot_serial_force_puthex64(b);
+    __boot_serial_force_puts(" rc=");
+    c3_force_rc(rc);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(path?path:"");
+    __boot_serial_force_puts("\n");
 }
 
 static void c3_trace_firefox_read_sample(const char *path,int fd,uint64_t off,size_t count,size_t got,const void *buf){
@@ -2834,6 +5719,184 @@ static bool c3_kvfs_symlink_target(const char *path,const char **target,size_t *
     return true;
 }
 
+static bool c3_kvfs_is_symlink(const char *path){
+    const char *target=0;
+    size_t target_len=0;
+    return c3_kvfs_symlink_target(path,&target,&target_len);
+}
+
+static int c3_symlink_target_to_abs(const char *link_path,const char *target,size_t target_len,
+                                    char *out,size_t cap){
+    char target_buf[VFS_PATH_MAX];
+    char dir[VFS_PATH_MAX];
+    char tmp[VFS_PATH_MAX*2];
+    size_t i=0;
+    if(!link_path||!target||!out||cap==0)return -EINVAL;
+    while(i+1<sizeof(target_buf)&&i<target_len&&target[i]){
+        target_buf[i]=target[i];
+        ++i;
+    }
+    target_buf[i]=0;
+    if(!target_buf[0])return -EINVAL;
+    if(target_buf[0]=='/'){
+        c3_path_normalize_abs(target_buf,out,cap);
+        return 0;
+    }
+    c3_path_dirname(link_path,dir,sizeof(dir));
+    c3_path_build(dir,target_buf,tmp,sizeof(tmp));
+    c3_path_normalize_abs(tmp,out,cap);
+    return 0;
+}
+
+static const char *c3_builtin_symlink_target(const char *path){
+    if(!path)return 0;
+    if(c3_strcmp(path,"/sys/dev/char/226:0")==0)return "/sys/devices/pci0000:00/0000:00:02.0/drm/card0";
+    if(c3_strcmp(path,"/sys/dev/char/226:128")==0)return "/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128";
+    if(c3_strcmp(path,"/sys/class/drm/card0")==0)return "/sys/devices/pci0000:00/0000:00:02.0/drm/card0";
+    if(c3_strcmp(path,"/sys/class/drm/renderD128")==0)return "/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128";
+    if(c3_strcmp(path,"/sys/bus/pci/devices/0000:00:02.0")==0)return "/sys/devices/pci0000:00/0000:00:02.0";
+    if(c3_strcmp(path,"/sys/dev/char/226:0/device")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128/device")==0||
+       c3_strcmp(path,"/sys/class/drm/card0/device")==0||
+       c3_strcmp(path,"/sys/class/drm/renderD128/device")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/card0/device")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/device")==0)return "/sys/devices/pci0000:00/0000:00:02.0";
+    if(c3_strcmp(path,"/sys/dev/char/226:0/subsystem")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128/subsystem")==0||
+       c3_strcmp(path,"/sys/class/drm/card0/subsystem")==0||
+       c3_strcmp(path,"/sys/class/drm/renderD128/subsystem")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/card0/subsystem")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128/subsystem")==0)return "/sys/class/drm";
+    if(c3_strcmp(path,"/sys/dev/char/226:0/device/subsystem")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128/device/subsystem")==0||
+       c3_strcmp(path,"/sys/class/drm/card0/device/subsystem")==0||
+       c3_strcmp(path,"/sys/class/drm/renderD128/device/subsystem")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/subsystem")==0)return "/sys/bus/pci";
+    if(c3_strcmp(path,"/sys/dev/char/226:0/device/driver")==0||
+       c3_strcmp(path,"/sys/dev/char/226:128/device/driver")==0||
+       c3_strcmp(path,"/sys/class/drm/card0/device/driver")==0||
+       c3_strcmp(path,"/sys/class/drm/renderD128/device/driver")==0||
+       c3_strcmp(path,"/sys/devices/pci0000:00/0000:00:02.0/driver")==0)return c3_drm_pci_driver_dir();
+    if(c3_strcmp(path,"/sys/class/input/event0")==0)return "/sys/devices/virtual/input/input0/event0";
+    if(c3_strcmp(path,"/sys/class/input/event1")==0)return "/sys/devices/virtual/input/input1/event1";
+    if(c3_strcmp(path,"/sys/class/input/mice")==0)return "/sys/devices/virtual/input/input1";
+    if(c3_strcmp(path,"/sys/class/input/event0/device")==0)return "/sys/devices/virtual/input/input0";
+    if(c3_strcmp(path,"/sys/class/input/event1/device")==0)return "/sys/devices/virtual/input/input1";
+    if(c3_strcmp(path,"/sys/class/input/mice/device")==0)return "/sys/devices/virtual/input/input1";
+    if(c3_strcmp(path,"/sys/class/input/event0/subsystem")==0||
+       c3_strcmp(path,"/sys/class/input/event1/subsystem")==0||
+       c3_strcmp(path,"/sys/class/input/mice/subsystem")==0)return "/sys/bus/input";
+    if(c3_strcmp(path,"/sys/bus/input/devices/input0")==0)return "/sys/devices/virtual/input/input0";
+    if(c3_strcmp(path,"/sys/bus/input/devices/input1")==0)return "/sys/devices/virtual/input/input1";
+    if(c3_strcmp(path,"/sys/bus/input/devices/event0")==0)return "/sys/devices/virtual/input/input0/event0";
+    if(c3_strcmp(path,"/sys/bus/input/devices/event1")==0)return "/sys/devices/virtual/input/input1/event1";
+    if(c3_strcmp(path,"/sys/bus/input/devices/input0/event0/device")==0)return "/sys/devices/virtual/input/input0";
+    if(c3_strcmp(path,"/sys/bus/input/devices/input1/event1/device")==0)return "/sys/devices/virtual/input/input1";
+    if(c3_strcmp(path,"/sys/bus/input/devices/event0/device")==0)return "/sys/devices/virtual/input/input0";
+    if(c3_strcmp(path,"/sys/bus/input/devices/event1/device")==0)return "/sys/devices/virtual/input/input1";
+    if(c3_strcmp(path,"/sys/devices/virtual/input/input0/event0/device")==0)return "/sys/devices/virtual/input/input0";
+    if(c3_strcmp(path,"/sys/devices/virtual/input/input1/event1/device")==0)return "/sys/devices/virtual/input/input1";
+    if(c3_strcmp(path,"/sys/devices/virtual/input/input0/event0/subsystem")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input1/event1/subsystem")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input0/subsystem")==0||
+       c3_strcmp(path,"/sys/devices/virtual/input/input1/subsystem")==0)return "/sys/bus/input";
+    if(c3_strcmp(path,"/sys/devices/virtual/input/subsystem")==0)return "/sys/bus/input";
+    if(c3_strcmp(path,"/sys/devices/virtual/subsystem")==0||
+       c3_strcmp(path,"/sys/devices/subsystem")==0)return "/sys/bus";
+    if(c3_strcmp(path,"/sys/dev/char/13:64")==0)return "/sys/devices/virtual/input/input0/event0";
+    if(c3_strcmp(path,"/sys/dev/char/13:65")==0)return "/sys/devices/virtual/input/input1/event1";
+    if(c3_strcmp(path,"/sys/dev/char/13:64/subsystem")==0||
+       c3_strcmp(path,"/sys/dev/char/13:65/subsystem")==0)return "/sys/bus/input";
+    return 0;
+}
+
+static int64_t c3_stat_builtin_symlink(const char *path,kstat_t *st){
+    const char *target=c3_builtin_symlink_target(path);
+    if(!target)return 0;
+    if(!st)return -EFAULT;
+    c3_memset(st,0,sizeof(*st));
+    st->st_uid=(uint32_t)task_current()->uid;
+    st->st_gid=(uint32_t)task_current()->gid;
+    st->st_nlink=1;
+    st->st_blksize=4096;
+    st->st_mode=0120777;
+    st->st_dev=1;
+    st->st_ino=c3_path_inode(path);
+    st->st_size=(int64_t)c3_strlen(target);
+    st->st_blocks=(st->st_size+511)/512;
+    return 1;
+}
+
+static int c3_resolve_builtin_symlink_path(const char *in,char *out,size_t cap){
+    char cur[VFS_PATH_MAX];
+    int limit=16;
+    if(!in||!out||cap==0)return -EFAULT;
+    c3_strlcpy(cur,in,sizeof(cur));
+    while(limit-- > 0){
+        char prefix[VFS_PATH_MAX];
+        char next[VFS_PATH_MAX];
+        size_t i=1;
+        bool changed=false;
+        prefix[0]='/';
+        prefix[1]=0;
+        if(cur[0]!='/')return -EINVAL;
+        while(cur[i]){
+            size_t pl=c3_strlen(prefix);
+            size_t start=i;
+            const char *target;
+            char target_abs[VFS_PATH_MAX];
+            while(cur[i]&&cur[i]!='/')++i;
+            if(pl>1)c3_append_ch(prefix,&pl,sizeof(prefix),'/');
+            while(start<i)c3_append_ch(prefix,&pl,sizeof(prefix),cur[start++]);
+            target=c3_builtin_symlink_target(prefix);
+            target_abs[0]=0;
+            if(target){
+                c3_strlcpy(target_abs,target,sizeof(target_abs));
+            }else{
+                const char *kv_target=0;
+                size_t kv_target_len=0;
+                if(c3_kvfs_symlink_target(prefix,&kv_target,&kv_target_len)){
+                    int trc=c3_symlink_target_to_abs(prefix,kv_target,kv_target_len,
+                                                     target_abs,sizeof(target_abs));
+                    if(trc<0)return trc;
+                }
+            }
+            if(target_abs[0]){
+                size_t nl=0;
+                next[0]=0;
+                c3_append_str(next,&nl,sizeof(next),target_abs);
+                if(cur[i]){
+                    if(nl==0||next[nl-1]!='/')c3_append_ch(next,&nl,sizeof(next),'/');
+                    c3_append_str(next,&nl,sizeof(next),cur+i+1);
+                }
+                c3_path_normalize_abs(next,cur,sizeof(cur));
+                changed=true;
+                break;
+            }
+            while(cur[i]=='/')++i;
+        }
+        if(!changed){
+            c3_strlcpy(out,cur,cap);
+            return 0;
+        }
+    }
+    return -ELOOP;
+}
+
+static bool c3_kvfs_read_follow(const char *path,const uint8_t **data,uint32_t *size,
+                                char *resolved,size_t resolved_cap){
+    char npath[VFS_PATH_MAX];
+    int rc;
+    if(!path)return false;
+    if(path[0]=='/')c3_path_normalize_abs(path,npath,sizeof(npath));
+    else c3_strlcpy(npath,path,sizeof(npath));
+    rc=c3_resolve_builtin_symlink_path(npath,npath,sizeof(npath));
+    if(rc<0)return false;
+    if(!kvfs_read(npath,data,size))return false;
+    if(resolved&&resolved_cap)c3_strlcpy(resolved,npath,resolved_cap);
+    return true;
+}
+
 int64_t real_sys_open(const char *path, int flags, int mode){
     task_t *cur=task_current();
     char npath[VFS_PATH_MAX];
@@ -2881,12 +5944,63 @@ int64_t real_sys_open(const char *path, int flags, int mode){
         c3_append_ch(hidden,&hl,sizeof(hidden),'-');
         c3_append_u32(hidden,&hl,sizeof(hidden),seq);
         if(!kvfs_write(hidden,""))return -ENOMEM;
+        if(!c3_memfd_track_set(hidden,0))return -ENOMEM;
         c3_path_mode_set(hidden,c3_path_mode_apply_create(mode,0600));
         slot=c3_vfs_open_slot_alloc(hidden);
         if(slot<0)return -EMFILE;
         fd=c3_fd_alloc_for_task(cur,FDKIND_VFSFILE,slot,fl|FDFL_READABLE|FDFL_WRITABLE);
         if(fd<0)return -EMFILE;
         return fd;
+    }
+
+    {
+        uint64_t sparse_size=0;
+        if(c3_memfd_path_get_size(npath,&sparse_size)){
+            int slot,fd;
+            (void)sparse_size;
+            if(flags&O_DIRECTORY)return -ENOTDIR;
+            if((flags&O_CREAT)&&(flags&O_EXCL))return -EEXIST;
+            slot=c3_vfs_open_slot_alloc(npath);
+            if(slot<0)return -EMFILE;
+            fd=c3_fd_alloc_for_task(cur,FDKIND_VFSFILE,slot,fl);
+            if(fd<0)return -EMFILE;
+            if((flags&O_TRUNC)&&(fl&FDFL_WRITABLE))
+                (void)c3_memfd_path_set_size(npath,0);
+            if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&c3_sparse_tmpfs_path(npath)){
+                static uint32_t trace_count;
+                if(trace_count<80u){
+                    ++trace_count;
+                    __boot_serial_force_puts("[wf-shm-open!] #");
+                    __boot_serial_force_putu32(trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" flags=");
+                    __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(npath);
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            return fd;
+        }
+    }
+
+    if((flags&O_NOFOLLOW)&&(c3_builtin_symlink_target(npath)||c3_kvfs_is_symlink(npath))){
+        int slot;
+        int fd;
+        slot=c3_vfs_open_slot_alloc(npath);
+        if(slot<0)return -EMFILE;
+        fd=c3_fd_alloc_for_task(cur,FDKIND_SYMLINK,slot,fl);
+        if(fd<0)return -EMFILE;
+        return fd;
+    }
+
+    {
+        int sr=c3_resolve_builtin_symlink_path(npath,npath,sizeof(npath));
+        if(sr<0)return sr;
     }
 
     if(c3_path_is_dir(npath)){
@@ -2904,8 +6018,9 @@ int64_t real_sys_open(const char *path, int flags, int mode){
     /* Check /dev, /proc, /sys */
     kind=resolve_dev_kind(npath);
     if(kind!=FDKIND_NONE){
+        int dev_ref=c3_dev_ref_from_path(npath,kind);
         if(flags&O_DIRECTORY)return -ENOTDIR;
-        int fd=c3_fd_alloc_for_task(cur,kind,0,fl);
+        int fd=c3_fd_alloc_for_task(cur,kind,dev_ref,fl);
         if(fd<0)return -EMFILE;
         /* For /proc files, generate content now */
         if(kind==FDKIND_PROC){
@@ -2914,10 +6029,12 @@ int64_t real_sys_open(const char *path, int flags, int mode){
             for(i=0;i<PROC_BUF_MAX;++i)if(!g_proc_bufs[i].used){
                 int gen;
                 g_proc_bufs[i].used=true;g_proc_bufs[i].fd=fd;
+                c3_strlcpy(g_proc_bufs[i].path,npath,sizeof(g_proc_bufs[i].path));
                 gen=proc_generate(npath,g_proc_bufs[i].data,(int)PROC_BUF_BYTES);
                 if(gen<0){
                     g_proc_bufs[i].used=false;
                     g_proc_bufs[i].fd=-1;
+                    g_proc_bufs[i].path[0]=0;
                     g_proc_bufs[i].size=0;
                     c3_fd_group_clear_fd(cur,fd);
                     return gen;
@@ -2953,6 +6070,36 @@ int64_t real_sys_open(const char *path, int flags, int mode){
      }
     }
     if(flags&O_DIRECTORY)return -ENOENT;
+    if((flags&O_CREAT)&&c3_sparse_tmpfs_path(npath)){
+        int slot,fd;
+        if(!c3_memfd_track_set(npath,0))return -ENOMEM;
+        c3_path_mode_set(npath,c3_path_mode_apply_create(mode,0600));
+        slot=c3_vfs_open_slot_alloc(npath);
+        if(slot<0)return -EMFILE;
+        fd=c3_fd_alloc_for_task(cur,FDKIND_VFSFILE,slot,fl);
+        if(fd<0)return -EMFILE;
+        c3_inotify_notify_path(npath,C3_IN_CREATE,0);
+        c3_inotify_notify_path(npath,C3_IN_OPEN,0);
+        if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t trace_count;
+            if(trace_count<80u){
+                ++trace_count;
+                __boot_serial_force_puts("[wf-shm-create!] #");
+                __boot_serial_force_putu32(trace_count);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(npath);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return fd;
+    }
     /* O_CREAT */
     if(flags&O_CREAT){
         int slot;
@@ -2971,15 +6118,28 @@ int64_t real_sys_open(const char *path, int flags, int mode){
     return -ENOENT;
 }
 
+static int64_t c3_real_open_trusted_kernel_path(const char *path,int flags,int mode){
+    int64_t rc;
+    ++g_c3_trusted_kernel_path_depth;
+    rc=real_sys_open(path,flags,mode);
+    if(g_c3_trusted_kernel_path_depth)--g_c3_trusted_kernel_path_depth;
+    return rc;
+}
+
 int64_t real_sys_openat(int dirfd,const char *path,int flags,int mode){
     task_t *cur=task_current();
     char npath[VFS_PATH_MAX];
     int64_t rc;
     if(!path)return -EFAULT;
     if(c3_resolve_user_path(cur,dirfd,path,npath,sizeof(npath))<0)return -EINVAL;
-    rc=real_sys_open(npath,flags,mode);
+    rc=c3_real_open_trusted_kernel_path(npath,flags,mode);
     c3_trace_path_rc("openat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)mode);
-    if(g_c3_openat_trace_count<C3_OPENAT_TRACE_MAX){
+    c3_force_wayfire_path_rc("openat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)mode);
+    c3_force_hyprland_gpu_path_rc("openat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)mode);
+    c3_force_hypr_portal_path_rc("openat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)mode);
+    c3_force_qt_path_rc("openat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)mode);
+    c3_force_vulkan_path_rc("openat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)mode);
+    if(c3_syscall_debug_trace_enabled()&&g_c3_openat_trace_count<C3_OPENAT_TRACE_MAX){
         ++g_c3_openat_trace_count;
         __boot_serial_puts("[openat] dirfd=");
         __boot_serial_putu32((uint32_t)dirfd);
@@ -2997,7 +6157,7 @@ int64_t real_sys_openat(int dirfd,const char *path,int flags,int mode){
         __boot_serial_puts("\n");
     }
     c3_trace_firefox_path_rc("openat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)mode);
-    if(cur&&c3_task_is_browser_runtime(cur)){
+    if(cur&&c3_syscall_debug_trace_enabled()&&c3_task_is_browser_runtime(cur)){
         static uint32_t force_open_trace;
         if(force_open_trace<32u){
             ++force_open_trace;
@@ -3068,9 +6228,37 @@ static int64_t c3_close_fd_for_task(task_t *owner,int fd){
     ref=owner->fdt.fds[fd].ref;
     fflags=owner->fdt.fds[fd].flags;
     last_ref=(c3_fd_ref_count(kind,ref)<=1);
+    if(owner&&c3_dbus_debug_trace_enabled()&&kind==FDKIND_SOCKET&&
+       ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used&&g_sockets[ref].domain==1&&
+       (g_sockets[ref].local_port==39030||g_sockets[ref].local_port==39031||
+        g_sockets[ref].remote_port==39030||g_sockets[ref].remote_port==39031)){
+        static uint32_t hypr_close_trace;
+        if(hypr_close_trace<96u){
+            socket_t *s=&g_sockets[ref];
+            ++hypr_close_trace;
+            __boot_serial_force_puts("[hypr-unix-close!] #");
+            __boot_serial_force_putu32(hypr_close_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)owner->pid);
+            c3_force_task_name(owner);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" last=");
+            __boot_serial_force_putu32(last_ref?1u:0u);
+            __boot_serial_force_puts(" peer=");
+            __boot_serial_force_putu32((uint32_t)s->peer);
+            __boot_serial_force_puts(" rx=");
+            __boot_serial_force_putu32(c3_socket_rx_used(ref));
+            __boot_serial_force_puts(" st=");
+            __boot_serial_force_putu32((uint32_t)s->tcp_state);
+            __boot_serial_force_puts("\n");
+        }
+    }
     if(c3_task_is_firefox_ipc_trace(owner)){
         static uint32_t close_trace=0;
-        if(close_trace<220){
+        if(close_trace<32){
             ++close_trace;
             c3_trace_one_fd("[close-fd]",owner,fd);
             __boot_serial_puts("[close-fd] last_ref=");
@@ -3082,7 +6270,7 @@ static int64_t c3_close_fd_for_task(task_t *owner,int fd){
         if(owner->pid>=90&&(fd==6||fd==14||fd==17||fd==18||fd==19||
                             (kind==FDKIND_SOCKET&&(ref==8||ref==9)))){
             static uint32_t content_close_trace=0;
-            if(content_close_trace<96){
+            if(content_close_trace<16){
                 ++content_close_trace;
                 c3_trace_one_fd("[content-close-fd]",owner,fd);
                 __boot_serial_puts("[content-close-fd] last_ref=");
@@ -3093,19 +6281,25 @@ static int64_t c3_close_fd_for_task(task_t *owner,int fd){
             }
         }
     }
-    if(kind==FDKIND_VFSFILE||kind==FDKIND_DIR){
+    if(kind==FDKIND_VFSFILE||kind==FDKIND_DIR||kind==FDKIND_SYMLINK){
         const char *p=c3_vfs_open_slot_path(ref);
         if(p){
             uint32_t m=(kind==FDKIND_DIR)?(C3_IN_CLOSE_NOWRITE|C3_IN_ISDIR):
                 ((fflags&FDFL_WRITABLE)?C3_IN_CLOSE_WRITE:C3_IN_CLOSE_NOWRITE);
             c3_inotify_notify_path(p,m,0);
         }
+    }else if(kind==FDKIND_DEVFB){
+        c3_drm_event_drop_fd_ref(fd,ref,last_ref);
+        drm_file_close(fd);
     }
     if(last_ref){
         if(kind==FDKIND_PROC){
             if(ref>=0&&ref<PROC_BUF_MAX)g_proc_bufs[ref].used=false;
         }else if(kind==FDKIND_SOCKET){
-            if(ref>=0&&ref<SOCK_MAX)sock_close(ref);
+            if(ref>=0&&ref<SOCK_MAX){
+                c3_unix_bound_path_set(ref,0);
+                sock_close(ref);
+            }
         }else if(kind==FDKIND_PIPE_R){
             pipe_close_read(ref);
         }else if(kind==FDKIND_PIPE_W){
@@ -3121,7 +6315,7 @@ static int64_t c3_close_fd_for_task(task_t *owner,int fd){
         }
     }
     c3_fd_group_clear_fd(owner,fd);
-    if(last_ref&&(kind==FDKIND_VFSFILE||kind==FDKIND_DIR))c3_vfs_open_slot_try_free(ref);
+    if(last_ref&&(kind==FDKIND_VFSFILE||kind==FDKIND_DIR||kind==FDKIND_SYMLINK))c3_vfs_open_slot_try_free(ref);
     return 0;
 }
 
@@ -3146,7 +6340,7 @@ int64_t real_sys_close(int fd){
     int64_t rc=c3_close_fd_for_task(cur,fd);
     if(rc<0&&c3_task_is_browser_runtime(cur)){
         static uint32_t browser_close_trace=0;
-        if(browser_close_trace<160){
+        if(browser_close_trace<32){
             ++browser_close_trace;
             __boot_serial_puts("[close-browser-softfail] pid=");
             __boot_serial_putu32((uint32_t)(cur?cur->pid:0));
@@ -3185,7 +6379,7 @@ static int64_t c3_pipe_read_wait(int ref,void *buf,size_t count,int flags){
             }
             if(c3_task_is_browser_runtime(cur)){
                 static uint32_t pipe_read_trace=0;
-                if(pipe_read_trace<64){
+                if(pipe_read_trace<16){
                     size_t left=(size_t)((p->head-p->tail+PIPE_BUF_SIZE)%PIPE_BUF_SIZE);
                     ++pipe_read_trace;
                     __boot_serial_puts("[pipe-read] pid=");
@@ -3204,7 +6398,7 @@ static int64_t c3_pipe_read_wait(int ref,void *buf,size_t count,int flags){
             }
             if(c3_task_is_firefox_ipc_trace(cur)){
                 static uint32_t ff_pipe_read_trace=0;
-                if(ff_pipe_read_trace<220){
+                if(ff_pipe_read_trace<48){
                     size_t left=(size_t)((p->head-p->tail+PIPE_BUF_SIZE)%PIPE_BUF_SIZE);
                     uint64_t b0=0;
                     size_t bi,lim=toread<8?toread:8;
@@ -3231,7 +6425,7 @@ static int64_t c3_pipe_read_wait(int ref,void *buf,size_t count,int flags){
             }
             if(c3_task_is_firefox_ipc_trace(cur)&&ref>=8){
                 static uint32_t content_pipe_read_trace=0;
-                if(content_pipe_read_trace<96){
+                if(content_pipe_read_trace<16){
                     size_t left=(size_t)((p->head-p->tail+PIPE_BUF_SIZE)%PIPE_BUF_SIZE);
                     uint64_t b0=0;
                     size_t bi,lim=toread<8?toread:8;
@@ -3256,6 +6450,7 @@ static int64_t c3_pipe_read_wait(int ref,void *buf,size_t count,int flags){
                     __boot_serial_puts("\n");
                 }
             }
+            c3_wake_fd_waiters(FDKIND_PIPE_W,ref,"pipe-read");
             return(int64_t)toread;
         }
         if(p->writers<=0)return 0;
@@ -3298,7 +6493,7 @@ static int64_t c3_pipe_write_wait(int ref,const void *buf,size_t count,int flags
             }
             if(c3_task_is_browser_runtime(cur)){
                 static uint32_t pipe_write_trace=0;
-                if(pipe_write_trace<64){
+                if(pipe_write_trace<16){
                     size_t used=(size_t)((p->head-p->tail+PIPE_BUF_SIZE)%PIPE_BUF_SIZE);
                     ++pipe_write_trace;
                     __boot_serial_puts("[pipe-write] pid=");
@@ -3317,7 +6512,7 @@ static int64_t c3_pipe_write_wait(int ref,const void *buf,size_t count,int flags
             }
             if(c3_task_is_firefox_ipc_trace(cur)){
                 static uint32_t ff_pipe_write_trace=0;
-                if(ff_pipe_write_trace<220){
+                if(ff_pipe_write_trace<48){
                     size_t used=(size_t)((p->head-p->tail+PIPE_BUF_SIZE)%PIPE_BUF_SIZE);
                     uint64_t b0=0;
                     size_t bi,lim=towrite<8?towrite:8;
@@ -3344,7 +6539,7 @@ static int64_t c3_pipe_write_wait(int ref,const void *buf,size_t count,int flags
             }
             if(c3_task_is_firefox_ipc_trace(cur)&&ref>=8){
                 static uint32_t content_pipe_write_trace=0;
-                if(content_pipe_write_trace<96){
+                if(content_pipe_write_trace<16){
                     size_t used=(size_t)((p->head-p->tail+PIPE_BUF_SIZE)%PIPE_BUF_SIZE);
                     uint64_t b0=0;
                     size_t bi,lim=towrite<8?towrite:8;
@@ -3369,6 +6564,7 @@ static int64_t c3_pipe_write_wait(int ref,const void *buf,size_t count,int flags
                     __boot_serial_puts("\n");
                 }
             }
+            c3_wake_fd_waiters(FDKIND_PIPE_R,ref,"pipe-write");
             return(int64_t)towrite;
         }
         if(flags&C3_MSG_DONTWAIT)return -EAGAIN;
@@ -3396,13 +6592,138 @@ int64_t real_sys_read(int fd,void *buf,size_t count){
         case FDKIND_DEVNULL: return 0;
         case FDKIND_DEVZERO: return dev_zero_read(buf,count);
         case FDKIND_DEVRANDOM: return dev_random_read(buf,count);
+        case FDKIND_DEVFUSE: {
+            static uint32_t fuse_read_trace;
+            struct c3_fuse_init_packet {
+                uint32_t len;
+                uint32_t opcode;
+                uint64_t unique;
+                uint64_t nodeid;
+                uint32_t uid;
+                uint32_t gid;
+                uint32_t pid;
+                uint32_t padding;
+                uint32_t major;
+                uint32_t minor;
+                uint32_t max_readahead;
+                uint32_t flags;
+            } pkt;
+            if(cur->fdt.fds[fd].offset!=0){
+                for(;;){
+                    if(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)return -EAGAIN;
+                    if(c3_task_has_unblocked_signal(cur))return -EINTR;
+                    /*
+                     * After FUSE_INIT Ridux does not yet enqueue real FUSE
+                     * requests. A blocking read must therefore sleep until a
+                     * signal/future request, not wake every millisecond and
+                     * burn the compositor's CPU budget.
+                     */
+                    c3_futex_wait_schedule(cur,0);
+                }
+            }
+            if(count<sizeof(pkt))return -EINVAL;
+            c3_memset(&pkt,0,sizeof(pkt));
+            pkt.len=(uint32_t)sizeof(pkt);
+            pkt.opcode=26; /* FUSE_INIT */
+            pkt.unique=1;
+            pkt.uid=(uint32_t)(cur?cur->euid:0);
+            pkt.gid=(uint32_t)(cur?cur->egid:0);
+            pkt.pid=(uint32_t)(cur?cur->pid:0);
+            pkt.major=7;
+            pkt.minor=31;
+            pkt.max_readahead=0;
+            pkt.flags=0x00000029u; /* ASYNC_READ | ATOMIC_O_TRUNC | BIG_WRITES */
+            if(c3_user_copy_out(cur,buf,&pkt,sizeof(pkt),"fuse-read")<0)return -EFAULT;
+            cur->fdt.fds[fd].offset=1;
+            c3_fd_group_copy_fd(cur,fd);
+            if(fuse_read_trace<16u){
+                ++fuse_read_trace;
+                __boot_serial_puts("[fuse-read-init] pid=");
+                __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
+                c3_trace_task_name(cur);
+                __boot_serial_puts(" fd=");
+                __boot_serial_putu32((uint32_t)fd);
+                __boot_serial_puts(" flags=");
+                __boot_serial_puthex64((uint64_t)pkt.flags);
+                __boot_serial_puts("\n");
+            }
+            return (int64_t)sizeof(pkt);
+        }
         case FDKIND_DEVTTY: return tty_read(&g_tty0,buf,count);
         case FDKIND_SOCKET: {
             int fl=(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)?C3_MSG_DONTWAIT:0;
             int ref=cur->fdt.fds[fd].ref;
             uint32_t rx_before=c3_socket_rx_used(ref);
+            if(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used&&g_sockets[ref].domain==16){
+                int64_t nr=c3_netlink_recv_user(cur,ref,buf,count,fl);
+                if(cur&&c3_dbus_debug_trace_enabled()){
+                    static uint32_t trace_count;
+                    if(trace_count<96u){
+                        ++trace_count;
+                        __boot_serial_force_puts("[netlink-read] #");
+                        __boot_serial_force_putu32(trace_count);
+                        __boot_serial_force_puts(" pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        c3_force_task_name(cur);
+                        __boot_serial_force_puts(" fd=");
+                        __boot_serial_force_putu32((uint32_t)fd);
+                        __boot_serial_force_puts(" ref=");
+                        __boot_serial_force_putu32((uint32_t)ref);
+                        __boot_serial_force_puts(" count=");
+                        __boot_serial_force_puthex64((uint64_t)count);
+                        __boot_serial_force_puts(" ret=");
+                        c3_force_rc(nr);
+                        __boot_serial_force_puts(" rx_before=");
+                        __boot_serial_force_putu32(rx_before);
+                        __boot_serial_force_puts(" rx_after=");
+                        __boot_serial_force_putu32(c3_socket_rx_used(ref));
+                        __boot_serial_force_puts("\n");
+                    }
+                }
+                return nr;
+            }
             int64_t r=c3_socket_recv_wait(ref,buf,count,fl);
-            if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_virtual_service(ref)==SOCK_VIRT_NONE){
+            if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+                static uint32_t wf_sock_read_trace;
+                if(wf_sock_read_trace<160u){
+                    socket_t *s=(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)?&g_sockets[ref]:0;
+                    uint64_t b0=0;
+                    size_t bi,lim=(r>0&&(size_t)r<8)?(size_t)r:8;
+                    const uint8_t *rb=(const uint8_t*)buf;
+                    if(r<=0)lim=0;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)rb[bi])<<(bi*8);
+                    ++wf_sock_read_trace;
+                    __boot_serial_force_puts("[wf-sock-read!] #");
+                    __boot_serial_force_putu32(wf_sock_read_trace);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" ref=");
+                    __boot_serial_force_putu32((uint32_t)ref);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    c3_force_rc(r);
+                    __boot_serial_force_puts(" rx_before=");
+                    __boot_serial_force_putu32(rx_before);
+                    if(s){
+                        __boot_serial_force_puts(" rx_after=");
+                        __boot_serial_force_putu32(c3_socket_rx_used(ref));
+                        __boot_serial_force_puts(" peer=");
+                        __boot_serial_force_putu32((uint32_t)s->peer);
+                        __boot_serial_force_puts(" svc=");
+                        __boot_serial_force_putu32((uint32_t)s->virt_service);
+                        __boot_serial_force_puts(" st=");
+                        __boot_serial_force_putu32((uint32_t)s->tcp_state);
+                    }
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(ref)){
                 static uint32_t ff_sock_read_trace=0;
                 if(ff_sock_read_trace<180){
                     socket_t *s=(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)?&g_sockets[ref]:0;
@@ -3447,11 +6768,60 @@ int64_t real_sys_read(int fd,void *buf,size_t count){
             if(ref>=0&&ref<PROC_BUF_MAX&&g_proc_bufs[ref].used){
                 uint64_t off=cur->fdt.fds[fd].offset;
                 uint32_t avail=g_proc_bufs[ref].size;
-                if(off>=avail)return 0;
+                const char *ppath=g_proc_bufs[ref].path;
+                if(off>=avail){
+                    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&ppath&&c3_starts_with(ppath,"/sys/")&&g_c3_wayfire_proc_read_trace_count<240u){
+                        ++g_c3_wayfire_proc_read_trace_count;
+                        __boot_serial_force_puts("[wf-proc-read!] #");
+                        __boot_serial_force_putu32(g_c3_wayfire_proc_read_trace_count);
+                        __boot_serial_force_puts(" pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        c3_force_task_name(cur);
+                        __boot_serial_force_puts(" fd=");
+                        __boot_serial_force_putu32((uint32_t)fd);
+                        __boot_serial_force_puts(" off=");
+                        __boot_serial_force_puthex64(off);
+                        __boot_serial_force_puts(" count=");
+                        __boot_serial_force_puthex64((uint64_t)count);
+                        __boot_serial_force_puts(" ret=0 size=");
+                        __boot_serial_force_putu32(avail);
+                        __boot_serial_force_puts(" path=");
+                        __boot_serial_force_puts(ppath);
+                        __boot_serial_force_puts("\n");
+                    }
+                    return 0;
+                }
                 size_t toread=count;if(toread>avail-off)toread=avail-(size_t)off;
-                c3_memcpy(buf,g_proc_bufs[ref].data+off,toread);
+                if(c3_user_copy_out(cur,buf,g_proc_bufs[ref].data+off,toread,"read-proc")<0)
+                    return -EFAULT;
                 cur->fdt.fds[fd].offset+=toread;
                 c3_fd_group_copy_fd(cur,fd);
+                if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&ppath&&c3_starts_with(ppath,"/sys/")&&g_c3_wayfire_proc_read_trace_count<240u){
+                    uint64_t b0=0;
+                    size_t bi,lim=toread<8?toread:8;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)(uint8_t)g_proc_bufs[ref].data[off+bi])<<(bi*8);
+                    ++g_c3_wayfire_proc_read_trace_count;
+                    __boot_serial_force_puts("[wf-proc-read!] #");
+                    __boot_serial_force_putu32(g_c3_wayfire_proc_read_trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64(off);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    __boot_serial_force_puthex64((uint64_t)toread);
+                    __boot_serial_force_puts(" size=");
+                    __boot_serial_force_putu32(avail);
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(ppath);
+                    __boot_serial_force_puts("\n");
+                }
                 return(int64_t)toread;
             }
             return 0;
@@ -3464,8 +6834,12 @@ int64_t real_sys_read(int fd,void *buf,size_t count){
             uint64_t memfd_size=0;
             if(!vpath)return -EBADF;
             if(c3_memfd_path_get_size(vpath,&memfd_size)){
+                size_t want=count;
+                if(want>C3_VFS_FILE_MAX)want=C3_VFS_FILE_MAX;
                 off=cur->fdt.fds[fd].offset;
-                toread=c3_memfd_sparse_read(vpath,off,buf,count);
+                toread=c3_memfd_sparse_read(vpath,off,g_c3_vfs_file_scratch,want);
+                if(c3_user_copy_out(cur,buf,g_c3_vfs_file_scratch,toread,"read-memfd")<0)
+                    return -EFAULT;
                 cur->fdt.fds[fd].offset+=toread;
                 c3_fd_group_copy_fd(cur,fd);
                 return(int64_t)toread;
@@ -3475,8 +6849,9 @@ int64_t real_sys_read(int fd,void *buf,size_t count){
             if(off>=size)return 0;
             toread=count;
             if(toread>(size_t)(size-off))toread=(size_t)(size-off);
-            c3_memcpy(buf,data+off,toread);
-            if(g_c3_libxi_read_trace_count<8&&vpath&&c3_has_token(vpath,"libXi.so.6")){
+            if(c3_user_copy_out(cur,buf,data+off,toread,"read-vfs")<0)
+                return -EFAULT;
+            if(c3_wayfire_debug_trace_enabled()&&g_c3_libxi_read_trace_count<8&&vpath&&c3_has_token(vpath,"libXi.so.6")){
                 uint64_t src8=0,dst8=0;
                 size_t bi,lim=toread<8?toread:8;
                 for(bi=0;bi<lim;++bi){
@@ -3504,13 +6879,59 @@ int64_t real_sys_read(int fd,void *buf,size_t count){
             cur->fdt.fds[fd].offset+=toread;
             c3_fd_group_copy_fd(cur,fd);
             c3_inotify_notify_path(vpath,C3_IN_ACCESS,0);
+            if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(vpath,C3_DELETED_PREFIX)){
+                static uint32_t trace_count=0;
+                if(trace_count<64u){
+                    uint64_t b0=0;
+                    size_t bi,lim=toread<8?toread:8;
+                    const uint8_t *rb=(const uint8_t*)buf;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)rb[bi])<<(bi*8);
+                    ++trace_count;
+                    __boot_serial_force_puts("[wf-read-deleted!] #");
+                    __boot_serial_force_putu32(trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64(off);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    __boot_serial_force_puthex64((uint64_t)toread);
+                    __boot_serial_force_puts(" size=");
+                    __boot_serial_force_puthex64((uint64_t)size);
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(vpath);
+                    __boot_serial_force_puts("\n");
+                }
+            }
             return(int64_t)toread;
         }
         case FDKIND_PIPE_R: {
             int fl=(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)?C3_MSG_DONTWAIT:0;
             return c3_pipe_read_wait(cur->fdt.fds[fd].ref,buf,count,fl);
         }
-        case FDKIND_DEVFB: return dev_fb_read(buf,count,cur->fdt.fds[fd].offset);
+        case FDKIND_DEVINPUT:
+            return c3_devinput_read(cur,cur->fdt.fds[fd].ref,buf,count,
+                (cur->fdt.fds[fd].flags&FDFL_NONBLOCK)!=0);
+        case FDKIND_DEVSND:
+            return c3_snd_read(cur->fdt.fds[fd].ref,buf,count,
+                (cur->fdt.fds[fd].flags&FDFL_NONBLOCK)!=0);
+        case FDKIND_DEVFB:
+            if(cur->fdt.fds[fd].ref==1||cur->fdt.fds[fd].ref==2){
+                for(;;){
+                    int64_t er=c3_drm_event_read(cur,fd,buf,count);
+                    if(er!=-EAGAIN)return er;
+                    if(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)return -EAGAIN;
+                    if(c3_task_has_unblocked_signal(cur))return -EINTR;
+                    c3_poll_wait_slice(cur,0);
+                }
+            }
+            return dev_fb_read(buf,count,cur->fdt.fds[fd].offset);
         case FDKIND_EVENTFD: {
             int fl=(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)?C3_MSG_DONTWAIT:0;
             return c3_eventfd_read(cur->fdt.fds[fd].ref,buf,count,fl);
@@ -3538,15 +6959,135 @@ int64_t real_sys_read(int fd,void *buf,size_t count){
 
 int64_t real_sys_write(int fd,const void *buf,size_t count){
     task_t *cur=task_current();
+    uint8_t kind;
+    bool trace_wayfire_stdio;
+    bool trace_waybar_stdio;
+    bool trace_portal_stdio;
     if(!fd_valid(&cur->fdt,fd))return -EBADF;
     if(!buf)return -EFAULT;
-    switch(cur->fdt.fds[fd].kind){
+    kind=cur->fdt.fds[fd].kind;
+    trace_wayfire_stdio=(fd==1||fd==2)&&cur&&c3_task_is_wayfire_runtime(cur)&&
+        (c3_wayfire_debug_trace_enabled()?
+             (c3_wayfire_stdio_interesting(buf,count)||c3_desktop_stdio_verbose(cur)):
+             (fd==2&&c3_desktop_stdio_error_interesting(buf,count)));
+    trace_waybar_stdio=(fd==1||fd==2)&&cur&&c3_wayfire_debug_trace_enabled()&&
+        (c3_has_token(c3_task_exec_path(cur),"waybar")||
+         c3_has_token(cur->name,"waybar"));
+    trace_portal_stdio=(fd==1||fd==2)&&cur&&c3_dbus_debug_trace_enabled()&&
+        (c3_has_token(c3_task_exec_path(cur),"xdg-desktop-portal")||
+         c3_has_token(cur->name,"xdg-desktop-portal"));
+    if(trace_waybar_stdio){
+        static uint32_t waybar_stdio_trace_count=0;
+        if(waybar_stdio_trace_count<96u){
+            const char *p=(const char*)buf;
+            size_t j,lim=count;
+            ++waybar_stdio_trace_count;
+            if(lim>420)lim=420;
+            __boot_serial_force_puts("[waybar-stdio] #");
+            __boot_serial_force_putu32(waybar_stdio_trace_count);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" n=");
+            __boot_serial_force_putu32((uint32_t)count);
+            __boot_serial_force_puts(" text=");
+            for(j=0;j<lim;++j){
+                char ch=p[j];
+                if(ch==0)break;
+                if((ch>=' '&&ch<='~')||ch=='\n'||ch=='\r'||ch=='\t')__boot_serial_force_putc(ch);
+                else __boot_serial_force_putc('.');
+            }
+            if(count>lim)__boot_serial_force_puts("...");
+            if(lim==0||p[lim-1]!='\n')__boot_serial_force_putc('\n');
+        }
+    }
+    if(trace_portal_stdio){
+        static uint32_t portal_stdio_trace_count=0;
+        if(portal_stdio_trace_count<160u){
+            const char *p=(const char*)buf;
+            size_t j,lim=count;
+            ++portal_stdio_trace_count;
+            if(lim>520)lim=520;
+            __boot_serial_force_puts("[portal-stdio] #");
+            __boot_serial_force_putu32(portal_stdio_trace_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" n=");
+            __boot_serial_force_putu32((uint32_t)count);
+            __boot_serial_force_puts(" text=");
+            for(j=0;j<lim;++j){
+                char ch=p[j];
+                if(ch==0)break;
+                if((ch>=' '&&ch<='~')||ch=='\n'||ch=='\r'||ch=='\t')__boot_serial_force_putc(ch);
+                else __boot_serial_force_putc('.');
+            }
+            if(count>lim)__boot_serial_force_puts("...");
+            if(lim==0||p[lim-1]!='\n')__boot_serial_force_putc('\n');
+        }
+    }
+    if(trace_wayfire_stdio){
+        static uint32_t wayfire_stdio_trace_count=0;
+        if(wayfire_stdio_trace_count<160u){
+            const char *p=(const char*)buf;
+            size_t j,lim=count;
+            ++wayfire_stdio_trace_count;
+            if(lim>520)lim=520;
+            __boot_serial_force_puts("[wayfire-stdio!] #");
+            __boot_serial_force_putu32(wayfire_stdio_trace_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" kind=");
+            __boot_serial_force_putu32((uint32_t)kind);
+            __boot_serial_force_puts(" n=");
+            __boot_serial_force_putu32((uint32_t)count);
+            __boot_serial_force_puts(" text=");
+            for(j=0;j<lim;++j){
+                char ch=p[j];
+                if(ch==0)break;
+                if((ch>=' '&&ch<='~')||ch=='\n'||ch=='\r'||ch=='\t')__boot_serial_force_putc(ch);
+                else __boot_serial_force_putc('.');
+            }
+            if(count>lim)__boot_serial_force_puts("...");
+            if(lim==0||p[lim-1]!='\n')__boot_serial_force_putc('\n');
+        }
+    }
+    if(cur&&c3_task_is_wayfire_runtime(cur)&&
+       c3_mem_has_token((const char*)buf,count,"ridux-visible-shell: painted"))
+        c3_wayfire_trace_visible_shell_memfd("painted");
+    switch(kind){
         case FDKIND_DEVNULL: return(int64_t)count;
         case FDKIND_DEVTTY: {
             int r=tty_write(&g_tty0,buf,count);
             static uint32_t browser_tty_trace_count=0;
+            static uint32_t wayfire_tty_trace_count=0;
             static uint32_t stderr_trace_count=0;
             static uint32_t abort_stack_trace_count=0;
+            if(trace_wayfire_stdio&&wayfire_tty_trace_count<96){
+                const char *p=(const char*)buf;
+                size_t j,lim=count;
+                ++wayfire_tty_trace_count;
+                if(lim>360)lim=360;
+                __boot_serial_force_puts("[wayfire-tty!] #");
+                __boot_serial_force_putu32(wayfire_tty_trace_count);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" n=");
+                __boot_serial_force_putu32((uint32_t)count);
+                __boot_serial_force_puts(" text=");
+                for(j=0;j<lim;++j){
+                    char ch=p[j];
+                    if(ch==0)break;
+                    if((ch>=' '&&ch<='~')||ch=='\n'||ch=='\r'||ch=='\t')__boot_serial_force_putc(ch);
+                    else __boot_serial_force_putc('.');
+                }
+                if(count>lim)__boot_serial_force_puts("...");
+                if(lim==0||p[lim-1]!='\n')__boot_serial_force_putc('\n');
+            }
             if(fd==2&&c3_task_is_browser_runtime(cur)&&browser_tty_trace_count<24){
                 const char *p=(const char*)buf;
                 size_t j,lim=count;
@@ -3616,8 +7157,75 @@ int64_t real_sys_write(int fd,const void *buf,size_t count){
         }
         case FDKIND_SOCKET: {
             int ref=cur->fdt.fds[fd].ref;
+            if(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used&&g_sockets[ref].domain==16){
+                iovec_t niov;
+                int64_t nr;
+                niov.iov_base=(void*)buf;
+                niov.iov_len=count;
+                nr=c3_netlink_sendmsg(cur,fd,ref,&niov,1,0);
+                if(cur&&c3_dbus_debug_trace_enabled()){
+                    static uint32_t trace_count;
+                    if(trace_count<96u){
+                        ++trace_count;
+                        __boot_serial_force_puts("[netlink-write] #");
+                        __boot_serial_force_putu32(trace_count);
+                        __boot_serial_force_puts(" pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        c3_force_task_name(cur);
+                        __boot_serial_force_puts(" fd=");
+                        __boot_serial_force_putu32((uint32_t)fd);
+                        __boot_serial_force_puts(" ref=");
+                        __boot_serial_force_putu32((uint32_t)ref);
+                        __boot_serial_force_puts(" count=");
+                        __boot_serial_force_puthex64((uint64_t)count);
+                        __boot_serial_force_puts(" ret=");
+                        c3_force_rc(nr);
+                        __boot_serial_force_puts(" rx=");
+                        __boot_serial_force_putu32(c3_socket_rx_used(ref));
+                        __boot_serial_force_puts("\n");
+                    }
+                }
+                return nr;
+            }
             int64_t r=(int64_t)sock_send(ref,buf,count,0);
-            if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_virtual_service(ref)==SOCK_VIRT_NONE){
+            if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+                static uint32_t wf_sock_write_trace;
+                if(wf_sock_write_trace<160u){
+                    socket_t *s=(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)?&g_sockets[ref]:0;
+                    uint64_t b0=0;
+                    size_t bi,lim=count<8?count:8;
+                    const uint8_t *wb=(const uint8_t*)buf;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)wb[bi])<<(bi*8);
+                    ++wf_sock_write_trace;
+                    __boot_serial_force_puts("[wf-sock-write!] #");
+                    __boot_serial_force_putu32(wf_sock_write_trace);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" ref=");
+                    __boot_serial_force_putu32((uint32_t)ref);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    c3_force_rc(r);
+                    if(s){
+                        __boot_serial_force_puts(" peer=");
+                        __boot_serial_force_putu32((uint32_t)s->peer);
+                        __boot_serial_force_puts(" rx=");
+                        __boot_serial_force_putu32(c3_socket_rx_used(ref));
+                        __boot_serial_force_puts(" peer_rx=");
+                        __boot_serial_force_putu32(c3_socket_rx_used(s->peer));
+                        __boot_serial_force_puts(" st=");
+                        __boot_serial_force_putu32((uint32_t)s->tcp_state);
+                    }
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(ref)){
                 static uint32_t ff_sock_write_trace=0;
                 if(ff_sock_write_trace<180){
                     socket_t *s=(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)?&g_sockets[ref]:0;
@@ -3655,11 +7263,33 @@ int64_t real_sys_write(int fd,const void *buf,size_t count){
             int fl=(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)?C3_MSG_DONTWAIT:0;
             return c3_pipe_write_wait(cur->fdt.fds[fd].ref,buf,count,fl);
         }
+        case FDKIND_DEVSND:
+            return c3_snd_write(cur->fdt.fds[fd].ref,buf,count);
+        case FDKIND_DEVINPUT:
+            return -EINVAL;
+        case FDKIND_DEVFUSE:
+            {
+                static uint32_t fuse_write_trace;
+                if(fuse_write_trace<16u){
+                    ++fuse_write_trace;
+                    __boot_serial_puts("[fuse-write] pid=");
+                    __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
+                    c3_trace_task_name(cur);
+                    __boot_serial_puts(" fd=");
+                    __boot_serial_putu32((uint32_t)fd);
+                    __boot_serial_puts(" count=");
+                    __boot_serial_puthex64((uint64_t)count);
+                    __boot_serial_puts("\n");
+                }
+            }
+            cur->fdt.fds[fd].offset=2;
+            c3_fd_group_copy_fd(cur,fd);
+            return (int64_t)count;
         case FDKIND_DEVFB: return dev_fb_write(buf,count,cur->fdt.fds[fd].offset);
         case FDKIND_DEVZERO: return(int64_t)count;
         case FDKIND_EVENTFD: {
             static uint32_t eventfd_write_fd_trace=0;
-            if(eventfd_write_fd_trace<48){
+            if(c3_wayfire_debug_trace_enabled()&&eventfd_write_fd_trace<48){
                 ++eventfd_write_fd_trace;
                 __boot_serial_puts("[eventfd-write-fd] pid=");
                 __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
@@ -3685,6 +7315,10 @@ int64_t real_sys_write(int fd,const void *buf,size_t count){
             uint8_t *out=g_c3_vfs_file_scratch;
             size_t base=0,avail,count_in,count_write,i;
             uint64_t memfd_size=0;
+            bool mirror_hypr_log=cur&&c3_task_is_wayfire_runtime(cur)&&vpath&&
+                c3_has_token(vpath,"hyprland.log")&&
+                (c3_wayfire_debug_trace_enabled()||
+                 c3_hyprland_log_trace_enabled());
             if(!vpath)return -EBADF;
             if(!(cur->fdt.fds[fd].flags&FDFL_WRITABLE))return -EBADF;
             if(c3_memfd_path_get_size(vpath,&memfd_size)){
@@ -3721,6 +7355,66 @@ int64_t real_sys_write(int fd,const void *buf,size_t count){
             c3_inotify_notify_path(vpath,C3_IN_MODIFY,0);
             cur->fdt.fds[fd].offset=(uint64_t)(base+count_write);
             c3_fd_group_copy_fd(cur,fd);
+            if(mirror_hypr_log){
+                static uint32_t hypr_log_trace_count;
+                if(hypr_log_trace_count<256u){
+                    size_t j,lim=count_write;
+                    ++hypr_log_trace_count;
+                    if(lim>8192)lim=8192;
+                    __boot_serial_force_puts("[hypr-log!] #");
+                    __boot_serial_force_putu32(hypr_log_trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64((uint64_t)base);
+                    __boot_serial_force_puts(" n=");
+                    __boot_serial_force_putu32((uint32_t)count_write);
+                    __boot_serial_force_puts(" text=");
+                    for(j=0;j<lim;++j){
+                        char ch=((const char*)buf)[j];
+                        if(ch==0)break;
+                        if((ch>=' '&&ch<='~')||ch=='\n'||ch=='\r'||ch=='\t')
+                            __boot_serial_force_putc(ch);
+                        else
+                            __boot_serial_force_putc('.');
+                    }
+                    if(count_write>lim)__boot_serial_force_puts("...");
+                    if(lim==0||((const char*)buf)[lim-1]!='\n')
+                        __boot_serial_force_putc('\n');
+                }
+            }
+            if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(vpath,C3_DELETED_PREFIX)){
+                static uint32_t trace_count=0;
+                if(trace_count<96u){
+                    uint64_t b0=0;
+                    size_t bi,lim=count_write<8?count_write:8;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)((const uint8_t*)buf)[bi])<<(bi*8);
+                    ++trace_count;
+                    __boot_serial_force_puts("[wf-write-deleted!] #");
+                    __boot_serial_force_putu32(trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64((uint64_t)base);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    __boot_serial_force_puthex64((uint64_t)count_write);
+                    __boot_serial_force_puts(" size=");
+                    __boot_serial_force_puthex64((uint64_t)(base+count_write));
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(vpath);
+                    __boot_serial_force_puts("\n");
+                }
+            }
             return(int64_t)count_write;
         }
         default: return -EINVAL;
@@ -3738,14 +7432,69 @@ int64_t real_sys_pread64(int fd,void *buf,size_t count,int64_t offset){
         case FDKIND_DEVNULL: return 0;
         case FDKIND_DEVZERO: return dev_zero_read(buf,count);
         case FDKIND_DEVRANDOM: return dev_random_read(buf,count);
+        case FDKIND_DEVINPUT:
+            return c3_devinput_read(cur,cur->fdt.fds[fd].ref,buf,count,
+                (cur->fdt.fds[fd].flags&FDFL_NONBLOCK)!=0);
+        case FDKIND_DEVSND:
+            return c3_snd_read(cur->fdt.fds[fd].ref,buf,count,
+                (cur->fdt.fds[fd].flags&FDFL_NONBLOCK)!=0);
         case FDKIND_PROC: {
             int ref=cur->fdt.fds[fd].ref;
             if(ref>=0&&ref<PROC_BUF_MAX&&g_proc_bufs[ref].used){
                 uint32_t avail=g_proc_bufs[ref].size;
                 size_t toread=count;
-                if(off>=avail)return 0;
+                const char *ppath=g_proc_bufs[ref].path;
+                if(off>=avail){
+                    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&ppath&&c3_starts_with(ppath,"/sys/")&&g_c3_wayfire_proc_read_trace_count<240u){
+                        ++g_c3_wayfire_proc_read_trace_count;
+                        __boot_serial_force_puts("[wf-proc-pread!] #");
+                        __boot_serial_force_putu32(g_c3_wayfire_proc_read_trace_count);
+                        __boot_serial_force_puts(" pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        c3_force_task_name(cur);
+                        __boot_serial_force_puts(" fd=");
+                        __boot_serial_force_putu32((uint32_t)fd);
+                        __boot_serial_force_puts(" off=");
+                        __boot_serial_force_puthex64(off);
+                        __boot_serial_force_puts(" count=");
+                        __boot_serial_force_puthex64((uint64_t)count);
+                        __boot_serial_force_puts(" ret=0 size=");
+                        __boot_serial_force_putu32(avail);
+                        __boot_serial_force_puts(" path=");
+                        __boot_serial_force_puts(ppath);
+                        __boot_serial_force_puts("\n");
+                    }
+                    return 0;
+                }
                 if(toread>(size_t)(avail-off))toread=(size_t)(avail-off);
-                c3_memcpy(buf,g_proc_bufs[ref].data+off,toread);
+                if(c3_user_copy_out(cur,buf,g_proc_bufs[ref].data+off,toread,"pread-proc")<0)
+                    return -EFAULT;
+                if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&ppath&&c3_starts_with(ppath,"/sys/")&&g_c3_wayfire_proc_read_trace_count<240u){
+                    uint64_t b0=0;
+                    size_t bi,lim=toread<8?toread:8;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)(uint8_t)g_proc_bufs[ref].data[off+bi])<<(bi*8);
+                    ++g_c3_wayfire_proc_read_trace_count;
+                    __boot_serial_force_puts("[wf-proc-pread!] #");
+                    __boot_serial_force_putu32(g_c3_wayfire_proc_read_trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64(off);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    __boot_serial_force_puthex64((uint64_t)toread);
+                    __boot_serial_force_puts(" size=");
+                    __boot_serial_force_putu32(avail);
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(ppath);
+                    __boot_serial_force_puts("\n");
+                }
                 return(int64_t)toread;
             }
             return 0;
@@ -3758,16 +7507,50 @@ int64_t real_sys_pread64(int fd,void *buf,size_t count,int64_t offset){
             uint64_t memfd_size=0;
             if(!vpath)return -EBADF;
             if(c3_memfd_path_get_size(vpath,&memfd_size)){
-                toread=c3_memfd_sparse_read(vpath,off,buf,count);
-                c3_trace_firefox_read_sample(vpath,fd,off,count,toread,buf);
+                size_t want=count;
+                if(want>C3_VFS_FILE_MAX)want=C3_VFS_FILE_MAX;
+                toread=c3_memfd_sparse_read(vpath,off,g_c3_vfs_file_scratch,want);
+                if(c3_user_copy_out(cur,buf,g_c3_vfs_file_scratch,toread,"pread-memfd")<0)
+                    return -EFAULT;
+                c3_trace_firefox_read_sample(vpath,fd,off,count,toread,g_c3_vfs_file_scratch);
                 return(int64_t)toread;
             }
             if(!kvfs_read(vpath,&data,&size))return -ENOENT;
             if(off>=size)return 0;
             if(toread>(size_t)(size-off))toread=(size_t)(size-off);
-            c3_memcpy(buf,data+off,toread);
-            c3_trace_firefox_read_sample(vpath,fd,off,count,toread,buf);
+            if(c3_user_copy_out(cur,buf,data+off,toread,"pread-vfs")<0)
+                return -EFAULT;
+            c3_trace_firefox_read_sample(vpath,fd,off,count,toread,data+off);
             c3_inotify_notify_path(vpath,C3_IN_ACCESS,0);
+            if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(vpath,C3_DELETED_PREFIX)){
+                static uint32_t trace_count=0;
+                if(trace_count<64u){
+                    uint64_t b0=0;
+                    size_t bi,lim=toread<8?toread:8;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)(data+off)[bi])<<(bi*8);
+                    ++trace_count;
+                    __boot_serial_force_puts("[wf-pread-deleted!] #");
+                    __boot_serial_force_putu32(trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64(off);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    __boot_serial_force_puthex64((uint64_t)toread);
+                    __boot_serial_force_puts(" size=");
+                    __boot_serial_force_puthex64((uint64_t)size);
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(vpath);
+                    __boot_serial_force_puts("\n");
+                }
+            }
             return(int64_t)toread;
         }
         case FDKIND_DEVFB: return dev_fb_read(buf,count,off);
@@ -3796,6 +7579,10 @@ int64_t real_sys_pwrite64(int fd,const void *buf,size_t count,int64_t offset){
     switch(cur->fdt.fds[fd].kind){
         case FDKIND_DEVNULL: return(int64_t)count;
         case FDKIND_DEVZERO: return(int64_t)count;
+        case FDKIND_DEVSND:
+            return c3_snd_write(cur->fdt.fds[fd].ref,buf,count);
+        case FDKIND_DEVINPUT:
+            return -EINVAL;
         case FDKIND_DEVFB: return dev_fb_write(buf,count,off);
         case FDKIND_VFSFILE: {
             const char *vpath=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
@@ -3804,6 +7591,10 @@ int64_t real_sys_pwrite64(int fd,const void *buf,size_t count,int64_t offset){
             uint8_t *out=g_c3_vfs_file_scratch;
             size_t base=(size_t)off,avail,count_in,count_write,i;
             uint64_t memfd_size=0;
+            bool mirror_hypr_log=cur&&c3_task_is_wayfire_runtime(cur)&&vpath&&
+                c3_has_token(vpath,"hyprland.log")&&
+                (c3_wayfire_debug_trace_enabled()||
+                 c3_hyprland_log_trace_enabled());
             if(!vpath)return -EBADF;
             if(!(cur->fdt.fds[fd].flags&FDFL_WRITABLE))return -EBADF;
             if(c3_memfd_path_get_size(vpath,&memfd_size)){
@@ -3828,6 +7619,66 @@ int64_t real_sys_pwrite64(int fd,const void *buf,size_t count,int64_t offset){
             c3_file_page_invalidate_path(vpath);
             kvfs_write_bytes(vpath,out,(uint32_t)(base+count_write));
             c3_inotify_notify_path(vpath,C3_IN_MODIFY,0);
+            if(mirror_hypr_log){
+                static uint32_t hypr_log_pwrite_trace_count;
+                if(hypr_log_pwrite_trace_count<96u){
+                    size_t j,lim=count_write;
+                    ++hypr_log_pwrite_trace_count;
+                    if(lim>8192)lim=8192;
+                    __boot_serial_force_puts("[hypr-log-pwrite!] #");
+                    __boot_serial_force_putu32(hypr_log_pwrite_trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64((uint64_t)base);
+                    __boot_serial_force_puts(" n=");
+                    __boot_serial_force_putu32((uint32_t)count_write);
+                    __boot_serial_force_puts(" text=");
+                    for(j=0;j<lim;++j){
+                        char ch=((const char*)buf)[j];
+                        if(ch==0)break;
+                        if((ch>=' '&&ch<='~')||ch=='\n'||ch=='\r'||ch=='\t')
+                            __boot_serial_force_putc(ch);
+                        else
+                            __boot_serial_force_putc('.');
+                    }
+                    if(count_write>lim)__boot_serial_force_puts("...");
+                    if(lim==0||((const char*)buf)[lim-1]!='\n')
+                        __boot_serial_force_putc('\n');
+                }
+            }
+            if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(vpath,C3_DELETED_PREFIX)){
+                static uint32_t trace_count=0;
+                if(trace_count<96u){
+                    uint64_t b0=0;
+                    size_t bi,lim=count_write<8?count_write:8;
+                    for(bi=0;bi<lim;++bi)b0|=((uint64_t)((const uint8_t*)buf)[bi])<<(bi*8);
+                    ++trace_count;
+                    __boot_serial_force_puts("[wf-pwrite-deleted!] #");
+                    __boot_serial_force_putu32(trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" off=");
+                    __boot_serial_force_puthex64((uint64_t)base);
+                    __boot_serial_force_puts(" count=");
+                    __boot_serial_force_puthex64((uint64_t)count);
+                    __boot_serial_force_puts(" ret=");
+                    __boot_serial_force_puthex64((uint64_t)count_write);
+                    __boot_serial_force_puts(" size=");
+                    __boot_serial_force_puthex64((uint64_t)(base+count_write));
+                    __boot_serial_force_puts(" b0=");
+                    __boot_serial_force_puthex64(b0);
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(vpath);
+                    __boot_serial_force_puts("\n");
+                }
+            }
             return(int64_t)count_write;
         }
         case FDKIND_DIR: return -EISDIR;
@@ -3845,43 +7696,102 @@ int64_t real_sys_pwrite64(int fd,const void *buf,size_t count,int64_t offset){
     }
 }
 
+static int c3_copy_iov_chunk_from_user(task_t *cur,iovec_t *dst,const iovec_t *src,
+                                       int first,int count,const char *tag){
+    if(count<=0)return 0;
+    if(!cur||!dst||!src)return -EFAULT;
+    return c3_user_copy_in(cur,dst,src+first,(size_t)count*sizeof(iovec_t),tag);
+}
+
 int64_t real_sys_readv(int fd,const iovec_t *iov,int iovcnt){
+    enum { C3_RWV_CHUNK = 64 };
     int64_t total=0;
-    int i;
+    int base_i;
+    task_t *cur=task_current();
     if(iovcnt<0||iovcnt>1024)return -EINVAL;
     if(iovcnt>0&&!iov)return -EFAULT;
-    for(i=0;i<iovcnt;++i){
-        int64_t r;
-        if(!iov[i].iov_len)continue;
-        if(!iov[i].iov_base)return total?total:-EFAULT;
-        r=real_sys_read(fd,iov[i].iov_base,iov[i].iov_len);
-        if(r<0)return total?total:r;
-        total+=r;
-        if((size_t)r<iov[i].iov_len)break;
+    for(base_i=0;base_i<iovcnt;base_i+=C3_RWV_CHUNK){
+        iovec_t local[C3_RWV_CHUNK];
+        int n=iovcnt-base_i;
+        int i;
+        if(n>C3_RWV_CHUNK)n=C3_RWV_CHUNK;
+        if(c3_copy_iov_chunk_from_user(cur,local,iov,base_i,n,"readv-iov")<0)
+            return total?total:-EFAULT;
+        for(i=0;i<n;++i){
+            int64_t r;
+            if(!local[i].iov_len)continue;
+            if(!local[i].iov_base)return total?total:-EFAULT;
+            r=real_sys_read(fd,local[i].iov_base,local[i].iov_len);
+            if(r<0)return total?total:r;
+            total+=r;
+            if((size_t)r<local[i].iov_len)return total;
+        }
     }
     return total;
 }
 
 int64_t real_sys_writev(int fd,const iovec_t *iov,int iovcnt){
+    enum { C3_RWV_CHUNK = 64 };
     int64_t total=0;
-    int i;
+    int base_i;
     task_t *cur=task_current();
     if(iovcnt<0||iovcnt>1024)return -EINVAL;
     if(iovcnt>0&&!iov)return -EFAULT;
-    if(fd_valid(&cur->fdt,fd)&&cur->fdt.fds[fd].kind==FDKIND_SOCKET){
-        int ref=cur->fdt.fds[fd].ref;
-        if(c3_socket_ref_is_virtual_stream(ref)){
-            return c3_socket_send_iov_coalesced(ref,iov,(size_t)iovcnt,0);
+    for(base_i=0;base_i<iovcnt;base_i+=C3_RWV_CHUNK){
+        iovec_t local[C3_RWV_CHUNK];
+        int n=iovcnt-base_i;
+        int i;
+        if(n>C3_RWV_CHUNK)n=C3_RWV_CHUNK;
+        if(c3_copy_iov_chunk_from_user(cur,local,iov,base_i,n,"writev-iov")<0)
+            return total?total:-EFAULT;
+        if(base_i==0&&fd==2&&cur&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t wayfire_writev_trace_count=0;
+            if(wayfire_writev_trace_count<16u){
+                size_t printed=0;
+                ++wayfire_writev_trace_count;
+                __boot_serial_force_puts("[wayfire-stderr!] writev pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" iov=");
+                __boot_serial_force_putu32((uint32_t)iovcnt);
+                __boot_serial_force_puts(" text=");
+                for(i=0;i<n&&printed<640u;++i){
+                    char buf[128];
+                    size_t got=0,j,lim=local[i].iov_len;
+                    if(!local[i].iov_base||!lim)continue;
+                    if(lim>sizeof(buf))lim=sizeof(buf);
+                    if(lim>640u-printed)lim=640u-printed;
+                    if(c3_user_copy_in(cur,buf,local[i].iov_base,lim,"writev-trace")<0)continue;
+                    got=lim;
+                    for(j=0;j<got;++j){
+                        char ch=buf[j];
+                        if(ch==0)break;
+                        if((ch>=' '&&ch<='~')||ch=='\n'||ch=='\r'||ch=='\t')__boot_serial_force_putc(ch);
+                        else __boot_serial_force_putc('.');
+                        ++printed;
+                    }
+                }
+                __boot_serial_force_puts("\n");
+            }
         }
-    }
-    for(i=0;i<iovcnt;++i){
-        int64_t r;
-        if(!iov[i].iov_len)continue;
-        if(!iov[i].iov_base)return total?total:-EFAULT;
-        r=real_sys_write(fd,iov[i].iov_base,iov[i].iov_len);
-        if(r<0)return total?total:r;
-        total+=r;
-        if((size_t)r<iov[i].iov_len)break;
+        if(fd_valid(&cur->fdt,fd)&&cur->fdt.fds[fd].kind==FDKIND_SOCKET){
+            int ref=cur->fdt.fds[fd].ref;
+            if(c3_socket_ref_is_virtual_stream(ref)){
+                int64_t r=c3_socket_send_iov_coalesced(ref,local,(size_t)n,0);
+                if(r<0)return total?total:r;
+                total+=r;
+                continue;
+            }
+        }
+        for(i=0;i<n;++i){
+            int64_t r;
+            if(!local[i].iov_len)continue;
+            if(!local[i].iov_base)return total?total:-EFAULT;
+            r=real_sys_write(fd,local[i].iov_base,local[i].iov_len);
+            if(r<0)return total?total:r;
+            total+=r;
+            if((size_t)r<local[i].iov_len)return total;
+        }
     }
     return total;
 }
@@ -4046,16 +7956,253 @@ int64_t real_sys_pipe2(int pipefd[2],int flags){
     return 0;
 }
 
-int64_t real_sys_ioctl(int fd,uint64_t request,uint64_t arg){
-    task_t *cur=task_current();
-    if(!fd_valid(&cur->fdt,fd))return -EBADF;
-    if(cur->fdt.fds[fd].kind==FDKIND_DEVTTY)return tty_ioctl(&g_tty0,request,(void*)(uintptr_t)arg);
-    if(cur->fdt.fds[fd].kind==FDKIND_DEVFB){
-        int rc=drm_ioctl_handler(fd,request,(void*)(uintptr_t)arg);
-        if(rc!=-ENOTTY)return rc;
-        return fb_ioctl_handler(fd,request,(void*)(uintptr_t)arg);
+/* DMA-buf and sync_file ioctl shim. wlroots/Mesa/Plasma issue these on
+ * memfd-backed PRIME fds (DMA_BUF_IOCTL_SYNC) and on sync_file fds returned
+ * by EXPORT_SYNC_FILE. We implement them as a no-op success path so userland
+ * proceeds, while still tracking the operation via tiny serial traces and the
+ * fence-completion model exposed through DRM_IOCTL_SYNCOBJ_*. */
+static int64_t c3_dmabuf_ioctl(task_t *cur,int fd,uint64_t request,void *arg){
+    if(!cur)return -EBADF;
+    (void)fd;
+    if(request==DMA_BUF_IOCTL_SYNC||request==DMA_BUF_IOCTL_SET_NAME||
+       request==DMA_BUF_IOCTL_SET_NAME_B){
+        return 0;
+    }
+    if(request==DMA_BUF_IOCTL_EXPORT_SYNC_FILE){
+        /* struct dma_buf_export_sync_file { __u32 flags; __s32 fd; }
+         * Allocate a fresh sync_file fd via memfd_create; consumers poll for
+         * read which we mark as always-ready (signaled fence). */
+        if(arg){
+            uint32_t flags;
+            int64_t sfd;
+            uint8_t *raw=(uint8_t*)arg;
+            ulibc_memcpy(&flags,raw,sizeof(flags));
+            (void)flags;
+            sfd=real_sys_memfd_create("ridux-sync-file",1u);
+            if(sfd<0)return sfd;
+            (void)real_sys_ftruncate((int)sfd,16);
+            { int32_t out=(int32_t)sfd; ulibc_memcpy(raw+4,&out,sizeof(out)); }
+        }
+        return 0;
+    }
+    if(request==DMA_BUF_IOCTL_IMPORT_SYNC_FILE){
+        /* No-op: take ownership of the fence in the dmabuf reservation slot. */
+        return 0;
+    }
+    if(request==SYNC_IOC_MERGE){
+        /* struct sync_merge_data { char name[32]; __s32 fd2; __s32 fence; ... } */
+        if(arg){
+            uint8_t *raw=(uint8_t*)arg;
+            int64_t merged=real_sys_memfd_create("ridux-sync-merge",1u);
+            if(merged<0)return merged;
+            (void)real_sys_ftruncate((int)merged,16);
+            { int32_t out=(int32_t)merged; ulibc_memcpy(raw+32+4,&out,sizeof(out)); }
+        }
+        return 0;
+    }
+    if(request==SYNC_IOC_FILE_INFO){
+        /* struct sync_file_info { char name[32]; __s32 status; __u32 flags;
+         *   __u32 num_fences; __u32 pad; __u64 sync_fence_info; }
+         * We always report status=1 (signaled) and num_fences=0 to satisfy
+         * EGL_ANDROID_native_fence_sync probes. */
+        if(arg){
+            uint8_t *raw=(uint8_t*)arg;
+            int32_t status=1;
+            uint32_t zero=0;
+            ulibc_memcpy(raw+32,&status,sizeof(status));
+            ulibc_memcpy(raw+36,&zero,sizeof(zero));
+            ulibc_memcpy(raw+40,&zero,sizeof(zero));
+        }
+        return 0;
+    }
+    if(request==SYNC_IOC_SET_DEADLINE){
+        /* Accept silently; we do not throttle. */
+        return 0;
     }
     return -ENOTTY;
+}
+
+static bool c3_fd_is_dmabuf_like(task_t *cur,int fd){
+    const char *p;
+    if(!cur||!fd_valid(&cur->fdt,fd))return false;
+    if(cur->fdt.fds[fd].kind!=FDKIND_VFSFILE)return false;
+    p=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
+    if(!p)return false;
+    return c3_starts_with(p,C3_MEMFD_PREFIX);
+}
+
+int64_t real_sys_ioctl(int fd,uint64_t request,uint64_t arg){
+    task_t *cur=task_current();
+    uint8_t kind;
+    bool trace_wayfire;
+    bool trace_hyprland_drm=false;
+    bool trace_drm_timing=false;
+    uint64_t trace_t0=0;
+    int64_t rc;
+    if(!fd_valid(&cur->fdt,fd))return -EBADF;
+    kind=cur->fdt.fds[fd].kind;
+    trace_wayfire=cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&
+                  (kind==FDKIND_DEVFB||kind==FDKIND_DEVINPUT||kind==FDKIND_DEVTTY);
+    if(cur&&c3_drm_ioctl_timing_trace_enabled()&&
+       c3_task_is_wayfire_runtime(cur)&&kind==FDKIND_DEVFB){
+        trace_drm_timing=true;
+        trace_t0=c3_rdtsc();
+    }
+    trace_hyprland_drm=cur&&c3_wayfire_debug_trace_enabled()&&
+                        c3_task_is_hyprland_compositor(cur)&&
+                        kind==FDKIND_DEVFB;
+    if(trace_hyprland_drm){
+        static uint32_t hypr_drm_ioctl_enter_count;
+        bool render_fd=(cur->fdt.fds[fd].ref==2);
+        bool keep_trace=render_fd||hypr_drm_ioctl_enter_count<260u;
+        if(keep_trace&&hypr_drm_ioctl_enter_count<900u){
+            ++hypr_drm_ioctl_enter_count;
+            __boot_serial_force_puts("[hypr-drm-ioctl-enter] #");
+            __boot_serial_force_putu32(hypr_drm_ioctl_enter_count);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)cur->fdt.fds[fd].ref);
+            __boot_serial_force_puts(" req=");
+            __boot_serial_force_puthex64(request);
+            __boot_serial_force_puts(" nr=");
+            __boot_serial_force_putu32(c3_ioctl_nr(request));
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(kind==FDKIND_DEVTTY){
+        rc=tty_ioctl(&g_tty0,request,(void*)(uintptr_t)arg);
+        goto ioctl_done;
+    }
+    if(kind==FDKIND_DEVFB){
+        rc=drm_ioctl_handler(fd,request,(void*)(uintptr_t)arg);
+        if(rc==-ENOTTY)rc=fb_ioctl_handler(fd,request,(void*)(uintptr_t)arg);
+        goto ioctl_done;
+    }
+    if(kind==FDKIND_DEVINPUT){
+        rc=c3_devinput_ioctl_handler(cur->fdt.fds[fd].ref,request,(void*)(uintptr_t)arg);
+        goto ioctl_done;
+    }
+    if(kind==FDKIND_DEVSND){
+        rc=c3_snd_ioctl_handler(cur->fdt.fds[fd].ref,request,(void*)(uintptr_t)arg);
+        goto ioctl_done;
+    }
+    if(kind==FDKIND_DEVFUSE){
+        if(c3_ioctl_type(request)==229&&c3_ioctl_nr(request)==0&&arg){
+            uint32_t clone_fd=0;
+            if(c3_user_copy_in(cur,&clone_fd,(const void*)(uintptr_t)arg,sizeof(clone_fd),"fuse-clone")<0){
+                rc=-EFAULT;
+                goto ioctl_done;
+            }
+            if(clone_fd>=TASK_FD_MAX||!fd_valid(&cur->fdt,(int)clone_fd)||
+               cur->fdt.fds[clone_fd].kind!=FDKIND_DEVFUSE){
+                rc=-EBADF;
+                goto ioctl_done;
+            }
+            cur->fdt.fds[clone_fd].ref=cur->fdt.fds[fd].ref;
+            cur->fdt.fds[clone_fd].offset=cur->fdt.fds[fd].offset;
+            c3_fd_group_copy_fd(cur,(int)clone_fd);
+            {
+                static uint32_t fuse_clone_trace;
+                if(fuse_clone_trace<16u){
+                    ++fuse_clone_trace;
+                    __boot_serial_puts("[fuse-clone] pid=");
+                    __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
+                    c3_trace_task_name(cur);
+                    __boot_serial_puts(" src=");
+                    __boot_serial_putu32((uint32_t)fd);
+                    __boot_serial_puts(" dst=");
+                    __boot_serial_putu32(clone_fd);
+                    __boot_serial_puts(" off=");
+                    __boot_serial_puthex64(cur->fdt.fds[clone_fd].offset);
+                    __boot_serial_puts("\n");
+                }
+            }
+            rc=0;
+            goto ioctl_done;
+        }
+        rc=-ENOTTY;
+        goto ioctl_done;
+    }
+    if(c3_fd_is_dmabuf_like(cur,fd)&&
+       (request==DMA_BUF_IOCTL_SYNC||request==DMA_BUF_IOCTL_SET_NAME||
+        request==DMA_BUF_IOCTL_SET_NAME_B||request==DMA_BUF_IOCTL_EXPORT_SYNC_FILE||
+        request==DMA_BUF_IOCTL_IMPORT_SYNC_FILE||request==SYNC_IOC_MERGE||
+        request==SYNC_IOC_FILE_INFO||request==SYNC_IOC_SET_DEADLINE)){
+        rc=c3_dmabuf_ioctl(cur,fd,request,(void*)(uintptr_t)arg);
+        goto ioctl_done;
+    }
+    rc=-ENOTTY;
+ioctl_done:
+    if(trace_drm_timing){
+        static uint32_t ridux_drm_ioctl_timing_count;
+        uint64_t dt_us=c3_tsc_to_us(c3_rdtsc()-trace_t0);
+        if(ridux_drm_ioctl_timing_count<240u&&
+           (ridux_drm_ioctl_timing_count<120u||dt_us>=5000ULL)){
+            ++ridux_drm_ioctl_timing_count;
+            __boot_serial_force_puts("[ridux-drm-ioctl] #");
+            __boot_serial_force_putu32(ridux_drm_ioctl_timing_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)cur->fdt.fds[fd].ref);
+            __boot_serial_force_puts(" req=");
+            __boot_serial_force_puthex64(request);
+            __boot_serial_force_puts(" nr=");
+            __boot_serial_force_putu32(c3_ioctl_nr(request));
+            __boot_serial_force_puts(" us=");
+            __boot_serial_force_putu32((uint32_t)(dt_us>0xFFFFFFFFULL?0xFFFFFFFFu:dt_us));
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(trace_wayfire){
+        static uint32_t wayfire_ioctl_trace_count;
+        if(wayfire_ioctl_trace_count<180u){
+            ++wayfire_ioctl_trace_count;
+            __boot_serial_force_puts("[wayfire-ioctl!] #");
+            __boot_serial_force_putu32(wayfire_ioctl_trace_count);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" kind=");
+            __boot_serial_force_putu32((uint32_t)kind);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)cur->fdt.fds[fd].ref);
+            __boot_serial_force_puts(" req=");
+            __boot_serial_force_puthex64(request);
+            __boot_serial_force_puts(" nr=");
+            __boot_serial_force_putu32(c3_ioctl_nr(request));
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(trace_hyprland_drm){
+        static uint32_t hypr_drm_ioctl_done_count;
+        bool render_fd=(cur->fdt.fds[fd].ref==2);
+        bool keep_trace=render_fd||hypr_drm_ioctl_done_count<260u;
+        if(keep_trace&&hypr_drm_ioctl_done_count<900u){
+            ++hypr_drm_ioctl_done_count;
+            __boot_serial_force_puts("[hypr-drm-ioctl-done] #");
+            __boot_serial_force_putu32(hypr_drm_ioctl_done_count);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)cur->fdt.fds[fd].ref);
+            __boot_serial_force_puts(" req=");
+            __boot_serial_force_puthex64(request);
+            __boot_serial_force_puts(" nr=");
+            __boot_serial_force_putu32(c3_ioctl_nr(request));
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    return rc;
 }
 
 #define F_DUPFD    0
@@ -4223,6 +8370,10 @@ static int64_t c3_stat_from_path(const char *path,kstat_t *st){
     st->st_mode=0100644;
     st->st_dev=1;
     st->st_ino=c3_path_inode(path);
+    {
+        const char *target=c3_builtin_symlink_target(path);
+        if(target)return c3_stat_from_path(target,st);
+    }
     if(c3_path_is_dir(path)){
         st->st_mode=0040000|c3_path_mode_get(path,0755);
         st->st_nlink=2;
@@ -4236,8 +8387,11 @@ static int64_t c3_stat_from_path(const char *path,kstat_t *st){
         return 0;
     }
     if(c3_starts_with(path,"/dev/")){
-        st->st_mode=0020666;
-        st->st_rdev=0x8800;
+        uint8_t kind=resolve_dev_kind(path);
+        int ref=c3_dev_ref_from_path(path,kind);
+        if(kind==FDKIND_NONE)return -ENOENT;
+        st->st_mode=0020000|0666;
+        st->st_rdev=c3_dev_rdev_from_kind_ref(kind,ref);
         st->st_size=0;
         return 0;
     }
@@ -4277,10 +8431,79 @@ int64_t real_sys_fstat(int fd,kstat_t *st){
     task_t *cur=task_current();
     const char *vpath;
     if(!fd_valid(&cur->fdt,fd))return -EBADF;
-    if(cur->fdt.fds[fd].kind==FDKIND_VFSFILE||cur->fdt.fds[fd].kind==FDKIND_DIR){
+    if(cur->fdt.fds[fd].kind==FDKIND_SYMLINK){
+        int64_t rc;
         vpath=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
         if(!vpath)return -EBADF;
-        return c3_stat_from_path(vpath,st);
+        rc=c3_stat_builtin_symlink(vpath,st);
+        if(rc>0)return 0;
+        return rc<0?rc:c3_stat_from_path(vpath,st);
+    }
+    if(cur->fdt.fds[fd].kind==FDKIND_VFSFILE||cur->fdt.fds[fd].kind==FDKIND_DIR){
+        int64_t rc;
+        vpath=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
+        if(!vpath)return -EBADF;
+        rc=c3_stat_from_path(vpath,st);
+        if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(vpath,C3_DELETED_PREFIX)){
+            static uint32_t trace_count=0;
+            if(trace_count<64u){
+                ++trace_count;
+                __boot_serial_force_puts("[wf-fstat-deleted!] #");
+                __boot_serial_force_putu32(trace_count);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" rc=");
+                c3_force_rc(rc);
+                if(rc==0&&st){
+                    __boot_serial_force_puts(" size=");
+                    __boot_serial_force_puthex64((uint64_t)st->st_size);
+                }
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(vpath);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return rc;
+    }
+    if(cur->fdt.fds[fd].kind==FDKIND_SOCKET){
+        if(!st)return -EFAULT;
+        c3_memset(st,0,sizeof(*st));
+        st->st_uid=(uint32_t)cur->uid;
+        st->st_gid=(uint32_t)cur->gid;
+        st->st_mode=0140000|0777;
+        st->st_nlink=1;
+        st->st_blksize=4096;
+        st->st_dev=1;
+        st->st_ino=0x50000000u+(uint32_t)cur->fdt.fds[fd].ref;
+        return 0;
+    }
+    if(cur->fdt.fds[fd].kind==FDKIND_PIPE_R||cur->fdt.fds[fd].kind==FDKIND_PIPE_W){
+        if(!st)return -EFAULT;
+        c3_memset(st,0,sizeof(*st));
+        st->st_uid=(uint32_t)cur->uid;
+        st->st_gid=(uint32_t)cur->gid;
+        st->st_mode=0010000|0666;
+        st->st_nlink=1;
+        st->st_blksize=4096;
+        st->st_dev=1;
+        st->st_ino=0x51000000u+(uint32_t)cur->fdt.fds[fd].ref;
+        return 0;
+    }
+    if(cur->fdt.fds[fd].kind==FDKIND_DEVINPUT||cur->fdt.fds[fd].kind==FDKIND_DEVSND||
+       cur->fdt.fds[fd].kind==FDKIND_DEVFB||cur->fdt.fds[fd].kind==FDKIND_DEVTTY||
+       cur->fdt.fds[fd].kind==FDKIND_DEVNULL||cur->fdt.fds[fd].kind==FDKIND_DEVZERO||
+       cur->fdt.fds[fd].kind==FDKIND_DEVRANDOM||cur->fdt.fds[fd].kind==FDKIND_DEVPTMX||
+       cur->fdt.fds[fd].kind==FDKIND_DEVFUSE){
+        if(!st)return -EFAULT;
+        c3_memset(st,0,sizeof(*st));
+        st->st_mode=0020000|0666;
+        st->st_nlink=1;
+        st->st_blksize=4096;
+        st->st_rdev=c3_dev_rdev_from_kind_ref(cur->fdt.fds[fd].kind,cur->fdt.fds[fd].ref);
+        return 0;
     }
     return vfs_fstat(fd,st);
 }
@@ -4289,9 +8512,36 @@ int64_t real_sys_stat(const char *path,kstat_t *st){
     char npath[VFS_PATH_MAX];
     if(!path)return -EFAULT;
     if(c3_resolve_user_path(cur,AT_FDCWD,path,npath,sizeof(npath))<0)return -EINVAL;
+    if(c3_resolve_builtin_symlink_path(npath,npath,sizeof(npath))<0)return -ELOOP;
     return c3_stat_from_path(npath,st);
 }
-int64_t real_sys_lstat(const char *path,kstat_t *st){return real_sys_stat(path,st);}
+int64_t real_sys_lstat(const char *path,kstat_t *st){
+    task_t *cur=task_current();
+    char npath[VFS_PATH_MAX];
+    int64_t sl;
+    if(!path)return -EFAULT;
+    if(c3_resolve_user_path(cur,AT_FDCWD,path,npath,sizeof(npath))<0)return -EINVAL;
+    sl=c3_stat_builtin_symlink(npath,st);
+    if(sl!=0)return sl<0?sl:0;
+    if(c3_kvfs_is_symlink(npath)){
+        const char *target=0;
+        size_t tl=0;
+        if(c3_kvfs_symlink_target(npath,&target,&tl)){
+            c3_memset(st,0,sizeof(*st));
+            st->st_uid=(uint32_t)task_current()->uid;
+            st->st_gid=(uint32_t)task_current()->gid;
+            st->st_nlink=1;
+            st->st_blksize=4096;
+            st->st_mode=0120777;
+            st->st_dev=1;
+            st->st_ino=c3_path_inode(npath);
+            st->st_size=(int64_t)tl;
+            st->st_blocks=(st->st_size+511)/512;
+            return 0;
+        }
+    }
+    return c3_stat_from_path(npath,st);
+}
 
 int64_t real_sys_access(const char *path,int mode){
     task_t *cur=task_current();
@@ -4300,12 +8550,18 @@ int64_t real_sys_access(const char *path,int mode){
     (void)mode;
     if(!path)return -EFAULT;
     if(c3_resolve_user_path(cur,AT_FDCWD,path,npath,sizeof(npath))<0)return -EINVAL;
-    if(c3_path_is_dir(npath))rc=0;
-    else if(c3_is_known_ipc_socket_path(npath))rc=0;
-    else if(c3_virtual_path_exists(npath))rc=0;
-    else if(kvfs_exists(npath))rc=0;
+    if(c3_resolve_builtin_symlink_path(npath,npath,sizeof(npath))<0)rc=-ELOOP;
+    if(rc!=-ELOOP&&c3_path_is_dir(npath))rc=0;
+    else if(rc!=-ELOOP&&c3_is_known_ipc_socket_path(npath))rc=0;
+    else if(rc!=-ELOOP&&c3_virtual_path_exists(npath))rc=0;
+    else if(rc!=-ELOOP&&kvfs_exists(npath))rc=0;
     c3_trace_path_rc("access",npath,rc,(uint64_t)(uint32_t)mode,0);
     c3_trace_firefox_path_rc("access",npath,rc,(uint64_t)(uint32_t)mode,0);
+    c3_force_wayfire_path_rc("access",npath,rc,(uint64_t)(uint32_t)mode,0);
+    c3_force_hyprland_gpu_path_rc("access",npath,rc,(uint64_t)(uint32_t)mode,0);
+    c3_force_hypr_portal_path_rc("access",npath,rc,(uint64_t)(uint32_t)mode,0);
+    c3_force_qt_path_rc("access",npath,rc,(uint64_t)(uint32_t)mode,0);
+    c3_force_vulkan_path_rc("access",npath,rc,(uint64_t)(uint32_t)mode,0);
     return rc;
 }
 int64_t real_sys_faccessat(int dirfd,const char *path,int mode,int flags){
@@ -4315,22 +8571,33 @@ int64_t real_sys_faccessat(int dirfd,const char *path,int mode,int flags){
     const int C3_AT_EACCESS_LOCAL=0x200;
     const int C3_AT_SYMLINK_NOFOLLOW_LOCAL=0x100;
     const int C3_AT_EMPTY_PATH_LOCAL=0x1000;
+    bool empty=false;
     (void)mode;
     if(!path)return -EFAULT;
     if(flags&~(C3_AT_EACCESS_LOCAL|C3_AT_SYMLINK_NOFOLLOW_LOCAL|C3_AT_EMPTY_PATH_LOCAL))return -EINVAL;
-    if(path[0]==0){
+    if(c3_user_path_is_empty(cur,path,&empty,"faccessat-empty")<0)return -EFAULT;
+    if(empty){
         if(!(flags&C3_AT_EMPTY_PATH_LOCAL))return -ENOENT;
         if(dirfd==AT_FDCWD)return 0;
         if(!fd_valid(&cur->fdt,dirfd))return -EBADF;
         return 0;
     }
     if(c3_resolve_user_path(cur,dirfd,path,npath,sizeof(npath))<0)return -EINVAL;
-    if(c3_path_is_dir(npath))rc=0;
-    else if(c3_is_known_ipc_socket_path(npath))rc=0;
-    else if(c3_virtual_path_exists(npath))rc=0;
-    else if(kvfs_exists(npath))rc=0;
+    if(!(flags&C3_AT_SYMLINK_NOFOLLOW_LOCAL)){
+        int sr=c3_resolve_builtin_symlink_path(npath,npath,sizeof(npath));
+        if(sr<0)rc=-ELOOP;
+    }
+    if(rc!=-ELOOP&&c3_path_is_dir(npath))rc=0;
+    else if(rc!=-ELOOP&&c3_is_known_ipc_socket_path(npath))rc=0;
+    else if(rc!=-ELOOP&&c3_virtual_path_exists(npath))rc=0;
+    else if(rc!=-ELOOP&&kvfs_exists(npath))rc=0;
     c3_trace_path_rc("faccessat",npath,rc,(uint64_t)(uint32_t)mode,(uint64_t)(uint32_t)flags);
     c3_trace_firefox_path_rc("faccessat",npath,rc,(uint64_t)(uint32_t)mode,(uint64_t)(uint32_t)flags);
+    c3_force_wayfire_path_rc("faccessat",npath,rc,(uint64_t)(uint32_t)mode,(uint64_t)(uint32_t)flags);
+    c3_force_hyprland_gpu_path_rc("faccessat",npath,rc,(uint64_t)(uint32_t)mode,(uint64_t)(uint32_t)flags);
+    c3_force_hypr_portal_path_rc("faccessat",npath,rc,(uint64_t)(uint32_t)mode,(uint64_t)(uint32_t)flags);
+    c3_force_qt_path_rc("faccessat",npath,rc,(uint64_t)(uint32_t)mode,(uint64_t)(uint32_t)flags);
+    c3_force_vulkan_path_rc("faccessat",npath,rc,(uint64_t)(uint32_t)mode,(uint64_t)(uint32_t)flags);
     return rc;
 }
 
@@ -4384,15 +8651,121 @@ int64_t real_sys_fchmod(int fd,int mode){
     return 0;
 }
 
+#define C3_ENODATA 61
+
+static int64_t c3_xattr_path_ok(int dirfd,const char *path,bool follow){
+    task_t *cur=task_current();
+    char npath[VFS_PATH_MAX];
+    (void)follow;
+    if(!cur)return -ESRCH;
+    if(!path)return -EFAULT;
+    if(c3_resolve_user_path(cur,dirfd,path,npath,sizeof(npath))<0)return -EFAULT;
+    if(!c3_path_is_dir(npath)&&!c3_is_known_ipc_socket_path(npath)&&
+       !c3_virtual_path_exists(npath)&&!kvfs_exists(npath))return -ENOENT;
+    return 0;
+}
+
+static int64_t c3_xattr_fd_ok(int fd){
+    task_t *cur=task_current();
+    if(!cur||!fd_valid(&cur->fdt,fd))return -EBADF;
+    return 0;
+}
+
+int64_t real_sys_setxattr(const char *path,const char *name,const void *value,size_t size,int flags){
+    int64_t rc;
+    (void)name;(void)value;(void)size;(void)flags;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,true);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_lsetxattr(const char *path,const char *name,const void *value,size_t size,int flags){
+    int64_t rc;
+    (void)name;(void)value;(void)size;(void)flags;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,false);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_fsetxattr(int fd,const char *name,const void *value,size_t size,int flags){
+    int64_t rc;
+    (void)name;(void)value;(void)size;(void)flags;
+    rc=c3_xattr_fd_ok(fd);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_getxattr(const char *path,const char *name,void *value,size_t size){
+    int64_t rc;
+    (void)name;(void)value;(void)size;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,true);
+    return rc<0?rc:-C3_ENODATA;
+}
+
+int64_t real_sys_lgetxattr(const char *path,const char *name,void *value,size_t size){
+    int64_t rc;
+    (void)name;(void)value;(void)size;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,false);
+    return rc<0?rc:-C3_ENODATA;
+}
+
+int64_t real_sys_fgetxattr(int fd,const char *name,void *value,size_t size){
+    int64_t rc;
+    (void)name;(void)value;(void)size;
+    rc=c3_xattr_fd_ok(fd);
+    return rc<0?rc:-C3_ENODATA;
+}
+
+int64_t real_sys_listxattr(const char *path,char *list,size_t size){
+    int64_t rc;
+    (void)list;(void)size;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,true);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_llistxattr(const char *path,char *list,size_t size){
+    int64_t rc;
+    (void)list;(void)size;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,false);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_flistxattr(int fd,char *list,size_t size){
+    int64_t rc;
+    (void)list;(void)size;
+    rc=c3_xattr_fd_ok(fd);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_removexattr(const char *path,const char *name){
+    int64_t rc;
+    (void)name;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,true);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_lremovexattr(const char *path,const char *name){
+    int64_t rc;
+    (void)name;
+    rc=c3_xattr_path_ok(AT_FDCWD,path,false);
+    return rc<0?rc:0;
+}
+
+int64_t real_sys_fremovexattr(int fd,const char *name){
+    int64_t rc;
+    (void)name;
+    rc=c3_xattr_fd_ok(fd);
+    return rc<0?rc:0;
+}
+
 int64_t real_sys_fchownat(int dirfd,const char *path,int uid,int gid,int flags){
     task_t *cur=task_current();
     char npath[VFS_PATH_MAX];
     const int C3_AT_SYMLINK_NOFOLLOW_LOCAL=0x100;
     const int C3_AT_EMPTY_PATH_LOCAL=0x1000;
+    bool empty=false;
     (void)uid;(void)gid;
     if(flags&~(C3_AT_SYMLINK_NOFOLLOW_LOCAL|C3_AT_EMPTY_PATH_LOCAL))return -EINVAL;
     if(!path)return -EFAULT;
-    if(path[0]==0){
+    if(c3_user_path_is_empty(cur,path,&empty,"fchownat-empty")<0)return -EFAULT;
+    if(empty){
         if(!(flags&C3_AT_EMPTY_PATH_LOCAL))return -ENOENT;
         if(dirfd==AT_FDCWD)return -EINVAL;
         return real_sys_fchown(dirfd,uid,gid);
@@ -4407,9 +8780,11 @@ int64_t real_sys_fchmodat(int dirfd,const char *path,int mode,int flags){
     char npath[VFS_PATH_MAX];
     const int C3_AT_SYMLINK_NOFOLLOW_LOCAL=0x100;
     const int C3_AT_EMPTY_PATH_LOCAL=0x1000;
+    bool empty=false;
     if(flags&~(C3_AT_SYMLINK_NOFOLLOW_LOCAL|C3_AT_EMPTY_PATH_LOCAL))return -EINVAL;
     if(!path)return -EFAULT;
-    if(path[0]==0){
+    if(c3_user_path_is_empty(cur,path,&empty,"fchmodat-empty")<0)return -EFAULT;
+    if(empty){
         if(!(flags&C3_AT_EMPTY_PATH_LOCAL))return -ENOENT;
         if(dirfd==AT_FDCWD)return -EINVAL;
         return real_sys_fchmod(dirfd,mode);
@@ -4419,6 +8794,7 @@ int64_t real_sys_fchmodat(int dirfd,const char *path,int mode,int flags){
 }
 
 #define C3_DT_UNKNOWN 0
+#define C3_DT_CHR     2
 #define C3_DT_DIR     4
 #define C3_DT_REG     8
 #define C3_DT_LNK     10
@@ -4439,6 +8815,120 @@ static int c3_getdents_emit(void *dirp,size_t count,size_t *written,uint64_t *se
     *written+=sizeof(linux_dirent64_t);
     ++(*seq);
     return 0;
+}
+
+static void c3_force_wayfire_dents_trace(const char *dpath,uint64_t off,size_t written,const void *dirp){
+    const uint8_t *p=(const uint8_t*)dirp;
+    size_t pos=0;
+    uint32_t shown=0;
+    task_t *cur;
+    if(!c3_wayfire_debug_trace_enabled())return;
+    if(!dpath||!dirp)return;
+    if(!(c3_has_token(dpath,"/sys/bus/input")||
+         c3_has_token(dpath,"/sys/class/input")||
+         c3_has_token(dpath,"/sys/devices/virtual/input")||
+         c3_has_token(dpath,"/run/udev")||
+         c3_has_token(dpath,"/dev/input")))return;
+    if(g_c3_wayfire_dents_trace_count>=80u)return;
+    cur=task_current();
+    if(!c3_task_is_wayfire_runtime(cur))return;
+    ++g_c3_wayfire_dents_trace_count;
+    __boot_serial_force_puts("[wayfire-dents!] #");
+    __boot_serial_force_putu32(g_c3_wayfire_dents_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" off=");
+    __boot_serial_force_puthex64(off);
+    __boot_serial_force_puts(" bytes=");
+    __boot_serial_force_puthex64((uint64_t)written);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(dpath);
+    __boot_serial_force_puts(" names=");
+    while(pos+sizeof(linux_dirent64_t)<=written&&shown<8u){
+        const linux_dirent64_t *de=(const linux_dirent64_t*)(p+pos);
+        if(de->d_reclen==0)break;
+        __boot_serial_force_puts(de->d_name);
+        __boot_serial_force_puts(":");
+        __boot_serial_force_putu32((uint32_t)de->d_type);
+        __boot_serial_force_puts(" ");
+        pos+=(size_t)de->d_reclen;
+        ++shown;
+    }
+    __boot_serial_force_puts("\n");
+}
+
+static void c3_force_qt_dents_trace(const char *dpath,uint64_t off,size_t written,const void *dirp){
+    const uint8_t *p=(const uint8_t*)dirp;
+    size_t pos=0;
+    uint32_t shown=0;
+    task_t *cur;
+    if(!c3_wayfire_debug_trace_enabled())return;
+    if(!dpath||!dirp)return;
+    if(!c3_trace_qt_path_needed(dpath,0))return;
+    if(g_c3_qt_dents_trace_count>=120u)return;
+    cur=task_current();
+    if(!c3_task_is_ridux_qt_runtime(cur))return;
+    ++g_c3_qt_dents_trace_count;
+    __boot_serial_force_puts("[qt-dents!] #");
+    __boot_serial_force_putu32(g_c3_qt_dents_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" off=");
+    __boot_serial_force_puthex64(off);
+    __boot_serial_force_puts(" bytes=");
+    __boot_serial_force_puthex64((uint64_t)written);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(dpath);
+    __boot_serial_force_puts(" names=");
+    while(pos+sizeof(linux_dirent64_t)<=written&&shown<8u){
+        const linux_dirent64_t *de=(const linux_dirent64_t*)(p+pos);
+        if(de->d_reclen==0)break;
+        __boot_serial_force_puts(de->d_name);
+        __boot_serial_force_puts(":");
+        __boot_serial_force_putu32((uint32_t)de->d_type);
+        __boot_serial_force_puts(" ");
+        pos+=(size_t)de->d_reclen;
+        ++shown;
+    }
+    __boot_serial_force_puts("\n");
+}
+
+static void c3_force_vulkan_dents_trace(const char *dpath,uint64_t off,size_t written,const void *dirp){
+    const uint8_t *p=(const uint8_t*)dirp;
+    size_t pos=0;
+    uint32_t shown=0;
+    task_t *cur;
+    if(!dpath||!dirp)return;
+    if(!c3_trace_vulkan_path_needed(dpath,0))return;
+    if(g_c3_vulkan_dents_trace_count>=140u)return;
+    cur=task_current();
+    if(!c3_task_is_vulkan_probe_runtime(cur))return;
+    ++g_c3_vulkan_dents_trace_count;
+    __boot_serial_force_puts("[vulkan-dents!] #");
+    __boot_serial_force_putu32(g_c3_vulkan_dents_trace_count);
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)(cur?cur->pid:0));
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" off=");
+    __boot_serial_force_puthex64(off);
+    __boot_serial_force_puts(" bytes=");
+    __boot_serial_force_puthex64((uint64_t)written);
+    __boot_serial_force_puts(" path=");
+    __boot_serial_force_puts(dpath);
+    __boot_serial_force_puts(" names=");
+    while(pos+sizeof(linux_dirent64_t)<=written&&shown<10u){
+        const linux_dirent64_t *de=(const linux_dirent64_t*)(p+pos);
+        if(de->d_reclen==0)break;
+        __boot_serial_force_puts(de->d_name);
+        __boot_serial_force_puts(":");
+        __boot_serial_force_putu32((uint32_t)de->d_type);
+        __boot_serial_force_puts(" ");
+        pos+=(size_t)de->d_reclen;
+        ++shown;
+    }
+    __boot_serial_force_puts("\n");
 }
 
 int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
@@ -4650,6 +9140,9 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"devices",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"class",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
@@ -4660,6 +9153,65 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"firmware",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"char",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"226:0",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"226:128",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"13:64",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"13:65",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char/226:0")==0||
+              c3_strcmp(dpath,"/sys/dev/char/226:128")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char/13:64")==0||
+              c3_strcmp(dpath,"/sys/dev/char/13:65")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char/226:0/device")==0||
+             c3_strcmp(dpath,"/sys/dev/char/226:128/device")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"vendor",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem_vendor",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem_device",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"class",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"drm",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/kernel")==0){
@@ -4711,6 +9263,52 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"virtual",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"pci0000:00",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/pci0000:00")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"0000:00:02.0",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/pci0000:00/0000:00:02.0")==0||
+             c3_strcmp(dpath,"/sys/bus/pci/devices/0000:00:02.0")==0){
+        static const char *pci_names[]={"vendor","device","subsystem_vendor","subsystem_device","class","uevent",0};
+        int i;
+        for(i=0;pci_names[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,pci_names[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"drm",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"driver",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/pci0000:00/0000:00:02.0/drm")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"card0",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"renderD128",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/pci0000:00/0000:00:02.0/drm/card0")==0||
+             c3_strcmp(dpath,"/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/devices/system")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"cpu",C3_DT_DIR);
         if(rc<0)return rc;
@@ -4760,8 +9358,223 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"online",C3_DT_REG);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"input",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"pci",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/pci")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"devices",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"drivers",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/pci/devices")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"0000:00:02.0",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/pci/drivers")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,c3_vbox_gpu_mode()?"vmwgfx":"virtio-pci",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/pci/drivers/virtio-pci")==0||
+             c3_strcmp(dpath,"/sys/bus/pci/drivers/vmwgfx")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"module",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/pci/drivers/virtio-pci/module")==0||
+             c3_strcmp(dpath,"/sys/bus/pci/drivers/vmwgfx/module")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"version",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/input")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"devices",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/input/devices")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"input0",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"event0",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"input1",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"event1",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/input/devices/input0")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"event0",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"phys",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uniq",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"properties",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"modalias",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"id",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"capabilities",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/input/devices/input1")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"event1",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"phys",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uniq",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"properties",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"modalias",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"id",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"capabilities",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/input/devices/input0/event0")==0||
+             c3_strcmp(dpath,"/sys/bus/input/devices/event0")==0||
+             c3_strcmp(dpath,"/sys/bus/input/devices/input1/event1")==0||
+             c3_strcmp(dpath,"/sys/bus/input/devices/event1")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/bus/input/devices/input0/capabilities")==0||
+             c3_strcmp(dpath,"/sys/bus/input/devices/input1/capabilities")==0){
+        static const char *caps[]={"ev","key","rel","abs","prop",0};
+        int i;
+        for(i=0;caps[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,caps[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/bus/input/devices/input0/id")==0||
+             c3_strcmp(dpath,"/sys/bus/input/devices/input1/id")==0){
+        static const char *ids[]={"bustype","vendor","product","version",0};
+        int i;
+        for(i=0;ids[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,ids[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/dev")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"char",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char")==0){
+        static const char *chars[]={"226:0","226:128","13:64","13:65",0};
+        int i;
+        for(i=0;chars[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,chars[i],C3_DT_DIR);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/dev/char/13:64")==0||
+             c3_strcmp(dpath,"/sys/dev/char/13:65")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char/13:64/device")==0||
+             c3_strcmp(dpath,"/sys/dev/char/13:65/device")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"phys",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uniq",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"properties",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"modalias",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"id",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"capabilities",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char/13:64/device/capabilities")==0||
+             c3_strcmp(dpath,"/sys/dev/char/13:65/device/capabilities")==0){
+        static const char *caps[]={"ev","key","rel","abs","prop",0};
+        int i;
+        for(i=0;caps[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,caps[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/dev/char/13:64/device/id")==0||
+             c3_strcmp(dpath,"/sys/dev/char/13:65/device/id")==0){
+        static const char *ids[]={"bustype","vendor","product","version",0};
+        int i;
+        for(i=0;ids[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,ids[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
     }else if(c3_strcmp(dpath,"/sys/devices/virtual")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dmi",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"input",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/devices/virtual/dmi")==0){
@@ -4785,6 +9598,9 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"net",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"power_supply",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"graphics",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
@@ -4795,17 +9611,27 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/class/drm")==0){
-        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"card0",C3_DT_DIR);
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"card0",C3_DT_LNK);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
-        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"renderD128",C3_DT_DIR);
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"renderD128",C3_DT_LNK);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/class/drm/card0")==0){
-        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_DIR);
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
-    }else if(c3_strcmp(dpath,"/sys/class/drm/card0/device")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/class/drm/card0/device")==0||
+             c3_strcmp(dpath,"/sys/class/drm/renderD128/device")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"vendor",C3_DT_REG);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
@@ -4824,20 +9650,29 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"driver",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
-    }else if(c3_strcmp(dpath,"/sys/class/drm/card0/device/driver")==0){
+    }else if(c3_strcmp(dpath,"/sys/class/drm/card0/device/driver")==0||
+             c3_strcmp(dpath,"/sys/class/drm/renderD128/device/driver")==0||
+             c3_strcmp(dpath,"/sys/devices/pci0000:00/0000:00:02.0/driver")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"module",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
-    }else if(c3_strcmp(dpath,"/sys/class/drm/card0/device/driver/module")==0){
+    }else if(c3_strcmp(dpath,"/sys/class/drm/card0/device/driver/module")==0||
+             c3_strcmp(dpath,"/sys/class/drm/renderD128/device/driver/module")==0||
+             c3_strcmp(dpath,"/sys/devices/pci0000:00/0000:00:02.0/driver/module")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"version",C3_DT_REG);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/class/drm/renderD128")==0){
-        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_DIR);
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
-    }else if(c3_strcmp(dpath,"/sys/class/drm/renderD128/device")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/class/net")==0){
@@ -4876,6 +9711,8 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"duplex",C3_DT_REG);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/class/power_supply")==0){
+        /* Valid desktop/VM sysfs directory with no battery devices. */
     }else if(c3_strcmp(dpath,"/sys/class/graphics")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"fb0",C3_DT_DIR);
         if(rc<0)return rc;
@@ -4905,6 +9742,210 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"board_name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/class/input")==0){
+        static const char *input_sys[]={"event0","event1","mice",0};
+        int i;
+        for(i=0;input_sys[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,input_sys[i],C3_DT_LNK);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/devices/virtual/input")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"input0",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"input1",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/virtual/input/input0")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"event0",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"phys",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uniq",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"properties",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"modalias",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"id",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"capabilities",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/virtual/input/input1")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"event1",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"phys",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uniq",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"properties",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"modalias",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"id",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"capabilities",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/virtual/input/input0/event0")==0||
+             c3_strcmp(dpath,"/sys/devices/virtual/input/input1/event1")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/devices/virtual/input/input0/capabilities")==0||
+             c3_strcmp(dpath,"/sys/devices/virtual/input/input1/capabilities")==0){
+        static const char *caps[]={"ev","key","rel","abs","prop",0};
+        int i;
+        for(i=0;caps[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,caps[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/devices/virtual/input/input0/id")==0||
+             c3_strcmp(dpath,"/sys/devices/virtual/input/input1/id")==0){
+        static const char *ids[]={"bustype","vendor","product","version",0};
+        int i;
+        for(i=0;ids[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,ids[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/class/input/event0")==0||
+             c3_strcmp(dpath,"/sys/class/input/event1")==0||
+             c3_strcmp(dpath,"/sys/class/input/mice")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"subsystem",C3_DT_LNK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/class/input/event0/device")==0||
+             c3_strcmp(dpath,"/sys/class/input/event1/device")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"name",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"phys",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uniq",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"properties",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"modalias",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"id",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"capabilities",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/class/input/event0/device/capabilities")==0||
+             c3_strcmp(dpath,"/sys/class/input/event1/device/capabilities")==0){
+        static const char *caps[]={"ev","key","rel","abs","prop",0};
+        int i;
+        for(i=0;caps[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,caps[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/class/input/event0/device/id")==0||
+             c3_strcmp(dpath,"/sys/class/input/event1/device/id")==0){
+        static const char *ids[]={"bustype","vendor","product","version",0};
+        int i;
+        for(i=0;ids[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,ids[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/sys/dev/char/226:0/device/drm")==0||
+             c3_strcmp(dpath,"/sys/dev/char/226:128/device/drm")==0||
+             c3_strcmp(dpath,"/sys/class/drm")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"card0",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"renderD128",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char/226:0/device/drm/card0")==0||
+             c3_strcmp(dpath,"/sys/dev/char/226:128/device/drm/card0")==0||
+             c3_strcmp(dpath,"/sys/class/drm/card0")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/sys/dev/char/226:0/device/drm/renderD128")==0||
+             c3_strcmp(dpath,"/sys/dev/char/226:128/device/drm/renderD128")==0||
+             c3_strcmp(dpath,"/sys/class/drm/renderD128")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dev",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"uevent",C3_DT_REG);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"device",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/sys/fs")==0){
@@ -4945,10 +9986,14 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/dev")==0){
-        static const char *dev_names[]={"null","zero","random","urandom","tty","tty0","console","ptmx","pts","fb0","dri","stdin","stdout","stderr",0};
+        static const char *dev_names[]={"null","zero","random","urandom","fuse","tty","tty0","tty1","console","ptmx","pts","fb0","dri","input","snd","shm","stdin","stdout","stderr",0};
         int i;
         for(i=0;dev_names[i];++i){
-            uint8_t t=(c3_strcmp(dev_names[i],"pts")==0||c3_strcmp(dev_names[i],"dri")==0)?C3_DT_DIR:C3_DT_REG;
+            uint8_t t=(c3_strcmp(dev_names[i],"pts")==0||
+                       c3_strcmp(dev_names[i],"dri")==0||
+                       c3_strcmp(dev_names[i],"input")==0||
+                       c3_strcmp(dev_names[i],"snd")==0||
+                       c3_strcmp(dev_names[i],"shm")==0)?C3_DT_DIR:C3_DT_CHR;
             rc=c3_getdents_emit(dirp,count,&written,&seq,off,dev_names[i],t);
             if(rc<0)return rc;
             if(rc>0)goto dents_done;
@@ -4958,12 +10003,28 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/dev/dri")==0){
-        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"card0",C3_DT_REG);
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"card0",C3_DT_CHR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
-        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"renderD128",C3_DT_REG);
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"renderD128",C3_DT_CHR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/dev/input")==0){
+        static const char *input_names[]={"event0","event1","mice",0};
+        int i;
+        for(i=0;input_names[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,input_names[i],C3_DT_CHR);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+    }else if(c3_strcmp(dpath,"/dev/snd")==0){
+        static const char *snd_names[]={"controlC0","pcmC0D0p","timer",0};
+        int i;
+        for(i=0;snd_names[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,snd_names[i],C3_DT_CHR);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
     }else if(c3_strcmp(dpath,"/run")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"user",C3_DT_DIR);
         if(rc<0)return rc;
@@ -4971,17 +10032,59 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"dbus",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"udev",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
     }else if(c3_strcmp(dpath,"/run/user")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"0",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
-    }else if(c3_strcmp(dpath,"/run/user/0")==0){
-        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"wayland-0",C3_DT_SOCK);
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"1000",C3_DT_DIR);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/run/user/0")==0){
+        int si;
+        for(si=0;si<SOCK_MAX;++si){
+            const char *p;
+            if(!c3_unix_bound_path_is_listener(si))continue;
+            if(!c3_starts_with(g_c3_unix_bound_paths[si],"/run/user/0/wayland-"))continue;
+            p=g_c3_unix_bound_paths[si]+12;
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,p,C3_DT_SOCK);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"bus",C3_DT_SOCK);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/run/user/1000")==0){
+        int si;
+        for(si=0;si<SOCK_MAX;++si){
+            const char *p;
+            if(!c3_unix_bound_path_is_listener(si))continue;
+            if(!c3_starts_with(g_c3_unix_bound_paths[si],"/run/user/1000/wayland-"))continue;
+            p=g_c3_unix_bound_paths[si]+15;
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,p,C3_DT_SOCK);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"bus",C3_DT_SOCK);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"doc",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/run/udev")==0){
+        rc=c3_getdents_emit(dirp,count,&written,&seq,off,"data",C3_DT_DIR);
+        if(rc<0)return rc;
+    if(rc>0)goto dents_done;
+    }else if(c3_strcmp(dpath,"/run/udev/data")==0){
+        static const char *udev_data[]={"c10:229","c13:64","c13:65","+input:event0","+input:event1","+input:input","+input:input0","+input:input1","c226:0","c226:128",0};
+        int i;
+        for(i=0;udev_data[i];++i){
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,udev_data[i],C3_DT_REG);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
     }else if(c3_strcmp(dpath,"/tmp")==0){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,".X11-unix",C3_DT_DIR);
         if(rc<0)return rc;
@@ -4990,6 +10093,21 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
         rc=c3_getdents_emit(dirp,count,&written,&seq,off,"X0",C3_DT_SOCK);
         if(rc<0)return rc;
     if(rc>0)goto dents_done;
+    }
+
+    {
+        int si;
+        for(si=0;si<SOCK_MAX;++si){
+            const char *name;
+            if(!c3_unix_bound_path_is_listener(si))continue;
+            if(c3_unix_path_is_wayland_display(g_c3_unix_bound_paths[si]))continue;
+            if(c3_has_token(g_c3_unix_bound_paths[si],"/bus"))continue;
+            name=c3_unix_bound_socket_child_name(dpath,g_c3_unix_bound_paths[si]);
+            if(!name)continue;
+            rc=c3_getdents_emit(dirp,count,&written,&seq,off,name,C3_DT_SOCK);
+            if(rc<0)return rc;
+            if(rc>0)goto dents_done;
+        }
     }
 
     {
@@ -5020,6 +10138,9 @@ int64_t real_sys_getdents64(int fd,void *dirp,size_t count){
 dents_done:
     cur->fdt.fds[fd].offset=seq;
     c3_fd_group_copy_fd(cur,fd);
+    c3_force_wayfire_dents_trace(dpath,off,written,dirp);
+    c3_force_qt_dents_trace(dpath,off,written,dirp);
+    c3_force_vulkan_dents_trace(dpath,off,written,dirp);
     return (int64_t)written;
 }
 
@@ -5061,18 +10182,36 @@ int64_t real_sys_readlink(const char *path,char *buf,size_t bufsiz){
             switch(pt->fdt.fds[fdn].kind){
                 case FDKIND_VFSFILE:
                 case FDKIND_DIR:
+                case FDKIND_SYMLINK:
                     target=c3_vfs_open_slot_path(pt->fdt.fds[fdn].ref);
                     break;
                 case FDKIND_DEVNULL: target="/dev/null"; break;
                 case FDKIND_DEVZERO: target="/dev/zero"; break;
                 case FDKIND_DEVRANDOM: target="/dev/urandom"; break;
-                case FDKIND_DEVTTY: target="/dev/tty"; break;
-                case FDKIND_DEVFB: target="/dev/fb0"; break;
+                case FDKIND_DEVTTY:
+                    target=(pt->fdt.fds[fdn].ref==1)?"/dev/tty0":
+                           ((pt->fdt.fds[fdn].ref==2)?"/dev/tty1":
+                            ((pt->fdt.fds[fdn].ref==3)?"/dev/console":"/dev/tty"));
+                    break;
+                case FDKIND_DEVFB:
+                    target=(pt->fdt.fds[fdn].ref==1)?"/dev/dri/card0":
+                           ((pt->fdt.fds[fdn].ref==2)?"/dev/dri/renderD128":"/dev/fb0");
+                    break;
+                case FDKIND_DEVINPUT:
+                    target=(pt->fdt.fds[fdn].ref==1)?"/dev/input/event1":
+                           ((pt->fdt.fds[fdn].ref==2)?"/dev/input/mice":"/dev/input/event0");
+                    break;
+                case FDKIND_DEVSND:
+                    target=(pt->fdt.fds[fdn].ref==0)?"/dev/snd/controlC0":
+                           ((pt->fdt.fds[fdn].ref==2)?"/dev/snd/timer":"/dev/snd/pcmC0D0p");
+                    break;
+                case FDKIND_DEVFUSE: target="/dev/fuse"; break;
                 case FDKIND_EVENTFD: target="anon_inode:[eventfd]"; break;
                 case FDKIND_SIGNALFD: target="anon_inode:[signalfd]"; break;
                 case FDKIND_TIMERFD: target="anon_inode:[timerfd]"; break;
                 case FDKIND_INOTIFY: target="anon_inode:[inotify]"; break;
                 case FDKIND_EPOLL: target="anon_inode:[eventpoll]"; break;
+                case FDKIND_PIDFD: target="anon_inode:[pidfd]"; break;
                 case FDKIND_PIPE_R:
                 case FDKIND_PIPE_W: target="pipe:[1]"; break;
                 case FDKIND_SOCKET: target="socket:[1]"; break;
@@ -5102,6 +10241,15 @@ int64_t real_sys_readlink(const char *path,char *buf,size_t bufsiz){
         if(l>bufsiz)l=bufsiz;
         c3_memcpy(buf,cur->cwd,l);
         return(int64_t)l;
+    }
+    {
+        const char *target=c3_builtin_symlink_target(npath);
+        if(target){
+            size_t l=c3_strlen(target);
+            if(l>bufsiz)l=bufsiz;
+            c3_memcpy(buf,target,l);
+            return(int64_t)l;
+        }
     }
     if(c3_starts_with(npath,"/proc/self/fd/")){
         char p[64];
@@ -5275,17 +10423,48 @@ static int64_t c3_rmdir_path(const char *npath){
 int64_t real_sys_unlink(const char *path){
     task_t *cur=task_current();
     char npath[VFS_PATH_MAX];
+    uint64_t memfd_size=0;
     if(!path)return -EFAULT;
     if(c3_resolve_user_path(cur,AT_FDCWD,path,npath,sizeof(npath))<0)return -EINVAL;
     if(c3_path_is_dir(npath)){
         c3_trace_path_rc("unlink",npath,-EISDIR,0,0);
         return -EISDIR;
     }
+    if(c3_memfd_path_get_size(npath,&memfd_size)){
+        (void)memfd_size;
+        if(c3_vfs_path_open_anywhere(npath)){
+            char hidden[VFS_PATH_MAX];
+            size_t hl=0;
+            uint32_t seq=g_c3_deleted_seq++;
+            if(seq==0)seq=g_c3_deleted_seq++;
+            hidden[0]=0;
+            c3_append_str(hidden,&hl,sizeof(hidden),C3_DELETED_PREFIX);
+            c3_append_u32(hidden,&hl,sizeof(hidden),(uint32_t)(cur?cur->pid:0));
+            c3_append_ch(hidden,&hl,sizeof(hidden),'-');
+            c3_append_u32(hidden,&hl,sizeof(hidden),seq);
+            if(!c3_memfd_track_rename(npath,hidden)){
+                c3_trace_path_rc("unlink",npath,-EIO,0,0);
+                return -EIO;
+            }
+            c3_vfs_open_slot_rename_path(npath,hidden);
+            c3_file_page_rename_path(npath,hidden);
+            c3_mmap_rename_backing_path(npath,hidden);
+            c3_path_mode_rename(npath,hidden);
+            c3_inotify_notify_path(npath,C3_IN_DELETE|C3_IN_DELETE_SELF,0);
+            c3_trace_path_rc("unlink-open",npath,0,0,0);
+            c3_trace_path_rc("unlink-hidden",hidden,0,0,0);
+            return 0;
+        }
+        c3_memfd_track_remove(npath);
+        c3_path_mode_remove(npath);
+        c3_inotify_notify_path(npath,C3_IN_DELETE|C3_IN_DELETE_SELF,0);
+        c3_trace_path_rc("unlink",npath,0,0,0);
+        return 0;
+    }
     if(!kvfs_exists(npath)){
         c3_trace_path_rc("unlink",npath,-ENOENT,0,0);
         return -ENOENT;
     }
-    c3_file_page_invalidate_path(npath);
     if(c3_vfs_path_open_anywhere(npath)){
         char hidden[VFS_PATH_MAX];
         size_t hl=0;
@@ -5301,12 +10480,15 @@ int64_t real_sys_unlink(const char *path){
             return -EIO;
         }
         c3_vfs_open_slot_rename_path(npath,hidden);
+        c3_file_page_rename_path(npath,hidden);
+        c3_mmap_rename_backing_path(npath,hidden);
         c3_path_mode_rename(npath,hidden);
         c3_inotify_notify_path(npath,C3_IN_DELETE|C3_IN_DELETE_SELF,0);
         c3_trace_path_rc("unlink-open",npath,0,0,0);
         c3_trace_path_rc("unlink-hidden",hidden,0,0,0);
         return 0;
     }
+    c3_file_page_invalidate_path(npath);
     if(!kvfs_remove(npath)){
         c3_trace_path_rc("unlink",npath,-EIO,0,0);
         return -EIO;
@@ -5400,11 +10582,54 @@ int64_t real_sys_ftruncate(int fd,int64_t l){
     vpath=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
     if(!vpath)return -EBADF;
     if(c3_memfd_path_get_size(vpath,&memfd_size)){
+        if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t wf_ftruncate_trace;
+            if(wf_ftruncate_trace<80u){
+                ++wf_ftruncate_trace;
+                __boot_serial_force_puts("[wf-ftruncate!] #");
+                __boot_serial_force_putu32(wf_ftruncate_trace);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" len=");
+                __boot_serial_force_puthex64((uint64_t)l);
+                __boot_serial_force_puts(" old=");
+                __boot_serial_force_puthex64(memfd_size);
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(vpath);
+                __boot_serial_force_puts("\n");
+            }
+        }
         if(c3_memfd_path_get_seals(vpath,&seals)){
             if((uint64_t)l<memfd_size&&(seals&C3_F_SEAL_SHRINK))return -EPERM;
             if((uint64_t)l>memfd_size&&(seals&C3_F_SEAL_GROW))return -EPERM;
         }
         return c3_memfd_path_set_size(vpath,(uint64_t)l)?0:-EINVAL;
+    }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(vpath,C3_DELETED_PREFIX)){
+        static uint32_t trace_count=0;
+        if(trace_count<64u){
+            const uint8_t *data=0;
+            uint32_t size=0;
+            ++trace_count;
+            (void)kvfs_read(vpath,&data,&size);
+            __boot_serial_force_puts("[wf-ftruncate-deleted!] #");
+            __boot_serial_force_putu32(trace_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" len=");
+            __boot_serial_force_puthex64((uint64_t)l);
+            __boot_serial_force_puts(" old=");
+            __boot_serial_force_puthex64((uint64_t)size);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(vpath);
+            __boot_serial_force_puts("\n");
+        }
     }
     return real_sys_truncate(vpath,l);
 }
@@ -5412,27 +10637,62 @@ int64_t real_sys_ftruncate(int fd,int64_t l){
 int64_t real_sys_newfstatat(int dirfd,const char *path,kstat_t *st,int flags){
     task_t *cur=task_current();
     char npath[VFS_PATH_MAX];
+    bool empty=false;
     if(!cur)return -ESRCH;
     if(!path||!st)return -EFAULT;
     if(flags&~(C3_AT_SYMLINK_NOFOLLOW|C3_AT_NO_AUTOMOUNT|C3_AT_EMPTY_PATH))return -EINVAL;
-    if(path[0]==0){
+    if(c3_user_path_is_empty(cur,path,&empty,"newfstatat-empty")<0)return -EFAULT;
+    if(empty){
         if(!(flags&C3_AT_EMPTY_PATH))return -ENOENT;
         if(dirfd==AT_FDCWD){
-            return c3_stat_from_path(cur->cwd,st);
+            int64_t rc=c3_stat_from_path(cur->cwd,st);
+            c3_force_qt_path_rc("newfstatat-empty",cur->cwd,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_vulkan_path_rc("newfstatat-empty",cur->cwd,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            return rc;
         }
         if(!fd_valid(&cur->fdt,dirfd))return -EBADF;
         if(cur->fdt.fds[dirfd].kind==FDKIND_VFSFILE||cur->fdt.fds[dirfd].kind==FDKIND_DIR){
             const char *vpath=c3_vfs_open_slot_path(cur->fdt.fds[dirfd].ref);
+            int64_t rc;
             if(!vpath)return -EBADF;
-            return c3_stat_from_path(vpath,st);
+            rc=c3_stat_from_path(vpath,st);
+            c3_force_qt_path_rc("newfstatat-empty",vpath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_vulkan_path_rc("newfstatat-empty",vpath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            return rc;
         }
-        return real_sys_fstat(dirfd,st);
+        {
+            int64_t rc=real_sys_fstat(dirfd,st);
+            c3_force_qt_path_rc("newfstatat-empty","<fd>",rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_vulkan_path_rc("newfstatat-empty","<fd>",rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            return rc;
+        }
     }
     if(c3_resolve_user_path(cur,dirfd,path,npath,sizeof(npath))<0)return -EINVAL;
+    if(flags&C3_AT_SYMLINK_NOFOLLOW){
+        int64_t sl=c3_stat_builtin_symlink(npath,st);
+        if(sl!=0){
+            c3_trace_path_rc("newfstatat",npath,sl<0?sl:0,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_trace_firefox_path_rc("newfstatat",npath,sl<0?sl:0,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_wayfire_path_rc("newfstatat",npath,sl<0?sl:0,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_hyprland_gpu_path_rc("newfstatat",npath,sl<0?sl:0,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_hypr_portal_path_rc("newfstatat",npath,sl<0?sl:0,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_qt_path_rc("newfstatat",npath,sl<0?sl:0,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            c3_force_vulkan_path_rc("newfstatat",npath,sl<0?sl:0,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+            return sl<0?sl:0;
+        }
+    }else{
+        int sr=c3_resolve_builtin_symlink_path(npath,npath,sizeof(npath));
+        if(sr<0)return sr;
+    }
     {
         int64_t rc=c3_stat_from_path(npath,st);
         c3_trace_path_rc("newfstatat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
         c3_trace_firefox_path_rc("newfstatat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+        c3_force_wayfire_path_rc("newfstatat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+        c3_force_hyprland_gpu_path_rc("newfstatat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+        c3_force_hypr_portal_path_rc("newfstatat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+        c3_force_qt_path_rc("newfstatat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
+        c3_force_vulkan_path_rc("newfstatat",npath,rc,(uint64_t)(uint32_t)flags,(uint64_t)(uint32_t)dirfd);
         return rc;
     }
 }
@@ -5441,10 +10701,41 @@ static int64_t real_sys_readlinkat(int dirfd,const char *path,char *buf,size_t b
     task_t *cur=task_current();
     char npath[VFS_PATH_MAX];
     int64_t rc;
+    bool empty=false;
     if(!path||!buf)return -EFAULT;
+    if(c3_user_path_is_empty(cur,path,&empty,"readlinkat-empty")<0)return -EFAULT;
+    if(empty){
+        const char *vpath=0;
+        const char *target=0;
+        if(dirfd==AT_FDCWD)return -ENOENT;
+        if(!fd_valid(&cur->fdt,dirfd))return -EBADF;
+        if(cur->fdt.fds[dirfd].kind!=FDKIND_SYMLINK)return -EINVAL;
+        vpath=c3_vfs_open_slot_path(cur->fdt.fds[dirfd].ref);
+        target=c3_builtin_symlink_target(vpath);
+        if(!target)return -EINVAL;
+        {
+            size_t l=c3_strlen(target);
+            if(l>bufsiz)l=bufsiz;
+            c3_memcpy(buf,target,l);
+            rc=(int64_t)l;
+        }
+        c3_force_wayfire_path_rc("readlinkat-empty",vpath?vpath:"",rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+        c3_force_hyprland_gpu_path_rc("readlinkat-empty",vpath?vpath:"",rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+        c3_force_hypr_portal_path_rc("readlinkat-empty",vpath?vpath:"",rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+        c3_force_qt_path_rc("readlinkat-empty",vpath?vpath:"",rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+        c3_force_vulkan_path_rc("readlinkat-empty",vpath?vpath:"",rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+        return rc;
+    }
     if(c3_resolve_user_path(cur,dirfd,path,npath,sizeof(npath))<0)return -EINVAL;
+    ++g_c3_trusted_kernel_path_depth;
     rc=real_sys_readlink(npath,buf,bufsiz);
+    if(g_c3_trusted_kernel_path_depth)--g_c3_trusted_kernel_path_depth;
     c3_trace_firefox_path_rc("readlinkat",npath,rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+    c3_force_wayfire_path_rc("readlinkat",npath,rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+    c3_force_hyprland_gpu_path_rc("readlinkat",npath,rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+    c3_force_hypr_portal_path_rc("readlinkat",npath,rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+    c3_force_qt_path_rc("readlinkat",npath,rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
+    c3_force_vulkan_path_rc("readlinkat",npath,rc,(uint64_t)bufsiz,(uint64_t)(uint32_t)dirfd);
     return rc;
 }
 
@@ -5545,9 +10836,11 @@ static int64_t real_sys_linkat(int olddirfd,const char *oldpath,int newdirfd,con
     task_t *cur=task_current();
     char o[VFS_PATH_MAX],n[VFS_PATH_MAX];
     const int C3_AT_SYMLINK_FOLLOW_LOCAL=0x400;
+    bool old_empty=false;
     if(!oldpath||!newpath)return -EFAULT;
     if(flags&~(C3_AT_SYMLINK_FOLLOW_LOCAL|C3_AT_EMPTY_PATH))return -EINVAL;
-    if(oldpath[0]==0){
+    if(c3_user_path_is_empty(cur,oldpath,&old_empty,"linkat-empty")<0)return -EFAULT;
+    if(old_empty){
         if(!(flags&C3_AT_EMPTY_PATH))return -ENOENT;
         if(olddirfd==AT_FDCWD)return -ENOENT;
         if(!fd_valid(&cur->fdt,olddirfd))return -EBADF;
@@ -5624,6 +10917,30 @@ int64_t real_sys_fallocate(int fd,int mode,int64_t offset,int64_t len){
     c3_file_page_invalidate_path(vpath);
     kvfs_write_bytes(vpath,out,(uint32_t)end);
     c3_inotify_notify_path(vpath,C3_IN_MODIFY,0);
+    if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(vpath,C3_DELETED_PREFIX)){
+        static uint32_t trace_count=0;
+        if(trace_count<64u){
+            ++trace_count;
+            __boot_serial_force_puts("[wf-fallocate-deleted!] #");
+            __boot_serial_force_putu32(trace_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" mode=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)mode);
+            __boot_serial_force_puts(" off=");
+            __boot_serial_force_puthex64((uint64_t)offset);
+            __boot_serial_force_puts(" len=");
+            __boot_serial_force_puthex64((uint64_t)len);
+            __boot_serial_force_puts(" size=");
+            __boot_serial_force_puthex64((uint64_t)end);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(vpath);
+            __boot_serial_force_puts("\n");
+        }
+    }
     return 0;
 }
 
@@ -5682,6 +10999,232 @@ static int c3_exec_capture_vec(char *const src[],char **outv,int maxc,char *pool
         ++c;
     }
     return -E2BIG;
+}
+
+static bool c3_exec_is_shell_path(const char *path){
+    return path&&(c3_strcmp(path,"/bin/sh")==0||
+                 c3_strcmp(path,"/usr/bin/sh")==0||
+                 c3_strcmp(path,"/bin/dash")==0||
+                 c3_strcmp(path,"/usr/bin/dash")==0);
+}
+
+static bool c3_exec_cmd_space(char c){
+    return c==' '||c=='\t'||c=='\r'||c=='\n';
+}
+
+/* Static scratch storage for shebang interpreter strings. The strings stored
+   here outlive the rewrite call because execve runs to completion (or
+   failure) before another exec is issued in the same task. */
+static char g_c3_exec_shebang_pool[512];
+
+/* If `data` (first bytes of the file at `npath`) starts with "#!" treat the
+   file as a script: parse the interpreter (and optional single argument)
+   from the shebang line, rewrite `npath` and `argv` so the kernel can re-read
+   the new interpreter binary and continue the normal ELF exec path. Returns
+   1 if the rewrite happened, 0 if it was not a shebang, negative on error. */
+static int c3_exec_apply_shebang(char *npath,size_t npath_cap,
+                                  const uint8_t *data,uint32_t sz,
+                                  char **argv,int *argc){
+    const uint8_t *p,*line_end;
+    char orig_npath[VFS_PATH_MAX];
+    char *pool=g_c3_exec_shebang_pool;
+    char *pool_end=g_c3_exec_shebang_pool+sizeof(g_c3_exec_shebang_pool);
+    char *out;
+    char *interp;
+    char *sb_arg=0;
+    char *orig_path_in_pool;
+    size_t orig_len;
+    int new_head,new_total,i;
+
+    if(!data||sz<2||data[0]!='#'||data[1]!='!')return 0;
+    if(!npath||!npath_cap||!argv||!argc||*argc<0)return 0;
+
+    c3_strlcpy(orig_npath,npath,sizeof(orig_npath));
+
+    p=data+2;
+    line_end=p;
+    {
+        const uint8_t *limit=data+sz;
+        size_t guard=0;
+        while(line_end<limit&&*line_end!='\n'&&*line_end!='\r'&&guard++<256)
+            ++line_end;
+    }
+    while(p<line_end&&(*p==' '||*p=='\t'))++p;
+    if(p>=line_end)return -ENOEXEC;
+
+    /* Copy the interpreter path into the shebang pool. */
+    interp=pool;
+    out=pool;
+    while(p<line_end&&*p!=' '&&*p!='\t'&&out+1<pool_end)
+        *out++=(char)*p++;
+    if(out>=pool_end-1)return -E2BIG;
+    *out++=0;
+    if(!interp[0])return -ENOEXEC;
+
+    /* Optional single argument (everything else on the shebang line, with
+       leading whitespace stripped, is treated as one argv element to mirror
+       Linux semantics). */
+    while(p<line_end&&(*p==' '||*p=='\t'))++p;
+    if(p<line_end){
+        sb_arg=out;
+        while(p<line_end&&out+1<pool_end)
+            *out++=(char)*p++;
+        /* Trim trailing whitespace. */
+        while(out>sb_arg&&(out[-1]==' '||out[-1]=='\t'||out[-1]=='\r'))--out;
+        if(out>=pool_end-1)return -E2BIG;
+        *out++=0;
+        if(!sb_arg[0])sb_arg=0;
+    }
+
+    /* Park the original script path inside the shebang pool so the pointer
+       stays alive after we overwrite npath. */
+    orig_len=c3_strlen(orig_npath);
+    if(out+orig_len+1>pool_end)return -E2BIG;
+    orig_path_in_pool=out;
+    c3_memcpy(orig_path_in_pool,orig_npath,orig_len+1);
+
+    /* Compose [interp, optional_arg, orig_script, orig_argv[1..]]. Shift
+       existing argv tail right first so we do not stomp on entries we still
+       need to read. */
+    new_head=sb_arg?3:2;
+    if(*argc<1){
+        argv[0]=orig_path_in_pool;
+        *argc=1;
+    }
+    new_total=new_head+(*argc-1);
+    if(new_total>C3_EXEC_ARG_MAX)return -E2BIG;
+    for(i=*argc-1;i>=1;--i)argv[new_head+(i-1)]=argv[i];
+    argv[0]=interp;
+    if(sb_arg){
+        argv[1]=sb_arg;
+        argv[2]=orig_path_in_pool;
+    }else{
+        argv[1]=orig_path_in_pool;
+    }
+    argv[new_total]=0;
+    *argc=new_total;
+
+    c3_strlcpy(npath,interp,npath_cap);
+
+    __boot_serial_puts("[execve-shebang] ");
+    __boot_serial_puts(orig_path_in_pool);
+    __boot_serial_puts(" -> ");
+    __boot_serial_puts(npath);
+    if(sb_arg){
+        __boot_serial_puts(" arg=");
+        __boot_serial_puts(sb_arg);
+    }
+    __boot_serial_puts("\n");
+    return 1;
+}
+
+static int c3_exec_rewrite_shell_c(char *npath,size_t npath_cap,char **argv,int *argc){
+    char *cmd,*p;
+    int outc=0;
+    bool quoted=false;
+    char quote=0;
+    if(!npath||!argv||!argc||*argc<3)return 0;
+    if(!c3_exec_is_shell_path(npath)||c3_strcmp(argv[1],"-c")!=0)return 0;
+    cmd=argv[2];
+    if(!cmd||!cmd[0])return 0;
+    for(p=cmd;*p;++p){
+        if(quoted){
+            if(*p==quote)quoted=false;
+            continue;
+        }
+        if(*p=='"'||*p=='\''){
+            quoted=true;
+            quote=*p;
+            continue;
+        }
+        if(*p=='|'||*p=='&'||*p==';'||*p=='<'||*p=='>'||
+           *p=='('||*p==')'||*p=='`'||*p=='$'){
+            return 0;
+        }
+    }
+    p=cmd;
+    while(*p&&c3_exec_cmd_space(*p))++p;
+    if(c3_strncmp(p,"exec",4)==0&&c3_exec_cmd_space(p[4])){
+        p+=4;
+        while(*p&&c3_exec_cmd_space(*p))++p;
+    }
+    while(*p&&outc<C3_EXEC_ARG_MAX){
+        char quote=0;
+        while(*p&&c3_exec_cmd_space(*p))++p;
+        if(!*p)break;
+        if(*p=='"'||*p=='\'')quote=*p++;
+        argv[outc++]=p;
+        while(*p){
+            if(quote){
+                if(*p==quote){*p++=0;break;}
+            }else if(c3_exec_cmd_space(*p)){
+                *p++=0;
+                break;
+            }
+            ++p;
+        }
+    }
+    if(outc<=0)return 0;
+    argv[outc]=0;
+    *argc=outc;
+    c3_strlcpy(npath,argv[0],npath_cap);
+    __boot_serial_puts("[execve-sh-c] direct ");
+    __boot_serial_puts(npath);
+    __boot_serial_puts("\n");
+    return 1;
+}
+
+static bool c3_exec_path_has_slash(const char *path){
+    if(!path)return false;
+    while(*path){
+        if(*path=='/')return true;
+        ++path;
+    }
+    return false;
+}
+
+static int c3_exec_resolve_rewritten_path(task_t *cur,char *npath,size_t npath_cap,
+                                          char **argv,int argc){
+    static const char *dirs[]={
+        "/usr/local/bin","/usr/bin","/bin",
+        "/opt/hyprland/bin","/opt/hyprland/usr/bin",
+        "/opt/wayfire/bin","/opt/wayfire/usr/bin"
+    };
+    const char *cmd=(argv&&argc>0&&argv[0])?argv[0]:npath;
+    int i;
+    if(!cmd||!cmd[0]||!npath||!npath_cap)return -EINVAL;
+    if(c3_exec_path_has_slash(cmd)){
+        char tmp[VFS_PATH_MAX*2];
+        char abs[VFS_PATH_MAX];
+        if(cmd[0]=='/'){
+            c3_path_normalize_abs(cmd,npath,npath_cap);
+        }else{
+            c3_path_build((cur&&cur->cwd[0])?cur->cwd:"/",cmd,tmp,sizeof(tmp));
+            c3_path_normalize_abs(tmp,npath,npath_cap);
+        }
+        if(c3_resolve_builtin_symlink_path(npath,abs,sizeof(abs))==0)
+            c3_strlcpy(npath,abs,npath_cap);
+        return 0;
+    }
+    for(i=0;i<(int)(sizeof(dirs)/sizeof(dirs[0]));++i){
+        const uint8_t *data=0;
+        uint32_t sz=0;
+        char cand[VFS_PATH_MAX];
+        char resolved[VFS_PATH_MAX];
+        size_t l=0;
+        (void)data;(void)sz;
+        cand[0]=0;
+        resolved[0]=0;
+        c3_append_str(cand,&l,sizeof(cand),dirs[i]);
+        if(l&&cand[l-1]!='/')c3_append_ch(cand,&l,sizeof(cand),'/');
+        c3_append_str(cand,&l,sizeof(cand),cmd);
+        if(c3_kvfs_read_follow(cand,&data,&sz,resolved,sizeof(resolved))||kvfs_exists(cand)){
+            if(resolved[0])c3_strlcpy(npath,resolved,npath_cap);
+            else c3_strlcpy(npath,cand,npath_cap);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int c3_exec_extract_interp(const uint8_t *data,uint32_t sz,char *out,size_t out_cap,bool *needs_interp){
@@ -5777,7 +11320,7 @@ static bool c3_exec_map_user_stack(address_space_t *as){
     int pg;
     if(!as)return false;
     for(pg=0;pg<(int)(TASK_USER_STACK/PAGE_SIZE);++pg){
-        uint64_t frame=pmm_alloc_frame();
+        uint64_t frame=c3_alloc_user_frame();
         uint64_t va=stk_base+(uint64_t)pg*PAGE_SIZE;
         if(!frame)return false;
         c3_phys_ref_set_initial(frame);
@@ -5829,7 +11372,7 @@ int compat3_init_user_tls(task_t *t){
     for(pg=tls_lo;pg<tls_hi;pg+=PAGE_SIZE){
         ent=paging_get_entry(t->addr_space,pg);
         if(!(ent&PAGE_PRESENT)){
-            phys=pmm_alloc_frame();
+            phys=c3_alloc_user_frame();
             if(!phys)return -ENOMEM;
             c3_phys_ref_set_initial(phys);
             if(!paging_map(t->addr_space,pg,phys,PAGE_PRESENT|PAGE_WRITABLE|PAGE_USER)){
@@ -5908,8 +11451,8 @@ static void c3_exec_wake_vfork_parent(const task_t *child){
         if(!p->used)continue;
         if(p->state!=TASK_SLEEPING)continue;
         if(p->wait_pid!=child->pid)continue;
+        if(!task_make_runnable(i))continue;
         p->wait_pid=0;
-        p->state=TASK_RUNNABLE;
         __boot_serial_puts("[vfork-exec-wake] child=");
         __boot_serial_putu32((uint32_t)child->pid);
         __boot_serial_puts(" parent=");
@@ -5949,6 +11492,35 @@ int64_t real_sys_fork(void){
         int pi=g_current_task;
         int ci=c3_task_index_by_pid((int)pid);
         if(pi>=0&&pi<TASK_MAX&&ci>=0&&ci<TASK_MAX){
+            task_t *child=&g_tasks[ci];
+            uint64_t *f=task_syscall_user_frame(cur);
+            if(f){
+                child->ctx.r15=f[0]; child->ctx.r14=f[1];
+                child->ctx.r13=f[2]; child->ctx.r12=f[3];
+                child->ctx.r11=f[4]; child->ctx.r10=f[5];
+                child->ctx.r9=f[6];  child->ctx.r8=f[7];
+                child->ctx.rbp=f[8]; child->ctx.rdi=f[9];
+                child->ctx.rsi=f[10]; child->ctx.rdx=f[11];
+                child->ctx.rcx=f[12]; child->ctx.rbx=f[13];
+                child->ctx.rip=f[12];
+                child->ctx.rsp=f[20];
+                child->ctx.rflags=f[19];
+                child->ctx.cs=0x28; child->ctx.ss=0x30;
+                child->ctx.fs_base=cur->ctx.fs_base;
+                child->ctx.gs_base=cur->ctx.gs_base;
+            }else{
+                child->ctx=cur->ctx;
+            }
+            child->ctx.rax=0;
+            /*
+             * task_fork() copies the parent's kernel stack, but fork() is
+             * called while the parent is inside a live syscall. The saved
+             * kernel RSP can therefore point at an old scheduler frame. Build
+             * a fresh first-launch frame for the child, the same way the
+             * clone() fallback path does.
+             */
+            { extern void clone3_setup_kstack(task_t *t);
+              clone3_setup_kstack(child); }
             g_c3_seccomp_mode[ci]=g_c3_seccomp_mode[pi];
             g_c3_seccomp_flags[ci]=g_c3_seccomp_flags[pi];
             g_c3_ns_mask[ci]=g_c3_ns_mask[pi];
@@ -6001,6 +11573,8 @@ static int c3_make_zombie_child(task_t *parent,const char *name,int exit_code){
     child->gid=parent->gid;
     child->euid=parent->euid;
     child->egid=parent->egid;
+    child->suid=parent->suid;
+    child->sgid=parent->sgid;
     child->state=TASK_ZOMBIE;
     child->exit_code=exit_code;
     c3_strlcpy(child->name,name?name:"linux-probe",TASK_NAME_LEN);
@@ -6015,12 +11589,11 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
     int ci;
     bool vfork_vm_share;
     if(!cur)return -ESRCH;
-    /* Loud trace so we can see which clone variants Firefox/Chrome try
-     * and how we serve them. Once Linuxulator parity is good we can
-     * gate this behind a verbosity flag. */
+    /* Keep clone details available for ABI bring-up, but keep them out of the
+     * normal desktop frame path. */
     {
         static uint32_t clone_trace_count=0;
-        if(clone_trace_count<64){
+        if(c3_wayfire_debug_trace_enabled()&&clone_trace_count<64){
             ++clone_trace_count;
             __boot_serial_puts("[clone] flags=");
             __boot_serial_puthex64(flags);
@@ -6036,6 +11609,26 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
             __boot_serial_puts(" tls=");
             __boot_serial_puthex64(tls);
             __boot_serial_puts("\n");
+        }
+    }
+    if(c3_task_is_browser_runtime(cur)){
+        static uint32_t browser_clone_trace=0;
+        if(c3_wayfire_debug_trace_enabled()&&browser_clone_trace<96){
+            ++browser_clone_trace;
+            __boot_serial_force_puts("[browser-clone] flags=");
+            __boot_serial_force_puthex64(flags);
+            __boot_serial_force_puts(" parent=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" stack=");
+            __boot_serial_force_puthex64(child_stack);
+            __boot_serial_force_puts(" ptid=");
+            __boot_serial_force_puthex64(ptid);
+            __boot_serial_force_puts(" ctid=");
+            __boot_serial_force_puthex64(ctid);
+            __boot_serial_force_puts(" tls=");
+            __boot_serial_force_puthex64(tls);
+            __boot_serial_force_puts("\n");
         }
     }
     /* Namespace flags (CLONE_NEW{NS,USER,PID,...}): historically we returned
@@ -6066,25 +11659,19 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
         pid=c3_make_zombie_child(cur,"linux-ns-probe",0);
         if(pid<0)return pid;
         if(flags&C3_CLONE_PARENT_SETTID&&ptid){
-            *(int*)(uintptr_t)ptid=pid;
+            (void)c3_user_write_u32_as(cur->addr_space,ptid,(uint32_t)pid,
+                                       "clone-ns-parent-settid");
         }
         return (int64_t)pid;
     }
     /* CLONE_VFORK | CLONE_VM without CLONE_THREAD is the canonical Linux
-     * vfork() / posix_spawn() pattern: child shares parent VM, parent
-     * blocks until the child calls execve() or exits. We previously
-     * returned -ENOSYS, which broke posix_spawn-based content/GPU
-     * process creation in Firefox. Implement it via the thread-clone
-     * path (shared VM, runnable child) plus a flag that puts the parent
-     * to sleep until the child execs or exits, matching FreeBSD's
-     * RFPPWAIT semantics. */
+     * vfork() / posix_spawn() pattern. A true shared-VM vfork needs stronger
+     * kernel-stack and mm lifetime rules than this Linux ABI layer currently
+     * has. Keep the externally visible behavior needed by posix_spawn -- the
+     * parent blocks until child exec/exit -- but back it with a process clone
+     * below instead of the thread/shared-VM path. That prevents a Ring3
+     * launcher from corrupting the parent's saved kernel return frame. */
     vfork_vm_share=((flags&C3_CLONE_VFORK)&&(flags&C3_CLONE_VM)&&!(flags&C3_CLONE_THREAD));
-    if(vfork_vm_share){
-        /* Pretend CLONE_THREAD so the existing thread-clone code path
-         * shares VM/sigh and. We will still record CLONE_VFORK below
-         * to make the parent block on the child. */
-        flags|=C3_CLONE_THREAD;
-    }
 
     /* Thread-like clone path */
     if(flags&C3_CLONE_THREAD){
@@ -6092,7 +11679,7 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
          * share the address space (CLONE_VM). Avoid task_create(..., true)
          * here: that allocates an unused 8 MiB user stack plus a fresh page
          * table per thread, which is deadly during Chromium renderer startup. */
-        pid=(flags&C3_CLONE_VM) ? task_create_user_shell(cur->name,cur->ctx.rip)
+        pid=(flags&C3_CLONE_VM) ? task_create_user_thread(cur->name,cur->ctx.rip,cur->addr_space)
                                 : task_create(cur->name,cur->ctx.rip,true);
         if(pid<0){c3_trace_clone_fail(cur,pid);return pid;}
         child=c3_task_by_pid(pid);
@@ -6119,7 +11706,11 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
             child->ctx.rbp=f[8]; child->ctx.rdi=f[9];
             child->ctx.rsi=f[10]; child->ctx.rdx=f[11];
             child->ctx.rcx=f[12]; child->ctx.rbx=f[13];
-            child->ctx.rip=f[17]; /* user RIP (after syscall instruction) */
+            /* The iret frame can be repaired later from saved RCX, so use
+             * the original syscall RCX here too.  Copying f[17] could send
+             * freshly-cloned Mesa/Hyprland threads into a stale frame RIP. */
+            child->ctx.rip=f[12]; /* user RIP after the SYSCALL instruction */
+            child->ctx.rsp=f[20]; /* user RSP at syscall entry */
             child->ctx.rflags=f[19]; /* user RFLAGS */
             child->ctx.cs=0x28; child->ctx.ss=0x30;
             child->ctx.fs_base=cur->ctx.fs_base;
@@ -6134,12 +11725,13 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
         c3_clone_prepare_user_tls_stack(cur,(uint64_t)child->pid,flags,child_stack,ptid,ctid,tls);
 
         if(flags&C3_CLONE_VM){
+            c3_vm_layout_pull_shared(cur);
             child->tgid=vfork_vm_share?child->pid:(cur->tgid?cur->tgid:cur->pid);
             child->ppid=vfork_vm_share?(cur->tgid?cur->tgid:cur->pid):cur->ppid;
-            child->addr_space=cur->addr_space;
             child->brk_start=cur->brk_start;
             child->brk_current=cur->brk_current;
             child->mmap_base=cur->mmap_base;
+            c3_vm_layout_push_shared(cur);
         }
         if(flags&C3_CLONE_SIGHAND){
             c3_memcpy(child->sigactions,cur->sigactions,sizeof(cur->sigactions));
@@ -6157,10 +11749,12 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
         }
         child->clear_child_tid=(flags&C3_CLONE_CHILD_CLEARTID)?ctid:0;
         if(flags&C3_CLONE_CHILD_SETTID&&ctid){
-            *(int*)(uintptr_t)ctid=child->pid;
+            (void)c3_user_write_u32_as(child->addr_space,ctid,(uint32_t)child->pid,
+                                       "clone-child-settid");
         }
         if(flags&C3_CLONE_PARENT_SETTID&&ptid){
-            *(int*)(uintptr_t)ptid=child->pid;
+            (void)c3_user_write_u32_as(cur->addr_space,ptid,(uint32_t)child->pid,
+                                       "clone-parent-settid");
         }
         {
             int ci=c3_task_index_by_pid(child->pid);
@@ -6236,7 +11830,8 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
         child->ctx.rbp=f[8]; child->ctx.rdi=f[9];
         child->ctx.rsi=f[10]; child->ctx.rdx=f[11];
         child->ctx.rcx=f[12]; child->ctx.rbx=f[13];
-        child->ctx.rip=f[17]; /* user RIP after the SYSCALL instruction */
+        child->ctx.rip=f[12]; /* user RIP after the SYSCALL instruction */
+        child->ctx.rsp=f[20]; /* user RSP at syscall entry */
         child->ctx.rflags=f[19];
         child->ctx.cs=0x28; child->ctx.ss=0x30;
         child->ctx.fs_base=cur->ctx.fs_base;
@@ -6263,7 +11858,8 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
         }
     }
     if(flags&C3_CLONE_PARENT_SETTID&&ptid){
-        *(int*)(uintptr_t)ptid=child->pid;
+        (void)c3_user_write_u32_as(cur->addr_space,ptid,(uint32_t)child->pid,
+                                   "clone-parent-settid");
     }
     ci=c3_task_index_by_pid(pid);
     if(ci>=0&&ci<TASK_MAX){
@@ -6281,10 +11877,18 @@ int64_t real_sys_clone(uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_
      * with the registers we just populated. */
     { extern void clone3_setup_kstack(task_t *t);
       clone3_setup_kstack(child); }
-    /* Same defer-preempt nudge as thread-clone path so the parent gets
-     * to record the returned child pid before timer preemption hands
-     * control to the child. */
-    g_task_preempt_defer_ticks=2;
+    if(vfork_vm_share){
+        cur->wait_pid=child->pid;
+        cur->state=TASK_SLEEPING;
+        task_schedule();
+        if(cur->state==TASK_SLEEPING)cur->state=TASK_RUNNING;
+        cur->wait_pid=0;
+    }else{
+        /* Same defer-preempt nudge as thread-clone path so the parent gets
+         * to record the returned child pid before timer preemption hands
+         * control to the child. */
+        g_task_preempt_defer_ticks=2;
+    }
     return pid;
 }
 
@@ -6317,10 +11921,13 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
     bool needs_interp=false;
     bool has_interp=false;
     bool switched=false;
+    bool execve_locked=false;
     bool is_chrome_exec=false;
+    bool is_fusermount_exec=false;
     int chrome_filtered_args=0;
     int chrome_added_args=0;
     int chrome_v8_fd_rc=0;
+    int fuse_commfd=-1;
     int argc=0;
     int envc=0;
     int rc;
@@ -6336,20 +11943,165 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
         __boot_serial_puts(npath);
         __boot_serial_puts("\n");
     }
-    if(!kvfs_read(npath,&data,&sz))return -ENOENT;
-    if(!elf64_validate(data,sz))return -ENOEXEC;
-
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        __boot_serial_force_puts("[wayfire-execve] resolved path=");
+        __boot_serial_force_puts(npath);
+        __boot_serial_force_puts("\n");
+    }
+    c3_execve_lock_acquire(cur,npath);
+    execve_locked=true;
     rc=c3_exec_capture_vec(argv,g_c3_exec_argv,C3_EXEC_ARG_MAX,g_c3_exec_argv_pool,sizeof(g_c3_exec_argv_pool),&argc);
-    if(rc<0)return rc;
+    if(rc<0){
+        if(c3_task_is_wayfire_runtime(cur)){
+            __boot_serial_force_puts("[wayfire-execve] argv capture rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts("\n");
+        }
+        goto exec_early_fail;
+    }
     rc=c3_exec_capture_vec(envp,g_c3_exec_envp,C3_EXEC_ENV_MAX,g_c3_exec_env_pool,sizeof(g_c3_exec_env_pool),&envc);
-    if(rc<0)return rc;
+    if(rc<0){
+        if(c3_task_is_wayfire_runtime(cur)){
+            __boot_serial_force_puts("[wayfire-execve] env capture rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts("\n");
+        }
+        goto exec_early_fail;
+    }
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        int wi;
+        __boot_serial_force_puts("[wayfire-execve] argc=");
+        __boot_serial_force_putu32((uint32_t)argc);
+        __boot_serial_force_puts("\n");
+        for(wi=0;wi<argc&&wi<8;++wi){
+            __boot_serial_force_puts("[wayfire-execve]   ");
+            __boot_serial_force_putu32((uint32_t)wi);
+            __boot_serial_force_puts(": ");
+            __boot_serial_force_puts(g_c3_exec_argv[wi]?g_c3_exec_argv[wi]:"(null)");
+            __boot_serial_force_puts("\n");
+        }
+    }
+    {
+        int sr=c3_resolve_builtin_symlink_path(npath,npath,sizeof(npath));
+        if(sr<0){
+            rc=sr;
+            goto exec_early_fail;
+        }
+    }
+    if(c3_exec_rewrite_shell_c(npath,sizeof(npath),g_c3_exec_argv,&argc)>0){
+        int pr=c3_exec_resolve_rewritten_path(cur,npath,sizeof(npath),g_c3_exec_argv,argc);
+        if(pr<0){
+            rc=pr;
+            goto exec_early_fail;
+        }
+        if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            __boot_serial_force_puts("[wayfire-execve] sh-c resolved ");
+            __boot_serial_force_puts(npath);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(c3_wayfire_debug_trace_enabled()&&
+       (c3_has_token(npath,"/usr/libexec/xdg-desktop-portal")||
+        c3_has_token(npath,"/usr/bin/waybar")||
+        c3_has_token(npath,"/usr/bin/ridux-hyprland-session"))){
+        __boot_serial_force_puts("[exec-env!] path=");
+        __boot_serial_force_puts(npath);
+        __boot_serial_force_puts(" argc=");
+        __boot_serial_force_putu32((uint32_t)argc);
+        __boot_serial_force_puts(" envc=");
+        __boot_serial_force_putu32((uint32_t)envc);
+        __boot_serial_force_puts("\n");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"WAYLAND_DISPLAY=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"HYPRLAND_INSTANCE_SIGNATURE=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"XDG_CURRENT_DESKTOP=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"DESKTOP_SESSION=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"DBUS_SESSION_BUS_ADDRESS=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"HOME=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"XDG_RUNTIME_DIR=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"XDG_CONFIG_HOME=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"XDG_DATA_HOME=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"XDG_CACHE_HOME=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"XDG_DATA_DIRS=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"XDG_DESKTOP_PORTAL_DIR=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"GDK_BACKEND=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"GTK_USE_PORTAL=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"GSETTINGS_BACKEND=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"GIO_USE_VFS=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"GIO_USE_VOLUME_MONITOR=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"QT_QPA_PLATFORM=");
+        c3_trace_exec_env_value("[exec-env!]",g_c3_exec_envp,envc,"SDL_VIDEODRIVER=");
+    }
+    {
+        int shebang_chain=0;
+        for(;;){
+            if(!c3_kvfs_read_follow(npath,&data,&sz,npath,sizeof(npath))){
+                if(c3_task_is_wayfire_runtime(cur)){
+                    __boot_serial_force_puts("[wayfire-execve] read miss ");
+                    __boot_serial_force_puts(npath);
+                    __boot_serial_force_puts("\n");
+                }
+                rc=-ENOENT;
+                goto exec_early_fail;
+            }
+            if(c3_task_is_wayfire_runtime(cur)&&
+               (c3_has_token(npath,"/usr/bin/waybar")||
+                c3_has_token(npath,"/usr/bin/nwg-dock-hyprland")||
+                c3_has_token(npath,"/usr/bin/wofi")||
+                c3_has_token(npath,"/usr/bin/ridux-open-launcher-native")||
+                c3_has_token(npath,"/usr/libexec/xdg-desktop-portal"))){
+                __boot_serial_force_puts("[wayfire-execve] read ok ");
+                __boot_serial_force_puts(npath);
+                __boot_serial_force_puts(" bytes=");
+                __boot_serial_force_putu32(sz);
+                __boot_serial_force_puts("\n");
+            }
+            if(elf64_validate(data,sz))break;
+            /* Try shebang interpretation. */
+            if(shebang_chain<4){
+                int sb=c3_exec_apply_shebang(npath,sizeof(npath),data,sz,
+                                             g_c3_exec_argv,&argc);
+                if(sb<0){
+                    rc=sb;
+                    goto exec_early_fail;
+                }
+                if(sb>0){
+                    ++shebang_chain;
+                    continue;
+                }
+            }
+            if(c3_task_is_wayfire_runtime(cur)){
+                __boot_serial_force_puts("[wayfire-execve] not elf ");
+                __boot_serial_force_puts(npath);
+                __boot_serial_force_puts("\n");
+            }
+            rc=-ENOEXEC;
+            goto exec_early_fail;
+        }
+    }
     if(argc==0){
         size_t plen=c3_strlen(npath);
-        if(plen+1>sizeof(g_c3_exec_argv_pool))return -E2BIG;
+        if(plen+1>sizeof(g_c3_exec_argv_pool)){
+            rc=-E2BIG;
+            goto exec_early_fail;
+        }
         c3_memcpy(g_c3_exec_argv_pool,npath,plen+1);
         g_c3_exec_argv[0]=g_c3_exec_argv_pool;
         g_c3_exec_argv[1]=0;
         argc=1;
+    }
+    is_fusermount_exec=c3_exec_is_fusermount_path(npath);
+    if(is_fusermount_exec){
+        fuse_commfd=c3_exec_env_fd_value(g_c3_exec_envp,envc,"_FUSE_COMMFD=");
+        __boot_serial_force_puts("[execve-fusermount!] pid=");
+        __boot_serial_force_putu32((uint32_t)cur->pid);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts(" path=");
+        __boot_serial_force_puts(npath);
+        __boot_serial_force_puts(" commfd=");
+        if(fuse_commfd<0)c3_force_rc((int64_t)fuse_commfd);
+        else __boot_serial_force_putu32((uint32_t)fuse_commfd);
+        __boot_serial_force_puts("\n");
+        if(fuse_commfd>=0)c3_force_one_fd("[execve-fusermount-fd-before!]",cur,fuse_commfd);
     }
     is_chrome_exec=c3_exec_is_chromium_trace(npath,g_c3_exec_argv,argc);
     if(is_chrome_exec){
@@ -6440,19 +12192,47 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
         __boot_serial_puts("[execve-firefox] suppressing glxtest helper pid=");
         __boot_serial_putu32((uint32_t)cur->pid);
         __boot_serial_puts("\n");
+        if(execve_locked){
+            c3_execve_lock_release();
+            execve_locked=false;
+        }
         return real_sys_exit(0);
     }
     (void)envc;
 
     rc=c3_exec_extract_interp(data,sz,interp,sizeof(interp),&needs_interp);
-    if(rc<0)return rc;
-    if(needs_interp&&!interp[0])return -ENOEXEC;
+    if(rc<0)goto exec_early_fail;
+    if(needs_interp&&!interp[0]){
+        rc=-ENOEXEC;
+        goto exec_early_fail;
+    }
     interp_path[0]=0;
     if(interp[0]){
-        if(c3_exec_resolve_interp_path(npath,interp,interp_path,sizeof(interp_path))<0)return -ENOEXEC;
-        if(!kvfs_read(interp_path,&interp_data,&interp_sz))return -ENOENT;
-        if(!elf64_validate(interp_data,interp_sz))return -ENOEXEC;
+        if(c3_exec_resolve_interp_path(npath,interp,interp_path,sizeof(interp_path))<0){
+            rc=-ENOEXEC;
+            goto exec_early_fail;
+        }
+        if(!kvfs_read(interp_path,&interp_data,&interp_sz)){
+            rc=-ENOENT;
+            goto exec_early_fail;
+        }
+        if(!elf64_validate(interp_data,interp_sz)){
+            rc=-ENOEXEC;
+            goto exec_early_fail;
+        }
         has_interp=true;
+    }
+    if(c3_task_is_wayfire_runtime(cur)&&
+       (c3_has_token(npath,"/usr/bin/waybar")||
+        c3_has_token(npath,"/usr/bin/nwg-dock-hyprland")||
+        c3_has_token(npath,"/usr/bin/wofi")||
+        c3_has_token(npath,"/usr/bin/ridux-open-launcher-native")||
+        c3_has_token(npath,"/usr/libexec/xdg-desktop-portal"))){
+        __boot_serial_force_puts("[wayfire-execve] interp ");
+        __boot_serial_force_puts(npath);
+        __boot_serial_force_puts(" -> ");
+        __boot_serial_force_puts(has_interp?interp_path:"(static)");
+        __boot_serial_force_puts("\n");
     }
 
     old_as=cur->addr_space;
@@ -6498,16 +12278,21 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
     c3_strlcpy(old_dyn_last_timeout_stage,g_c3_dyn_last_timeout_stage,sizeof(old_dyn_last_timeout_stage));
 
     new_as=paging_create_address_space();
-    if(!new_as)return -ENOMEM;
+    if(!new_as){
+        rc=-ENOMEM;
+        goto exec_early_fail;
+    }
     if(!c3_exec_map_user_stack(new_as)){
         paging_destroy_address_space(new_as);
-        return -ENOMEM;
+        new_as=0;
+        rc=-ENOMEM;
+        goto exec_early_fail;
     }
 
     cur->addr_space=new_as;
-    cur->brk_start=0x800000ULL;
-    cur->brk_current=0x800000ULL;
-    cur->mmap_base=0x40000000ULL;
+    cur->brk_start=0;
+    cur->brk_current=0;
+    cur->mmap_base=C3_USER_LOW_SAFE;
     cur->ctx.rsp=C3_USER_STACK_TOP-16;
     cur->entry_point=0;
     cur->exec_path[0]=0;
@@ -6535,6 +12320,16 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
     compat3_set_next_image_name(npath);
     rc=elf64_map_into_task(cur,data,sz);
     if(rc<0)goto exec_fail;
+    if(c3_task_is_wayfire_runtime(cur)&&
+       (c3_has_token(npath,"/usr/bin/waybar")||
+        c3_has_token(npath,"/usr/bin/nwg-dock-hyprland")||
+        c3_has_token(npath,"/usr/bin/wofi")||
+        c3_has_token(npath,"/usr/bin/ridux-open-launcher-native")||
+        c3_has_token(npath,"/usr/libexec/xdg-desktop-portal"))){
+        __boot_serial_force_puts("[wayfire-execve] mapped main ");
+        __boot_serial_force_puts(npath);
+        __boot_serial_force_puts("\n");
+    }
 
     if(has_interp){
         rc=c3_exec_collect_elf_info(interp_data,interp_sz,cur->mmap_base,&interp_lb,&interp_entry,&interp_phdr,&interp_phent,&interp_phnum);
@@ -6542,6 +12337,16 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
         compat3_set_next_image_name(interp_path);
         rc=elf64_map_into_task(cur,interp_data,interp_sz);
         if(rc<0)goto exec_fail;
+        if(c3_task_is_wayfire_runtime(cur)&&
+           (c3_has_token(npath,"/usr/bin/waybar")||
+            c3_has_token(npath,"/usr/bin/nwg-dock-hyprland")||
+            c3_has_token(npath,"/usr/bin/wofi")||
+            c3_has_token(npath,"/usr/bin/ridux-open-launcher-native")||
+            c3_has_token(npath,"/usr/libexec/xdg-desktop-portal"))){
+            __boot_serial_force_puts("[wayfire-execve] mapped interp ");
+            __boot_serial_force_puts(interp_path);
+            __boot_serial_force_puts("\n");
+        }
         cur->ctx.rip=interp_entry;
         cur->entry_point=interp_entry;
     }else{
@@ -6554,6 +12359,10 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
 
     c3_strlcpy(cur->exec_path,npath,sizeof(cur->exec_path));
     c3_task_force_browser_stable_mode(cur,npath);
+    if(!c3_place_user_heap(cur,"exec")){
+        rc=-ENOMEM;
+        goto exec_fail;
+    }
     cur->aux_at_phdr=main_phdr;
     cur->aux_at_phent=main_phent;
     cur->aux_at_phnum=main_phnum;
@@ -6592,7 +12401,22 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
         if(rc<0)goto exec_fail;
     }
 
+    if(is_fusermount_exec&&fuse_commfd>=0){
+        if(fd_valid(&cur->fdt,fuse_commfd)&&cur->fdt.fds[fuse_commfd].kind==FDKIND_SOCKET){
+            if(cur->fdt.fds[fuse_commfd].flags&FDFL_CLOEXEC){
+                cur->fdt.fds[fuse_commfd].flags&=(uint16_t)~FDFL_CLOEXEC;
+                c3_fd_group_copy_fd(cur,fuse_commfd);
+                __boot_serial_force_puts("[execve-fusermount-preserve-commfd!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fuse_commfd);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        c3_force_one_fd("[execve-fusermount-fd-precloexec!]",cur,fuse_commfd);
+    }
     c3_exec_close_cloexec_fds(cur);
+    if(is_fusermount_exec&&fuse_commfd>=0)c3_force_one_fd("[execve-fusermount-fd-after!]",cur,fuse_commfd);
     if(c3_trace_firefox_path_needed(npath))c3_trace_fd_table("[execve-firefox-fds-after-cloexec]",cur);
     if(is_chrome_exec){
         static uint32_t chrome_fd_after_trace_count=0;
@@ -6603,6 +12427,7 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
     }
     c3_exec_reset_signal_state(cur);
     compat4_tls_reset_task(g_current_task);
+    c3_rseq_forget_task(g_current_task);
     if(has_interp){
         /*
          * A Linux kernel does not prebuild a glibc TCB for dynamically
@@ -6624,12 +12449,46 @@ int64_t real_sys_execve(const char *path,char *const argv[],char *const envp[]){
         while(*s){if(*s=='/')n=s+1;++s;}
         c3_strlcpy(cur->name,n,TASK_NAME_LEN);
     }
+    if(has_interp&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t trace_count=0;
+        bool hold_loader_preempt =
+            c3_task_is_hyprland_compositor(cur) ||
+            c3_has_token(npath,"/Hyprland") ||
+            c3_has_token(npath,"/hyprland") ||
+            c3_has_token(npath,"/start-hyprland") ||
+            c3_has_token(npath,"/wayfire") ||
+            c3_has_token(npath,"/startwayfire");
+        cur->no_timer_preempt=hold_loader_preempt;
+        if(!hold_loader_preempt)g_task_preempt_defer_ticks=1;
+        if(c3_wayfire_debug_trace_enabled()&&trace_count<64){
+            ++trace_count;
+            __boot_serial_puts(hold_loader_preempt ?
+                "[desktop-loader-preempt-hold] pid=" :
+                "[desktop-loader-preempt-open] pid=");
+            __boot_serial_putu32((uint32_t)cur->pid);
+            c3_trace_task_name(cur);
+            __boot_serial_puts(" path=");
+            __boot_serial_puts(npath);
+            __boot_serial_puts("\n");
+        }
+    }
     c3_exec_wake_vfork_parent(cur);
+    if(execve_locked){
+        c3_execve_lock_release();
+        execve_locked=false;
+    }
     /* execve success never returns to the pre-exec syscall site.
      * Jump straight into the new image so we do not iretq back to
      * the old user RIP with a replaced address space underneath. */
     task_launch_to_user(cur);
     return 0;
+
+exec_early_fail:
+    if(execve_locked){
+        c3_execve_lock_release();
+        execve_locked=false;
+    }
+    return rc<0?rc:-ENOEXEC;
 
 exec_fail:
     cur->addr_space=old_as;
@@ -6675,6 +12534,10 @@ exec_fail:
     c3_strlcpy(cur->exec_path,old_exec_path,sizeof(cur->exec_path));
     if(switched&&old_as)paging_switch(old_as);
     if(new_as&&new_as!=old_as)paging_destroy_address_space(new_as);
+    if(execve_locked){
+        c3_execve_lock_release();
+        execve_locked=false;
+    }
     return rc<0?rc:-ENOEXEC;
 }
 
@@ -6684,14 +12547,47 @@ exec_fail:
 #define C3_FUTEX_BITSET_ANY     0xFFFFFFFFu
 
 typedef struct {
-    uint64_t next;
-} c3_robust_list64_t;
-
-typedef struct {
     uint64_t list_next;
     int64_t  futex_offset;
     uint64_t list_op_pending;
 } c3_robust_list_head64_t;
+
+static bool c3_exit_user_range_ok(address_space_t *as,uint64_t va,uint64_t len,bool write){
+    uint64_t end,page,last;
+    if(!as||!len)return false;
+    end=va+len-1ULL;
+    if(end<va)return false;
+    if(va>=0x0000800000000000ULL||end>=0x0000800000000000ULL)return false;
+    page=va&~(PAGE_SIZE-1ULL);
+    last=end&~(PAGE_SIZE-1ULL);
+    for(;;){
+        uint64_t entry=paging_get_entry(as,page);
+        if(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER))return false;
+        if(write&&!(entry&PAGE_WRITABLE))return false;
+        if(page==last)break;
+        page+=PAGE_SIZE;
+        if(!page)return false;
+    }
+    return true;
+}
+
+static bool c3_exit_user_read64(address_space_t *as,uint64_t va,uint64_t *out){
+    if(!out||!c3_exit_user_range_ok(as,va,sizeof(uint64_t),false))return false;
+    *out=*(uint64_t*)(uintptr_t)va;
+    return true;
+}
+
+static bool c3_exit_user_read32(address_space_t *as,uint64_t va,uint32_t *out){
+    if(!out||!c3_exit_user_range_ok(as,va,sizeof(uint32_t),false))return false;
+    *out=*(uint32_t*)(uintptr_t)va;
+    return true;
+}
+
+static bool c3_exit_user_write32(address_space_t *as,uint64_t va,uint32_t value){
+    if(!c3_exit_user_range_ok(as,va,sizeof(uint32_t),true))return false;
+    *(uint32_t*)(uintptr_t)va=value;
+    return true;
+}
 
 static void c3_robust_wake_one(task_t *cur,uint64_t node,int64_t futex_offset){
     uint64_t faddr;
@@ -6701,42 +12597,147 @@ static void c3_robust_wake_one(task_t *cur,uint64_t node,int64_t futex_offset){
     faddr=(uint64_t)((int64_t)node+futex_offset);
     if(!faddr||((uintptr_t)faddr&3U)!=0)return;
     uaddr=(uint32_t*)(uintptr_t)faddr;
-    oldv=*uaddr;
+    if(!c3_exit_user_read32(cur->addr_space,faddr,&oldv))return;
     if((oldv&C3_FUTEX_TID_MASK)!=(uint32_t)cur->pid)return;
     newv=(oldv&C3_FUTEX_WAITERS_BIT)|C3_FUTEX_OWNER_DIED_BIT;
-    *uaddr=newv;
+    if(!c3_exit_user_write32(cur->addr_space,faddr,newv))return;
     woken=c3_futex_wake_n(uaddr,1,(uintptr_t)cur->addr_space,true,C3_FUTEX_BITSET_ANY);
     if(!woken)(void)c3_futex_wake_n(uaddr,(uint32_t)-1,0,false,C3_FUTEX_BITSET_ANY);
 }
 
 static void c3_robust_list_exit(task_t *cur){
-    c3_robust_list_head64_t *head;
     uint64_t head_addr,next,pending;
+    uint64_t offset_bits;
     int64_t futex_offset;
     uint32_t guard=0;
     if(!cur||!cur->robust_list_head)return;
     if(cur->robust_list_len&&cur->robust_list_len<sizeof(c3_robust_list_head64_t))return;
     head_addr=cur->robust_list_head;
-    head=(c3_robust_list_head64_t*)(uintptr_t)head_addr;
-    next=head->list_next;
-    futex_offset=head->futex_offset;
-    pending=head->list_op_pending;
+    if(!c3_exit_user_read64(cur->addr_space,head_addr+0u,&next))return;
+    if(!c3_exit_user_read64(cur->addr_space,head_addr+8u,&offset_bits))return;
+    if(!c3_exit_user_read64(cur->addr_space,head_addr+16u,&pending))return;
+    futex_offset=(int64_t)offset_bits;
     while(next&&next!=head_addr&&guard++<2048u){
-        c3_robust_list64_t *node=(c3_robust_list64_t*)(uintptr_t)next;
         uint64_t cur_node=next;
-        next=node->next;
+        if(!c3_exit_user_read64(cur->addr_space,next,&next))break;
         c3_robust_wake_one(cur,cur_node,futex_offset);
     }
     if(pending&&pending!=head_addr)c3_robust_wake_one(cur,pending,futex_offset);
 }
 
+static void c3_trace_browser_exit_now(task_t *cur,const char *kind,int code){
+    static uint32_t trace_count;
+    uint64_t *f;
+    uint64_t rip=0,rsp=0;
+    if(!cur||trace_count>=48u)return;
+    if(!c3_task_is_chromium_runtime(cur)&&!c3_task_is_firefox_runtime(cur))return;
+    ++trace_count;
+    f=task_syscall_user_frame(cur);
+    if(f){
+        rip=f[17];
+        rsp=f[20];
+    }else{
+        rip=cur->ctx.rip;
+        rsp=cur->ctx.rsp;
+    }
+    __boot_serial_force_puts("[browser-exit!] ");
+    __boot_serial_force_puts(kind?kind:"exit");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" code=");
+    __boot_serial_force_putu32((uint32_t)code);
+    __boot_serial_force_puts(" rip=");
+    __boot_serial_force_puthex64(rip);
+    __boot_serial_force_puts(" rsp=");
+    __boot_serial_force_puthex64(rsp);
+    __boot_serial_force_puts("\n");
+    c3_force_browser_addr_mapping(cur,rip,"browser-exit-rip");
+    if(rsp&&rsp>=0x10000ULL&&rsp<C3_USER_TOP&&cur->addr_space){
+        int i;
+        for(i=0;i<16;++i){
+            uint64_t a=rsp+(uint64_t)i*8ULL;
+            uint64_t sv=0;
+            if(!(paging_get_entry(cur->addr_space,a)&PAGE_PRESENT))break;
+            sv=*(uint64_t*)(uintptr_t)a;
+            if((i&3)==0){
+                __boot_serial_force_puts("[browser-exit-stack!] +");
+                __boot_serial_force_putu32((uint32_t)(i*8));
+                __boot_serial_force_puts(":");
+            }
+            __boot_serial_force_puts(" ");
+            __boot_serial_force_puthex64(sv);
+            if((i&3)==3)__boot_serial_force_puts("\n");
+            c3_force_browser_addr_mapping(cur,sv,"browser-exit-sp");
+        }
+        if((i&3)!=0)__boot_serial_force_puts("\n");
+    }
+}
+
+static void c3_trace_wayfire_exit_now(task_t *cur,const char *kind,int code){
+    static uint32_t trace_count;
+    uint64_t *f;
+    uint64_t rip=0,rsp=0;
+    if(!cur||trace_count>=64u)return;
+    if(!c3_task_is_wayfire_runtime(cur))return;
+    if(code==0&&!c3_wayfire_debug_trace_enabled())return;
+    ++trace_count;
+    f=task_syscall_user_frame(cur);
+    if(f){
+        rip=f[17];
+        rsp=f[20];
+    }else{
+        rip=cur->ctx.rip;
+        rsp=cur->ctx.rsp;
+    }
+    __boot_serial_force_puts("[wayfire-exit!] ");
+    __boot_serial_force_puts(kind?kind:"exit");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" code=");
+    __boot_serial_force_putu32((uint32_t)code);
+    __boot_serial_force_puts(" rip=");
+    __boot_serial_force_puthex64(rip);
+    __boot_serial_force_puts(" rsp=");
+    __boot_serial_force_puthex64(rsp);
+    __boot_serial_force_puts("\n");
+    c3_force_wayfire_addr_mapping(cur,rip,"wayfire-exit-rip");
+    if(rsp&&rsp>=0x10000ULL&&rsp<C3_USER_TOP&&cur->addr_space){
+        int i;
+        for(i=0;i<24;++i){
+            uint64_t a=rsp+(uint64_t)i*8ULL;
+            uint64_t sv=0;
+            if(!(paging_get_entry(cur->addr_space,a)&PAGE_PRESENT))break;
+            sv=*(uint64_t*)(uintptr_t)a;
+            if((i&3)==0){
+                __boot_serial_force_puts("[wayfire-exit-stack!] +");
+                __boot_serial_force_putu32((uint32_t)(i*8));
+                __boot_serial_force_puts(":");
+            }
+            __boot_serial_force_puts(" ");
+            __boot_serial_force_puthex64(sv);
+            if((i&3)==3)__boot_serial_force_puts("\n");
+            c3_force_wayfire_addr_mapping(cur,sv,"wayfire-exit-sp");
+        }
+        if((i&3)!=0)__boot_serial_force_puts("\n");
+    }
+}
+
+static bool c3_same_thread_group(const task_t *a,const task_t *b);
+static bool c3_thread_group_has_live_peer(const task_t *cur);
+static void c3_exit_thread_group_peers(task_t *cur,int code,const char *why);
+
 int64_t real_sys_exit(int code){
     task_t *cur=task_current();
     int ti=g_current_task;
     static uint32_t force_exit_trace_count;
+    uint32_t exit_trace_seq=force_exit_trace_count++;
+    bool trace_exit=(code!=0)||c3_syscall_debug_trace_enabled()||c3_wayfire_debug_trace_enabled();
     if(!cur)return -ESRCH;
-    if(force_exit_trace_count<128u||code!=0){
-        ++force_exit_trace_count;
+    c3_trace_browser_exit_now(cur,"exit",code);
+    c3_trace_wayfire_exit_now(cur,"exit",code);
+    if(trace_exit&&(exit_trace_seq<96u||(code!=0&&(exit_trace_seq&0x3FFu)==0))){
         __boot_serial_force_puts("[exit!] pid=");
         __boot_serial_force_putu32((uint32_t)cur->pid);
         __boot_serial_force_puts(" code=");
@@ -6744,29 +12745,38 @@ int64_t real_sys_exit(int code){
         c3_force_task_name(cur);
         __boot_serial_force_puts("\n");
     }
-    __boot_serial_puts("[exit] pid=");
-    __boot_serial_putu32((uint32_t)cur->pid);
-    __boot_serial_puts(" code=");
-    __boot_serial_putu32((uint32_t)code);
-    __boot_serial_puts("\n");
+    if(trace_exit){
+        __boot_serial_puts("[exit] pid=");
+        __boot_serial_putu32((uint32_t)cur->pid);
+        __boot_serial_puts(" code=");
+        __boot_serial_putu32((uint32_t)code);
+        __boot_serial_puts("\n");
+    }
     c3_robust_list_exit(cur);
     if(cur&&cur->clear_child_tid){
         uint32_t *ctid=(uint32_t*)(uintptr_t)cur->clear_child_tid;
-        __boot_serial_puts("[exit] clear_child_tid=");
-        __boot_serial_puthex64(cur->clear_child_tid);
-        __boot_serial_puts("\n");
-        *ctid=0;
-        { uint32_t woken=c3_futex_wake_n(ctid,1,(uintptr_t)cur->addr_space,true,0xFFFFFFFFu);
-          __boot_serial_puts("[exit] futex_wake woken=");
-          __boot_serial_putu32(woken);
-          __boot_serial_puts("\n");
-          if(!woken){
-              /* Try broader wake without exact key match */
-              woken=c3_futex_wake_n(ctid,(uint32_t)-1,0,false,0xFFFFFFFFu);
-              __boot_serial_puts("[exit] futex_wake(broad) woken=");
-              __boot_serial_putu32(woken);
-              __boot_serial_puts("\n");
-          }
+        if(trace_exit){
+            __boot_serial_puts("[exit] clear_child_tid=");
+            __boot_serial_puthex64(cur->clear_child_tid);
+            __boot_serial_puts("\n");
+        }
+        if(c3_exit_user_write32(cur->addr_space,cur->clear_child_tid,0)){
+            uint32_t woken=c3_futex_wake_n(ctid,1,(uintptr_t)cur->addr_space,true,0xFFFFFFFFu);
+            if(trace_exit){
+                __boot_serial_puts("[exit] futex_wake woken=");
+                __boot_serial_putu32(woken);
+                __boot_serial_puts("\n");
+            }
+            if(!woken){
+                woken=c3_futex_wake_n(ctid,(uint32_t)-1,0,false,0xFFFFFFFFu);
+                if(trace_exit){
+                    __boot_serial_puts("[exit] futex_wake(broad) woken=");
+                    __boot_serial_putu32(woken);
+                    __boot_serial_puts("\n");
+                }
+            }
+        }else{
+            if(trace_exit)__boot_serial_puts("[exit] clear_child_tid skipped (bad user ptr)\n");
         }
     }
     if(cur){
@@ -6777,7 +12787,10 @@ int64_t real_sys_exit(int code){
         g_c3_seccomp_flags[ti]=0;
         g_c3_ns_mask[ti]=0;
         g_c3_no_new_privs[ti]=0;
+        c3_rseq_forget_task(ti);
     }
+    if(code>=128&&c3_thread_group_has_live_peer(cur))
+        c3_exit_thread_group_peers(cur,code,"fatal-exit");
     task_exit(cur->pid,code);
     task_schedule();
     /* No more runnable user tasks. Do NOT halt the CPU: the original
@@ -6804,11 +12817,58 @@ static bool c3_same_thread_group(const task_t *a,const task_t *b){
     return ag==bg;
 }
 
+static bool c3_thread_group_has_live_peer(const task_t *cur){
+    int i;
+    if(!cur)return false;
+    for(i=0;i<TASK_MAX;++i){
+        task_t *t=&g_tasks[i];
+        if(!t->used||t==cur)continue;
+        if(t->state==TASK_ZOMBIE||t->state==TASK_FREE)continue;
+        if(c3_same_thread_group(cur,t))return true;
+    }
+    return false;
+}
+
+static void c3_exit_thread_group_peers(task_t *cur,int code,const char *why){
+    int i;
+    static uint32_t trace_count=0;
+    if(!cur)return;
+    if(trace_count<64u){
+        ++trace_count;
+        __boot_serial_force_puts("[exit-group-peers!] why=");
+        __boot_serial_force_puts(why?why:"?");
+        __boot_serial_force_puts(" tgid=");
+        __boot_serial_force_putu32((uint32_t)(cur->tgid?cur->tgid:cur->pid));
+        __boot_serial_force_puts(" code=");
+        __boot_serial_force_putu32((uint32_t)code);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts("\n");
+    }
+    for(i=0;i<TASK_MAX;++i){
+        task_t *t=&g_tasks[i];
+        if(!t->used||t==cur)continue;
+        if(t->state==TASK_ZOMBIE||t->state==TASK_FREE)continue;
+        if(!c3_same_thread_group(cur,t))continue;
+        c3_robust_list_exit(t);
+        if(t->clear_child_tid){
+            uint32_t *ctid=(uint32_t*)(uintptr_t)t->clear_child_tid;
+            if(c3_exit_user_write32(t->addr_space,t->clear_child_tid,0)){
+                (void)c3_futex_wake_n(ctid,(uint32_t)-1,(uintptr_t)t->addr_space,true,0xFFFFFFFFu);
+                (void)c3_futex_wake_n(ctid,(uint32_t)-1,0,false,0xFFFFFFFFu);
+            }
+        }
+        c3_futex_waiter_remove_task_uaddr(i,0,0,false);
+        c3_rseq_forget_task(i);
+        task_exit(t->pid,code);
+    }
+}
+
 static void c3_trace_exit_group_stack(task_t *cur){
     static uint32_t trace_count=0;
     uint64_t *f;
     uint64_t rip=0,rsp=0;
     int i;
+    if(!c3_syscall_debug_trace_enabled()&&!c3_wayfire_debug_trace_enabled())return;
     if(!cur||trace_count>=8)return;
     ++trace_count;
     f=task_syscall_user_frame(cur);
@@ -6846,29 +12906,19 @@ static void c3_trace_exit_group_stack(task_t *cur){
 
 int64_t real_sys_exit_group(int code){
     task_t *cur=task_current();
-    int i;
+    bool trace_exit=(code!=0)||c3_syscall_debug_trace_enabled()||c3_wayfire_debug_trace_enabled();
     if(!cur)return -ESRCH;
+    c3_trace_browser_exit_now(cur,"exit_group",code);
+    c3_trace_wayfire_exit_now(cur,"exit_group",code);
     c3_trace_exit_group_stack(cur);
-    __boot_serial_puts("[exit_group] tgid=");
-    __boot_serial_putu32((uint32_t)(cur->tgid?cur->tgid:cur->pid));
-    __boot_serial_puts(" code=");
-    __boot_serial_putu32((uint32_t)code);
-    __boot_serial_puts("\n");
-    for(i=0;i<TASK_MAX;++i){
-        task_t *t=&g_tasks[i];
-        if(!t->used||t==cur)continue;
-        if(t->state==TASK_ZOMBIE||t->state==TASK_FREE)continue;
-        if(!c3_same_thread_group(cur,t))continue;
-        c3_robust_list_exit(t);
-        if(t->clear_child_tid){
-            uint32_t *ctid=(uint32_t*)(uintptr_t)t->clear_child_tid;
-            *ctid=0;
-            (void)c3_futex_wake_n(ctid,(uint32_t)-1,(uintptr_t)t->addr_space,true,0xFFFFFFFFu);
-            (void)c3_futex_wake_n(ctid,(uint32_t)-1,0,false,0xFFFFFFFFu);
-        }
-        c3_futex_waiter_remove_task_uaddr(i,0,0,false);
-        task_exit(t->pid,code);
+    if(trace_exit){
+        __boot_serial_puts("[exit_group] tgid=");
+        __boot_serial_putu32((uint32_t)(cur->tgid?cur->tgid:cur->pid));
+        __boot_serial_puts(" code=");
+        __boot_serial_putu32((uint32_t)code);
+        __boot_serial_puts("\n");
     }
+    c3_exit_thread_group_peers(cur,code,"exit_group");
     return real_sys_exit(code);
 }
 
@@ -6884,7 +12934,7 @@ int64_t real_sys_wait4(int pid,int *status,int options,void *rusage){
      * separation failing for the shared stack page). If they differ,
      * something is overwriting the iretq frame's rsp slot during the
      * syscall handler. */
-    {
+    if(c3_syscall_debug_trace_enabled()){
       uint64_t *f=task_syscall_user_frame(task_current());
       __boot_serial_puts("[wait4 enter] pid_arg=");
       __boot_serial_putu32((uint32_t)pid);
@@ -6896,7 +12946,7 @@ int64_t real_sys_wait4(int pid,int *status,int options,void *rusage){
     }
     (void)rusage;
     r=(int64_t)task_waitpid(pid,status,options);
-    {
+    if(c3_syscall_debug_trace_enabled()){
       uint64_t *f=task_syscall_user_frame(task_current());
       __boot_serial_puts("[wait4 exit ] ret=");
       __boot_serial_puthex64((uint64_t)r);
@@ -6924,7 +12974,7 @@ typedef struct {
 } c3_linux_siginfo_chld_t;
 
 int64_t real_sys_waitid(int idtype,int id,void *infop,int options,void *rusage){
-    enum { C3_P_ALL=0, C3_P_PID=1, C3_P_PGID=2 };
+    enum { C3_P_ALL=0, C3_P_PID=1, C3_P_PGID=2, C3_P_PIDFD=3 };
     enum { C3_WNOHANG=1, C3_WEXITED=4, C3_WNOWAIT=0x01000000 };
     enum { C3_SIGCHLD=17, C3_CLD_EXITED=1 };
     task_t *cur=task_current();
@@ -6943,6 +12993,12 @@ int64_t real_sys_waitid(int idtype,int id,void *infop,int options,void *rusage){
         wait_pid=id;
     }else if(idtype==C3_P_PGID){
         wait_pid=id? -id : 0;
+    }else if(idtype==C3_P_PIDFD){
+        if(id<0)return -EINVAL;
+        if(!fd_valid(&cur->fdt,id))return -EBADF;
+        if(cur->fdt.fds[id].kind!=FDKIND_PIDFD)return -EINVAL;
+        wait_pid=cur->fdt.fds[id].ref;
+        if(wait_pid<=0)return -EINVAL;
     }else{
         return -EINVAL;
     }
@@ -7008,8 +13064,127 @@ int64_t real_sys_getuid(void){return(int64_t)task_current()->uid;}
 int64_t real_sys_getgid(void){return(int64_t)task_current()->gid;}
 int64_t real_sys_geteuid(void){return(int64_t)task_current()->euid;}
 int64_t real_sys_getegid(void){return(int64_t)task_current()->egid;}
-int64_t real_sys_setuid(int uid){task_current()->uid=uid;task_current()->euid=uid;return 0;}
-int64_t real_sys_setgid(int gid){task_current()->gid=gid;task_current()->egid=gid;return 0;}
+static void c3_update_aux_creds(task_t *t){
+    if(!t)return;
+    t->aux_at_uid=(uint64_t)t->uid;
+    t->aux_at_euid=(uint64_t)t->euid;
+    t->aux_at_gid=(uint64_t)t->gid;
+    t->aux_at_egid=(uint64_t)t->egid;
+}
+static bool c3_uid_allowed(const task_t *t,int uid){
+    return t&&(uid==t->uid||uid==t->euid||uid==t->suid);
+}
+static bool c3_gid_allowed(const task_t *t,int gid){
+    return t&&(gid==t->gid||gid==t->egid||gid==t->sgid);
+}
+int64_t real_sys_setuid(int uid){
+    task_t *cur=task_current();
+    if(!cur)return -ESRCH;
+    if(uid<0)return -EINVAL;
+    if(cur->euid==0){
+        cur->uid=uid; cur->euid=uid; cur->suid=uid;
+    }else if(c3_uid_allowed(cur,uid)){
+        cur->euid=uid;
+    }else{
+        return -EPERM;
+    }
+    c3_update_aux_creds(cur);
+    return 0;
+}
+int64_t real_sys_setgid(int gid){
+    task_t *cur=task_current();
+    if(!cur)return -ESRCH;
+    if(gid<0)return -EINVAL;
+    if(cur->egid==0){
+        cur->gid=gid; cur->egid=gid; cur->sgid=gid;
+    }else if(c3_gid_allowed(cur,gid)){
+        cur->egid=gid;
+    }else{
+        return -EPERM;
+    }
+    c3_update_aux_creds(cur);
+    return 0;
+}
+int64_t real_sys_setreuid(int ruid,int euid){
+    task_t *cur=task_current();
+    int nr,ne;
+    if(!cur)return -ESRCH;
+    if(ruid<-1||euid<-1)return -EINVAL;
+    nr=(ruid==-1)?cur->uid:ruid;
+    ne=(euid==-1)?cur->euid:euid;
+    if(cur->euid!=0){
+        if(ruid!=-1&&!c3_uid_allowed(cur,nr))return -EPERM;
+        if(euid!=-1&&!c3_uid_allowed(cur,ne))return -EPERM;
+    }
+    cur->uid=nr;
+    cur->euid=ne;
+    if(ruid!=-1||euid!=-1)cur->suid=cur->euid;
+    c3_update_aux_creds(cur);
+    return 0;
+}
+int64_t real_sys_setregid(int rgid,int egid){
+    task_t *cur=task_current();
+    int nr,ne;
+    if(!cur)return -ESRCH;
+    if(rgid<-1||egid<-1)return -EINVAL;
+    nr=(rgid==-1)?cur->gid:rgid;
+    ne=(egid==-1)?cur->egid:egid;
+    if(cur->egid!=0){
+        if(rgid!=-1&&!c3_gid_allowed(cur,nr))return -EPERM;
+        if(egid!=-1&&!c3_gid_allowed(cur,ne))return -EPERM;
+    }
+    cur->gid=nr;
+    cur->egid=ne;
+    if(rgid!=-1||egid!=-1)cur->sgid=cur->egid;
+    c3_update_aux_creds(cur);
+    return 0;
+}
+int64_t real_sys_getresuid(uint32_t *ruid,uint32_t *euid,uint32_t *suid){
+    task_t *cur=task_current();
+    if(!cur)return -ESRCH;
+    if(!ruid||!euid||!suid)return -EFAULT;
+    *ruid=(uint32_t)cur->uid; *euid=(uint32_t)cur->euid; *suid=(uint32_t)cur->suid;
+    return 0;
+}
+int64_t real_sys_getresgid(uint32_t *rgid,uint32_t *egid,uint32_t *sgid){
+    task_t *cur=task_current();
+    if(!cur)return -ESRCH;
+    if(!rgid||!egid||!sgid)return -EFAULT;
+    *rgid=(uint32_t)cur->gid; *egid=(uint32_t)cur->egid; *sgid=(uint32_t)cur->sgid;
+    return 0;
+}
+int64_t real_sys_setresuid(uint32_t ruid,uint32_t euid,uint32_t suid){
+    task_t *cur=task_current();
+    int nr,ne,ns;
+    if(!cur)return -ESRCH;
+    nr=(ruid==(uint32_t)-1)?cur->uid:(int)ruid;
+    ne=(euid==(uint32_t)-1)?cur->euid:(int)euid;
+    ns=(suid==(uint32_t)-1)?cur->suid:(int)suid;
+    if(cur->euid!=0){
+        if(ruid!=(uint32_t)-1&&!c3_uid_allowed(cur,nr))return -EPERM;
+        if(euid!=(uint32_t)-1&&!c3_uid_allowed(cur,ne))return -EPERM;
+        if(suid!=(uint32_t)-1&&!c3_uid_allowed(cur,ns))return -EPERM;
+    }
+    cur->uid=nr; cur->euid=ne; cur->suid=ns;
+    c3_update_aux_creds(cur);
+    return 0;
+}
+int64_t real_sys_setresgid(uint32_t rgid,uint32_t egid,uint32_t sgid){
+    task_t *cur=task_current();
+    int nr,ne,ns;
+    if(!cur)return -ESRCH;
+    nr=(rgid==(uint32_t)-1)?cur->gid:(int)rgid;
+    ne=(egid==(uint32_t)-1)?cur->egid:(int)egid;
+    ns=(sgid==(uint32_t)-1)?cur->sgid:(int)sgid;
+    if(cur->egid!=0){
+        if(rgid!=(uint32_t)-1&&!c3_gid_allowed(cur,nr))return -EPERM;
+        if(egid!=(uint32_t)-1&&!c3_gid_allowed(cur,ne))return -EPERM;
+        if(sgid!=(uint32_t)-1&&!c3_gid_allowed(cur,ns))return -EPERM;
+    }
+    cur->gid=nr; cur->egid=ne; cur->sgid=ns;
+    c3_update_aux_creds(cur);
+    return 0;
+}
 int64_t real_sys_setpgid(int pid,int pgid){
     if(!pid)pid=task_current()->pid;
     return(int64_t)task_setpgid(pid,pgid);
@@ -7127,12 +13302,44 @@ int64_t real_sys_kill(int pid,int sig){
     return c3_signal_after_send("kill",pid,sig,rc);
 }
 int64_t real_sys_tkill(int tid,int sig){
+    if(sig==32||sig==33){
+        task_t *cur=task_current();
+        if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t trace_count=0;
+            if(trace_count<16u){
+                ++trace_count;
+                __boot_serial_force_puts("[wayfire-nptl-sig-skip!] op=tkill tid=");
+                __boot_serial_force_putu32((uint32_t)tid);
+                __boot_serial_force_puts(" sig=");
+                __boot_serial_force_putu32((uint32_t)sig);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return -EINVAL;
+    }
     int rc=sig_send(tid,sig);
     return c3_signal_after_send("tkill",tid,sig,rc);
 }
 int64_t real_sys_tgkill(int tgid,int tid,int sig){
     task_t *t=c3_task_by_pid(tid);
     if(tgid>0&&(!t||(t->tgid?t->tgid:t->pid)!=tgid))return -ESRCH;
+    if(sig==32||sig==33){
+        task_t *cur=task_current();
+        if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t trace_count=0;
+            if(trace_count<32u){
+                ++trace_count;
+                __boot_serial_force_puts("[wayfire-nptl-sig-skip!] op=tgkill tgid=");
+                __boot_serial_force_putu32((uint32_t)tgid);
+                __boot_serial_force_puts(" tid=");
+                __boot_serial_force_putu32((uint32_t)tid);
+                __boot_serial_force_puts(" sig=");
+                __boot_serial_force_putu32((uint32_t)sig);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return -EINVAL;
+    }
     return c3_signal_after_send("tgkill",tid,sig,sig_send(tid,sig));
 }
 
@@ -7147,6 +13354,34 @@ static void c3_sigset_drop_unblockable(sigset_t2 *s){
     if(!s)return;
     s->sig[SIGKILL/64]&=~(1ULL<<(SIGKILL%64));
     s->sig[SIGSTOP/64]&=~(1ULL<<(SIGSTOP%64));
+}
+
+static bool c3_sigset_has_bit(const sigset_t2 *s,int sig){
+    int idx,bit;
+    if(!s||sig<=0||sig>=NSIG)return false;
+    idx=sig/64;
+    bit=sig%64;
+    if(idx<0||idx>1)return false;
+    return (s->sig[idx]&(1ULL<<bit))!=0;
+}
+
+static void c3_sigset_clear_bit(sigset_t2 *s,int sig){
+    int idx,bit;
+    if(!s||sig<=0||sig>=NSIG)return;
+    idx=sig/64;
+    bit=sig%64;
+    if(idx<0||idx>1)return;
+    s->sig[idx]&=~(1ULL<<bit);
+}
+
+static int c3_pending_signal_in_set(task_t *t,const sigset_t2 *wanted){
+    int sig;
+    if(!t||!wanted)return 0;
+    for(sig=1;sig<NSIG;++sig){
+        if(c3_sigset_has_bit(&t->sig_pending,sig)&&c3_sigset_has_bit(wanted,sig))
+            return sig;
+    }
+    return 0;
 }
 
 static bool c3_task_has_unblocked_signal(const task_t *t){
@@ -7213,12 +13448,77 @@ int64_t real_sys_rt_sigprocmask(int how,const void *set,void *oldset,size_t sigs
 int64_t real_sys_rt_sigreturn(void){
     task_t *cur=task_current();
     if(!cur)return -ESRCH;
-    if(cur->sig_in_handler){
-        cur->sig_blocked=cur->sig_saved_mask;
-        cur->sig_in_handler=false;
-    }
-    sig_check_pending(cur);
+    return sig_restore_context(cur);
+}
+
+int64_t real_sys_rt_sigpending(void *set,size_t sigsetsize){
+    task_t *cur=task_current();
+    size_t nbytes=sigsetsize?sigsetsize:sizeof(sigset_t2);
+    if(!cur)return -ESRCH;
+    if(!set)return -EFAULT;
+    if(sigsetsize&&(sigsetsize<sizeof(uint64_t)||sigsetsize>sizeof(sigset_t2)))return -EINVAL;
+    if(nbytes>sizeof(sigset_t2))nbytes=sizeof(sigset_t2);
+    c3_memcpy(set,&cur->sig_pending,nbytes);
     return 0;
+}
+
+int64_t real_sys_rt_sigtimedwait(const void *set,void *info,const timespec_t *timeout,size_t sigsetsize){
+    task_t *cur=task_current();
+    sigset_t2 wanted;
+    size_t nbytes=sigsetsize?sigsetsize:sizeof(sigset_t2);
+    uint64_t deadline=0;
+    bool has_timeout=false;
+    if(!cur)return -ESRCH;
+    if(!set)return -EFAULT;
+    if(sigsetsize&&(sigsetsize<sizeof(uint64_t)||sigsetsize>sizeof(sigset_t2)))return -EINVAL;
+    if(nbytes>sizeof(sigset_t2))nbytes=sizeof(sigset_t2);
+    c3_memset(&wanted,0,sizeof(wanted));
+    c3_memcpy(&wanted,set,nbytes);
+    c3_sigset_drop_unblockable(&wanted);
+    if(timeout){
+        uint32_t ms;
+        if(timeout->tv_sec<0||timeout->tv_nsec<0||timeout->tv_nsec>=1000000000LL)return -EINVAL;
+        has_timeout=true;
+        ms=c3_timespec_to_ms_ceil(timeout);
+        deadline=ms?c3_dyn_deadline_from_ms(ms):c3_rdtsc();
+    }
+    for(;;){
+        int sig=c3_pending_signal_in_set(cur,&wanted);
+        if(sig){
+            c3_sigset_clear_bit(&cur->sig_pending,sig);
+            if(info){
+                uint8_t *si=(uint8_t*)info;
+                c3_memset(si,0,128);
+                *(int*)(si+0)=sig;
+                *(int*)(si+4)=0;
+                *(int*)(si+8)=0;
+            }
+            return sig;
+        }
+        if(has_timeout&&deadline&&c3_dyn_deadline_expired(deadline))return -EAGAIN;
+        if(has_timeout&&deadline==c3_rdtsc())return -EAGAIN;
+        if(c3_task_has_unblocked_signal(cur))return -EINTR;
+        c3_poll_wait_slice(cur,has_timeout?deadline:0);
+    }
+}
+
+int64_t real_sys_rt_sigsuspend(const void *mask,size_t sigsetsize){
+    task_t *cur=task_current();
+    sigset_t2 saved,tmp;
+    size_t nbytes=sigsetsize?sigsetsize:sizeof(sigset_t2);
+    if(!cur)return -ESRCH;
+    if(!mask)return -EFAULT;
+    if(sigsetsize&&(sigsetsize<sizeof(uint64_t)||sigsetsize>sizeof(sigset_t2)))return -EINVAL;
+    if(nbytes>sizeof(sigset_t2))nbytes=sizeof(sigset_t2);
+    saved=cur->sig_blocked;
+    c3_memset(&tmp,0,sizeof(tmp));
+    c3_memcpy(&tmp,mask,nbytes);
+    c3_sigset_drop_unblockable(&tmp);
+    cur->sig_blocked=tmp;
+    while(!c3_task_has_unblocked_signal(cur))c3_poll_wait_slice(cur,0);
+    cur->sig_blocked=saved;
+    sig_check_pending(cur);
+    return -EINTR;
 }
 int64_t real_sys_sigaltstack(const void *ss,void *oss){(void)ss;(void)oss;return 0;}
 
@@ -7245,6 +13545,39 @@ static void c3_phys_ref_retain(uint64_t phys){
     else if(g_c3_phys_refcnt[idx]<0xFFFFu)++g_c3_phys_refcnt[idx];
 }
 
+#define C3_PHYS_QUARANTINE_MAX 4096
+static uint64_t g_c3_phys_quarantine[C3_PHYS_QUARANTINE_MAX];
+static uint32_t g_c3_phys_quarantine_head=0;
+static uint32_t g_c3_phys_quarantine_count=0;
+
+static void c3_phys_quarantine_drain(uint32_t max_pages){
+    while(max_pages&&g_c3_phys_quarantine_count){
+        uint64_t phys=g_c3_phys_quarantine[g_c3_phys_quarantine_head];
+        g_c3_phys_quarantine[g_c3_phys_quarantine_head]=0;
+        g_c3_phys_quarantine_head=(g_c3_phys_quarantine_head+1u)%C3_PHYS_QUARANTINE_MAX;
+        --g_c3_phys_quarantine_count;
+        --max_pages;
+        if(phys)pmm_free_frame(phys&~0xFFFULL);
+    }
+}
+
+static void c3_phys_quarantine_frame(uint64_t phys){
+    uint32_t slot;
+    if(!phys)return;
+    if(pmm_free_count()<256)c3_phys_quarantine_drain(256);
+    if(g_c3_phys_quarantine_count<C3_PHYS_QUARANTINE_MAX){
+        slot=(g_c3_phys_quarantine_head+g_c3_phys_quarantine_count)%C3_PHYS_QUARANTINE_MAX;
+        g_c3_phys_quarantine[slot]=phys&~0xFFFULL;
+        ++g_c3_phys_quarantine_count;
+        return;
+    }
+    slot=g_c3_phys_quarantine_head;
+    if(g_c3_phys_quarantine[slot])
+        pmm_free_frame(g_c3_phys_quarantine[slot]&~0xFFFULL);
+    g_c3_phys_quarantine[slot]=phys&~0xFFFULL;
+    g_c3_phys_quarantine_head=(g_c3_phys_quarantine_head+1u)%C3_PHYS_QUARANTINE_MAX;
+}
+
 static void c3_phys_ref_release(uint64_t phys){
     int idx=c3_phys_ref_index(phys);
     static uint32_t untracked_release_warns=0;
@@ -7255,7 +13588,7 @@ static void c3_phys_ref_release(uint64_t phys){
         return;
     }
     if(g_c3_phys_refcnt[idx]==0){
-        if(untracked_release_warns<32){
+        if(c3_wayfire_debug_trace_enabled()&&untracked_release_warns<32){
             ++untracked_release_warns;
             __boot_serial_puts("[phys-ref] ignored untracked release phys=");
             __boot_serial_puthex64(phys);
@@ -7274,16 +13607,19 @@ static void c3_phys_ref_release(uint64_t phys){
      * through coarse metadata; reusing a mistakenly released executable
      * page turns it into a zero-filled anonymous page and crashes inside
      * valid code. Quarantine until mmap ownership is exact. */
-    if(quarantine_warns<16){
+    if(c3_wayfire_debug_trace_enabled()&&quarantine_warns<16){
         ++quarantine_warns;
         __boot_serial_puts("[phys-ref] quarantined released frame phys=");
         __boot_serial_puthex64(phys);
+        __boot_serial_puts(" q=");
+        __boot_serial_putu32(g_c3_phys_quarantine_count);
         __boot_serial_puts("\n");
     }
+    c3_phys_quarantine_frame(phys);
 }
 
 /* Memory syscalls (real paging) */
-#define MMAP_REGION_MAX 4096
+#define MMAP_REGION_MAX 16384
 typedef struct {
     bool      used;
     address_space_t *as;
@@ -7293,11 +13629,56 @@ typedef struct {
     int       flags;
     int       fd;
     uint64_t  offset;
+    uint32_t  drm_handle;
+    uint32_t  resident_pages;
     uint8_t   backing_kind;
+    uint8_t   no_free_phys;
     char      backing_path[VFS_PATH_MAX];
 } mmap_entry_t;
 static mmap_entry_t g_mmap_table[MMAP_REGION_MAX];
 static uint32_t g_c3_shared_anon_seq=1;
+
+static bool c3_mmap_backing_path_used_anywhere(const char *path){
+    int i;
+    if(!path||!*path)return false;
+    for(i=0;i<MMAP_REGION_MAX;++i){
+        if(!g_mmap_table[i].used)continue;
+        if(!g_mmap_table[i].backing_path[0])continue;
+        if(c3_strcmp(g_mmap_table[i].backing_path,path)==0)return true;
+    }
+    return false;
+}
+
+static bool c3_mmap_can_merge(const mmap_entry_t *a,const mmap_entry_t *b);
+static void c3_mmap_merge_adjacent(address_space_t *as);
+static void c3_mmap_merge_slot(int slot);
+
+static void c3_mmap_rename_backing_path(const char *old_path,const char *new_path){
+    int i;
+    uint32_t moved=0;
+    if(!old_path||!*old_path||!new_path||!*new_path)return;
+    for(i=0;i<MMAP_REGION_MAX;++i){
+        if(!g_mmap_table[i].used)continue;
+        if(c3_strcmp(g_mmap_table[i].backing_path,old_path)!=0)continue;
+        c3_strlcpy(g_mmap_table[i].backing_path,new_path,sizeof(g_mmap_table[i].backing_path));
+        ++moved;
+    }
+    if(moved&&c3_task_is_wayfire_runtime(task_current())){
+        static uint32_t trace_count=0;
+        if(trace_count<32u){
+            ++trace_count;
+            __boot_serial_force_puts("[wf-mmap-rename!] #");
+            __boot_serial_force_putu32(trace_count);
+            __boot_serial_force_puts(" moved=");
+            __boot_serial_force_putu32(moved);
+            __boot_serial_force_puts(" old=");
+            __boot_serial_force_puts(old_path);
+            __boot_serial_force_puts(" new=");
+            __boot_serial_force_puts(new_path);
+            __boot_serial_force_puts("\n");
+        }
+    }
+}
 
 static void c3_shared_anon_make_path(char *out,size_t cap){
     size_t l=0;
@@ -7331,6 +13712,8 @@ static void c3_exec_clear_mmap_for_as(address_space_t *as){
 #define C3_MAP_ANONYMOUS   0x20
 #define C3_MAP_FIXED_NOREPLACE 0x100000
 #define C3_MAP_ANON        C3_MAP_ANONYMOUS
+#define C3_LIBXUL_DYNAMIC_FILE_OFF 0x000000000ac3b570ULL
+#define C3_LIBXUL_DYNAMIC_NULL_DELTA 0x4e0ULL
 #define C3_MREMAP_MAYMOVE  0x1
 #define C3_MREMAP_FIXED    0x2
 #define C3_MREMAP_DONTUNMAP 0x4
@@ -7359,6 +13742,32 @@ static bool c3_mmap_is_private(int flags){return (flags&C3_MAP_PRIVATE)!=0;}
 static bool c3_mmap_is_shared(int flags){return (flags&C3_MAP_SHARED)!=0;}
 static bool c3_mmap_is_lazy_anon(const mmap_entry_t *m){
     return m&&m->used&&m->fd<0&&c3_mmap_is_anon(m->flags);
+}
+static bool c3_mmap_is_lazy_private_file(const mmap_entry_t *m){
+    return m&&m->used&&m->backing_path[0]&&
+           c3_mmap_is_private(m->flags)&&!c3_mmap_is_anon(m->flags);
+}
+static bool c3_mmap_owns_phys(const mmap_entry_t *m){
+    return !(m&&m->used&&m->no_free_phys);
+}
+
+static uint32_t c3_mmap_pages_u32(uint64_t len){
+    uint64_t pages=(len+PAGE_SIZE-1ULL)/PAGE_SIZE;
+    return pages>0xFFFFFFFFULL?0xFFFFFFFFu:(uint32_t)pages;
+}
+
+static void c3_mmap_resident_add(mmap_entry_t *m,uint64_t pages){
+    uint64_t cur;
+    if(!m||!m->used||!pages)return;
+    cur=(uint64_t)m->resident_pages+pages;
+    m->resident_pages=cur>0xFFFFFFFFULL?0xFFFFFFFFu:(uint32_t)cur;
+}
+
+static void c3_mmap_resident_clamp(mmap_entry_t *m){
+    uint32_t max_pages;
+    if(!m||!m->used)return;
+    max_pages=c3_mmap_pages_u32(m->size);
+    if(m->resident_pages>max_pages)m->resident_pages=max_pages;
 }
 
 static bool c3_mmap_fd_perms_ok(task_t *cur,int fd,int prot,int flags){
@@ -7421,6 +13830,45 @@ static bool c3_mmap_pages_present(address_space_t *as,uint64_t s,uint64_t e){
         if((entry&PAGE_PRESENT)&&(entry&PAGE_USER))return true;
     }
     return false;
+}
+
+static void c3_mmap_force_unmapped_pages(address_space_t *as,uint64_t s,uint64_t e){
+    uint64_t pg;
+    if(!as||e<s)return;
+    s&=~(PAGE_SIZE-1ULL);
+    e=(e+PAGE_SIZE-1ULL)&~(PAGE_SIZE-1ULL);
+    if(e<=C3_USER_LOW_SAFE)return;
+    if(s<C3_USER_LOW_SAFE)s=C3_USER_LOW_SAFE;
+    for(pg=s;pg<e;pg+=PAGE_SIZE){
+        (void)paging_map(as,pg,0,PAGE_PRESENT);
+        (void)paging_unmap(as,pg);
+    }
+}
+
+static int c3_mmap_register_lazy_file(address_space_t *as,uint64_t virt,uint64_t len,
+                                      int prot,uint64_t off,const char *path){
+    int slot;
+    if(!as||!path||!*path||!len)return -EINVAL;
+    if((virt&(PAGE_SIZE-1))||(len&(PAGE_SIZE-1)))return -EINVAL;
+    if(virt>=C3_USER_TOP||len>C3_USER_TOP-virt)return -EINVAL;
+    if(virt<C3_USER_LOW_SAFE)return -EINVAL;
+    if(c3_mmap_overlap_as(as,virt,virt+len,-1))return -EEXIST;
+    slot=c3_mmap_alloc_slot();
+    if(slot<0)return -ENOMEM;
+    g_mmap_table[slot].used=true;
+    g_mmap_table[slot].as=as;
+    g_mmap_table[slot].virt=virt;
+    g_mmap_table[slot].size=len;
+    g_mmap_table[slot].prot=prot;
+    g_mmap_table[slot].flags=C3_MAP_PRIVATE;
+    g_mmap_table[slot].fd=-1;
+    g_mmap_table[slot].offset=off;
+    g_mmap_table[slot].resident_pages=0;
+    g_mmap_table[slot].backing_kind=FDKIND_VFSFILE;
+    g_mmap_table[slot].no_free_phys=0;
+    c3_strlcpy(g_mmap_table[slot].backing_path,path,sizeof(g_mmap_table[slot].backing_path));
+    c3_mmap_force_unmapped_pages(as,virt,virt+len);
+    return 0;
 }
 
 static bool c3_mmap_next_gap_after_overlap(address_space_t *as,uint64_t s,uint64_t e,int skip_idx,uint64_t *next){
@@ -7495,14 +13943,326 @@ static void c3_trace_user_addr_mapping(const task_t *cur,uint64_t addr,const cha
     __boot_serial_puts("\n");
 }
 
+static void c3_force_browser_addr_mapping(const task_t *cur,uint64_t addr,const char *tag){
+    static uint32_t force_map_count;
+    int idx;
+    uint64_t off;
+    char perms[5];
+    if(force_map_count>=96u)return;
+    if(!cur||!cur->addr_space)return;
+    if(addr<0x40000000ULL||addr>=C3_USER_TOP)return;
+    idx=c3_mmap_region_find(cur->addr_space,addr);
+    if(idx<0)return;
+    ++force_map_count;
+    off=g_mmap_table[idx].offset+(addr-g_mmap_table[idx].virt);
+    c3_mmap_perm_text(g_mmap_table[idx].prot,g_mmap_table[idx].flags,perms);
+    __boot_serial_force_puts("[browser-map!] ");
+    __boot_serial_force_puts(tag?tag:"addr");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" addr=");
+    __boot_serial_force_puthex64(addr);
+    __boot_serial_force_puts(" base=");
+    __boot_serial_force_puthex64(g_mmap_table[idx].virt);
+    __boot_serial_force_puts(" off=");
+    __boot_serial_force_puthex64(off);
+    __boot_serial_force_puts(" prot=");
+    __boot_serial_force_puts(perms);
+    __boot_serial_force_puts(" path=");
+    if(g_mmap_table[idx].backing_path[0])__boot_serial_force_puts(g_mmap_table[idx].backing_path);
+    else if(g_mmap_table[idx].fd>=0)__boot_serial_force_puts("[fd]");
+    else __boot_serial_force_puts("[anon]");
+    __boot_serial_force_puts("\n");
+}
+
+static void c3_force_wayfire_addr_mapping(const task_t *cur,uint64_t addr,const char *tag){
+    static uint32_t force_map_count;
+    int idx;
+    uint64_t off;
+    char perms[5];
+    if(force_map_count>=512u)return;
+    if(!cur||!cur->addr_space)return;
+    if(addr<0x40000000ULL||addr>=C3_USER_TOP)return;
+    idx=c3_mmap_region_find(cur->addr_space,addr);
+    ++force_map_count;
+    if(idx<0){
+        if(cur->aux_at_base&&addr>=cur->aux_at_base&&addr<cur->aux_at_base+0x00100000ULL){
+            __boot_serial_force_puts("[wayfire-map!] ");
+            __boot_serial_force_puts(tag?tag:"addr");
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" addr=");
+            __boot_serial_force_puthex64(addr);
+            __boot_serial_force_puts(" base=");
+            __boot_serial_force_puthex64(cur->aux_at_base);
+            __boot_serial_force_puts(" off=");
+            __boot_serial_force_puthex64(addr-cur->aux_at_base);
+            __boot_serial_force_puts(" prot=r-xp path=/lib64/ld-linux-x86-64.so.2\n");
+            return;
+        }
+        if(cur->brk_start&&cur->brk_current>=cur->brk_start&&addr>=cur->brk_start&&addr<cur->brk_current){
+            __boot_serial_force_puts("[wayfire-map!] ");
+            __boot_serial_force_puts(tag?tag:"addr");
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" addr=");
+            __boot_serial_force_puthex64(addr);
+            __boot_serial_force_puts(" heap=");
+            __boot_serial_force_puthex64(cur->brk_start);
+            __boot_serial_force_puts("-");
+            __boot_serial_force_puthex64(cur->brk_current);
+            __boot_serial_force_puts(" mmap_base=");
+            __boot_serial_force_puthex64(cur->mmap_base);
+            __boot_serial_force_puts(" path=[heap]\n");
+            return;
+        }
+        __boot_serial_force_puts("[wayfire-map!] ");
+        __boot_serial_force_puts(tag?tag:"addr");
+        __boot_serial_force_puts(" pid=");
+        __boot_serial_force_putu32((uint32_t)cur->pid);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts(" addr=");
+        __boot_serial_force_puthex64(addr);
+        __boot_serial_force_puts(" heap=");
+        __boot_serial_force_puthex64(cur->brk_start);
+        __boot_serial_force_puts("-");
+        __boot_serial_force_puthex64(cur->brk_current);
+        __boot_serial_force_puts(" mmap_base=");
+        __boot_serial_force_puthex64(cur->mmap_base);
+        __boot_serial_force_puts(" path=[exec-or-untracked]\n");
+        return;
+    }
+    off=g_mmap_table[idx].offset+(addr-g_mmap_table[idx].virt);
+    c3_mmap_perm_text(g_mmap_table[idx].prot,g_mmap_table[idx].flags,perms);
+    __boot_serial_force_puts("[wayfire-map!] ");
+    __boot_serial_force_puts(tag?tag:"addr");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" addr=");
+    __boot_serial_force_puthex64(addr);
+    __boot_serial_force_puts(" base=");
+    __boot_serial_force_puthex64(g_mmap_table[idx].virt);
+    __boot_serial_force_puts(" off=");
+    __boot_serial_force_puthex64(off);
+    __boot_serial_force_puts(" prot=");
+    __boot_serial_force_puts(perms);
+    __boot_serial_force_puts(" path=");
+    if(g_mmap_table[idx].backing_path[0])__boot_serial_force_puts(g_mmap_table[idx].backing_path);
+    else if(g_mmap_table[idx].fd>=0)__boot_serial_force_puts("[fd]");
+    else __boot_serial_force_puts("[anon]");
+    __boot_serial_force_puts("\n");
+}
+
+void compat3_debug_wayfire_addr_mapping(const task_t *cur,uint64_t addr,const char *tag){
+    c3_force_wayfire_addr_mapping(cur,addr,tag);
+}
+
+static bool c3_read_user_u64_from_task(const task_t *cur,uint64_t addr,uint64_t *out){
+    uint64_t v=0;
+    uint32_t i;
+    if(!cur||!cur->addr_space||!out)return false;
+    if(addr<0x10000ULL||addr>=C3_USER_TOP||addr+7ULL>=C3_USER_TOP)return false;
+    for(i=0;i<8u;++i){
+        uint64_t phys=paging_translate(cur->addr_space,addr+(uint64_t)i);
+        if(!phys)return false;
+        v|=((uint64_t)(*(const uint8_t*)PHYS_TO_DMAP(phys)))<<(i*8u);
+    }
+    *out=v;
+    return true;
+}
+
+void compat3_debug_wayfire_stack_mapping(const task_t *cur,uint64_t sp,const char *tag){
+    static uint32_t stack_trace_count;
+    uint32_t i;
+    if(stack_trace_count>=64u)return;
+    if(!cur||!cur->addr_space)return;
+    if(sp<0x40000000ULL||sp>=C3_USER_TOP)return;
+    ++stack_trace_count;
+    __boot_serial_force_puts("[wayfire-stack!] ");
+    __boot_serial_force_puts(tag?tag:"sp");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" sp=");
+    __boot_serial_force_puthex64(sp);
+    for(i=0;i<8u;++i){
+        uint64_t a=sp+(uint64_t)i*8u;
+        uint64_t v=0;
+        if(!c3_read_user_u64_from_task(cur,a,&v))break;
+        __boot_serial_force_puts(" ");
+        __boot_serial_force_putu32(i);
+        __boot_serial_force_puts("=");
+        __boot_serial_force_puthex64(v);
+    }
+    __boot_serial_force_puts("\n");
+    for(i=0;i<8u;++i){
+        uint64_t a=sp+(uint64_t)i*8u;
+        uint64_t v=0;
+        if(!c3_read_user_u64_from_task(cur,a,&v))break;
+        if(v>=0x40000000ULL&&v<C3_USER_TOP)c3_force_wayfire_addr_mapping(cur,v,"heartbeat-stack");
+    }
+}
+
+static bool c3_user_read64(const task_t *cur,uint64_t addr,uint64_t *out){
+    return c3_read_user_u64_from_task(cur,addr,out);
+}
+
+static bool c3_user_strlen_limited(const task_t *cur,uint64_t addr,size_t cap,uint64_t *out){
+    size_t i;
+    if(!cur||!cur->addr_space||!out||addr<0x10000ULL||addr>=C3_USER_TOP)return false;
+    for(i=0;i<cap;++i){
+        uint64_t a=addr+(uint64_t)i;
+        char ch;
+        if(a>=C3_USER_TOP||!(paging_get_entry(cur->addr_space,a)&PAGE_PRESENT))return false;
+        ch=*(const char*)(uintptr_t)a;
+        if(!ch){
+            *out=(uint64_t)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool c3_addr_file_offset(const task_t *cur,uint64_t addr,const char *path_token,uint64_t *off_out){
+    int idx;
+    uint64_t off;
+    if(!cur||!cur->addr_space||!path_token||!off_out)return false;
+    if(addr<0x40000000ULL||addr>=C3_USER_TOP)return false;
+    idx=c3_mmap_region_find(cur->addr_space,addr);
+    if(idx<0||idx>=MMAP_REGION_MAX)return false;
+    if(!g_mmap_table[idx].backing_path[0])return false;
+    if(!c3_has_token(g_mmap_table[idx].backing_path,path_token))return false;
+    off=g_mmap_table[idx].offset+(addr-g_mmap_table[idx].virt);
+    *off_out=off;
+    return true;
+}
+
+static uint64_t c3_loaded_symbol_addr_by_value(const task_t *cur,const char *path_token,uint64_t st_value){
+    uint64_t best=0;
+    uint64_t best_size=~0ULL;
+    int i;
+    if(!cur||!cur->addr_space||!path_token||!st_value)return 0;
+    for(i=0;i<MMAP_REGION_MAX;++i){
+        uint64_t s,e;
+        if(!g_mmap_table[i].used||g_mmap_table[i].as!=cur->addr_space)continue;
+        if(!g_mmap_table[i].backing_path[0])continue;
+        if(!c3_has_token(g_mmap_table[i].backing_path,path_token))continue;
+        s=g_mmap_table[i].offset;
+        e=s+g_mmap_table[i].size;
+        if(st_value<s||st_value>=e)continue;
+        if(g_mmap_table[i].size<best_size){
+            best=g_mmap_table[i].virt+(st_value-s);
+            best_size=g_mmap_table[i].size;
+        }
+    }
+    return best;
+}
+
+bool compat3_recover_null_plt_call(uint32_t vec,uint64_t err_code,
+                                   uint64_t cr2,uint64_t fault_rip,
+                                   uint64_t frame_base){
+    typedef struct {
+        const char *ret_path;
+        uint64_t ret_off;
+        const char *target_path;
+        uint64_t target_value;
+        const char *symbol;
+    } fix_t;
+    static const fix_t fixes[]={
+        {"libinput.so.10",0x0000000000012b09ULL,"libc.so.6",  0x0000000000111480ULL,"epoll_create1"},
+        {"libinput.so.10",0x0000000000012a4fULL,"libc.so.6",  0x00000000001114b0ULL,"epoll_ctl"},
+        {"libinput.so.10",0x0000000000012ab1ULL,"libc.so.6",  0x00000000001114b0ULL,"epoll_ctl"},
+        {"libinput.so.10",0x0000000000012a18ULL,"libc.so.6",  0x00000000000a3dc0ULL,"calloc"},
+        {"libinput.so.10",0x0000000000012b2aULL,"libc.so.6",  0x00000000000a3dc0ULL,"calloc"},
+        {"libinput.so.10",0x000000000001307aULL,"libc.so.6",  0x0000000000110a90ULL,"epoll_wait"},
+        {"libinput.so.10",0x000000000003f5c0ULL,"libudev.so.1",0x000000000000cce0ULL,"udev_device_ref"},
+        {"libinput.so.10",0x000000000003f5e1ULL,"libudev.so.1",0x000000000000cd60ULL,"udev_device_unref"},
+        {"libinput.so.10",0x000000000003f6e3ULL,"libc.so.6",  0x00000000000a97d0ULL,"strdup"},
+        {"libinput.so.10",0x000000000003f673ULL,"libc.so.6",  0x00000000000a3280ULL,"free"},
+        {"libinput.so.10",0x0000000000012bfaULL,"libc.so.6",  0x00000000000430c0ULL,"getenv"},
+        {"libinput.so.10",0x0000000000045c00ULL,"libc.so.6",  0x00000000000a3dc0ULL,"calloc"},
+        {"libinput.so.10",0x0000000000045c5cULL,"libc.so.6",  0x00000000000430c0ULL,"getenv"},
+        {"libinput.so.10",0x0000000000045c71ULL,"libc.so.6",  0x00000000000a97d0ULL,"strdup"},
+        {"libinput.so.10",0x0000000000045cedULL,"libudev.so.1",0x0000000000011140ULL,"udev_new"},
+        {"libinput.so.10",0x0000000000045d04ULL,"libudev.so.1",0x000000000000c920ULL,"udev_device_new_from_syspath"},
+        {"libinput.so.10",0x0000000000045d1bULL,"libudev.so.1",0x000000000000c840ULL,"udev_device_get_property_value"},
+        {"libinput.so.10",0x0000000000045d28ULL,"libc.so.6",  0x00000000000a97d0ULL,"strdup"},
+        {"libinput.so.10",0x0000000000045d3cULL,"libudev.so.1",0x000000000000cd60ULL,"udev_device_unref"},
+        {"libinput.so.10",0x0000000000045d44ULL,"libudev.so.1",0x00000000000111f0ULL,"udev_unref"},
+        {"libinput.so.10",0x000000000003f81fULL,"libc.so.6",  0x0000000000111210ULL,"timerfd_settime"},
+        {"libinput.so.10",0x000000000003f94dULL,"libc.so.6",  0x0000000000103ed0ULL,"read"},
+        {"libinput.so.10",0x000000000003f96eULL,"libc.so.6",  0x00000000000dbec0ULL,"clock_gettime"},
+        {"libinput.so.10",0x000000000003fd27ULL,"libc.so.6",  0x00000000001119c0ULL,"timerfd_create"},
+        {"libinput.so.10",0x000000000003fd61ULL,"libc.so.6",  0x00000000000ff780ULL,"close"},
+        {"libinput.so.10",0x000000000003f64eULL,"libudev.so.1",0x0000000000011180ULL,"udev_ref"},
+        {"libgcc_s.so.1", 0x0000000000025ab0ULL,"libc.so.6",  0x000000000015fcc0ULL,"_dl_find_object"},
+    };
+    task_t *cur;
+    uint64_t user_rsp,ret,ret_off,target;
+    size_t i;
+    (void)err_code;
+    if(vec!=14u||fault_rip!=0||cr2!=0||!frame_base)return false;
+    cur=task_current();
+    if(!cur||!cur->addr_space||!c3_task_is_wayfire_runtime(cur))return false;
+    user_rsp=*(uint64_t*)(uintptr_t)(frame_base+160u);
+    if(!c3_user_read64(cur,user_rsp,&ret))return false;
+    if(c3_addr_file_offset(cur,ret,"libinput.so.10",&ret_off)&&
+       ret_off==0x000000000003f6b1ULL){
+        uint64_t s=*(uint64_t*)(uintptr_t)(frame_base+72u);
+        uint64_t n=0;
+        if(!c3_user_strlen_limited(cur,s,4096u,&n))return false;
+        *(uint64_t*)(uintptr_t)(frame_base+112u)=n;
+        *(uint64_t*)(uintptr_t)(frame_base+136u)=ret;
+        *(uint64_t*)(uintptr_t)(frame_base+160u)=user_rsp+8u;
+        __boot_serial_force_puts("[wayfire-null-plt-emulate] pid=");
+        __boot_serial_force_putu32((uint32_t)cur->pid);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts(" sym=strlen ret=");
+        __boot_serial_force_puthex64(ret);
+        __boot_serial_force_puts(" arg=");
+        __boot_serial_force_puthex64(s);
+        __boot_serial_force_puts(" len=");
+        __boot_serial_force_puthex64(n);
+        __boot_serial_force_puts("\n");
+        return true;
+    }
+    for(i=0;i<sizeof(fixes)/sizeof(fixes[0]);++i){
+        if(!c3_addr_file_offset(cur,ret,fixes[i].ret_path,&ret_off))continue;
+        if(ret_off!=fixes[i].ret_off)continue;
+        target=c3_loaded_symbol_addr_by_value(cur,fixes[i].target_path,fixes[i].target_value);
+        if(!target||target>=C3_USER_TOP)continue;
+        *(uint64_t*)(uintptr_t)(frame_base+136u)=target;
+        __boot_serial_force_puts("[wayfire-null-plt-heal] pid=");
+        __boot_serial_force_putu32((uint32_t)cur->pid);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts(" sym=");
+        __boot_serial_force_puts(fixes[i].symbol);
+        __boot_serial_force_puts(" ret=");
+        __boot_serial_force_puthex64(ret);
+        __boot_serial_force_puts(" off=");
+        __boot_serial_force_puthex64(ret_off);
+        __boot_serial_force_puts(" target=");
+        __boot_serial_force_puthex64(target);
+        __boot_serial_force_puts("\n");
+        return true;
+    }
+    return false;
+}
+
 static int c3_mmap_pick_addr(task_t *cur,uint64_t hint,uint64_t len,int flags,uint64_t *out){
     uint64_t base,try_addr;
     int guard=0;
     if(!cur||!out||!len)return -EINVAL;
+    c3_vm_layout_pull_shared(cur);
     if(len>=C3_USER_TOP)return -ENOMEM;
     if(flags&(C3_MAP_FIXED|C3_MAP_FIXED_NOREPLACE)){
         uint64_t fixed=hint&~(PAGE_SIZE-1);
         if(fixed>=C3_USER_TOP||len>C3_USER_TOP-fixed)return -ENOMEM;
+        if(fixed<C3_USER_LOW_SAFE)return -ENOMEM;
         *out=fixed;
         return 0;
     }
@@ -7518,8 +14278,10 @@ retry_search:
         if(!c3_mmap_overlap_as(cur->addr_space,try_addr,end,-1)&&
            !c3_mmap_pages_present(cur->addr_space,try_addr,end)){
             *out=try_addr;
-            if(end+PAGE_SIZE>end&&end+PAGE_SIZE<C3_USER_TOP)end+=PAGE_SIZE;
-            if(end>cur->mmap_base&&end<C3_USER_TOP)cur->mmap_base=end;
+            if(end>cur->mmap_base&&end<C3_USER_TOP){
+                cur->mmap_base=end;
+                c3_vm_layout_push_shared(cur);
+            }
             return 0;
         }
         if(c3_mmap_next_gap_after_overlap(cur->addr_space,try_addr,end,-1,&next)&&next>try_addr&&next<C3_USER_TOP)
@@ -7552,7 +14314,7 @@ static int c3_mmap_map_pages(address_space_t *as,uint64_t va,uint64_t len,uint64
             }
             return -EEXIST;
         }
-        frame=pmm_alloc_frame();
+        frame=c3_alloc_user_frame();
         if(!frame){
             uint64_t rb;
             for(rb=0;rb<pg;rb+=PAGE_SIZE){
@@ -7577,6 +14339,25 @@ static int c3_mmap_map_pages(address_space_t *as,uint64_t va,uint64_t len,uint64
                 paging_unmap(as,va+rb);
                 if(phys)c3_phys_ref_release(phys&~0xFFFULL);
             }
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+
+static int c3_mmap_map_kernel_buffer(address_space_t *as,uint64_t va,uint64_t len,uint64_t kptr,uint64_t pflags){
+    uint64_t pg;
+    address_space_t *kas=paging_get_kernel_space();
+    for(pg=0;pg<len;pg+=PAGE_SIZE){
+        uint64_t kpage=(kptr+pg)&~(uint64_t)(PAGE_SIZE-1);
+        uint64_t phys=kas?paging_translate(kas,kpage):0;
+        if(!phys){
+            if(kpage>=DMAP_BASE)phys=DMAP_TO_PHYS(kpage);
+            else phys=kpage;
+        }
+        if(!paging_map(as,va+pg,phys&~0xFFFULL,pflags)){
+            uint64_t rb;
+            for(rb=0;rb<pg;rb+=PAGE_SIZE)paging_unmap(as,va+rb);
             return -ENOMEM;
         }
     }
@@ -7664,7 +14445,8 @@ static int c3_mmap_file_copy(task_t *cur,uint64_t va,uint64_t len,int fd,uint64_
     if(kind==FDKIND_SOCKET||kind==FDKIND_PIPE_R||kind==FDKIND_PIPE_W||
        kind==FDKIND_EVENTFD||kind==FDKIND_TIMERFD||kind==FDKIND_SIGNALFD||
        kind==FDKIND_INOTIFY||kind==FDKIND_EPOLL||kind==FDKIND_DIR||
-       kind==FDKIND_DEVTTY||kind==FDKIND_DEVRANDOM){
+       kind==FDKIND_DEVTTY||kind==FDKIND_DEVRANDOM||kind==FDKIND_DEVFUSE||
+       kind==FDKIND_DEVINPUT||kind==FDKIND_DEVSND){
         static uint32_t nonfile_trace=0;
         if(nonfile_trace<32){
             ++nonfile_trace;
@@ -7686,6 +14468,9 @@ static int c3_mmap_file_copy(task_t *cur,uint64_t va,uint64_t len,int fd,uint64_
     return -ENODEV;
 }
 
+static uint64_t c3_file_page_hash_for(const char *path,uint64_t page_off);
+static void c3_file_page_cache_slot(int slot);
+
 static void c3_file_page_invalidate_phys(uint64_t phys){
     int i;
     phys&=~0xFFFULL;
@@ -7701,6 +14486,7 @@ static void c3_file_page_invalidate_phys(uint64_t phys){
         g_c3_file_pages[i].path[0]=0;
         g_c3_file_pages[i].page_off=0;
         g_c3_file_pages[i].phys=0;
+        g_c3_file_pages[i].hash=0;
     }
 }
 
@@ -7719,27 +14505,191 @@ static void c3_file_page_invalidate_path(const char *path){
         g_c3_file_pages[i].path[0]=0;
         g_c3_file_pages[i].page_off=0;
         g_c3_file_pages[i].phys=0;
+        g_c3_file_pages[i].hash=0;
+    }
+}
+
+static void c3_file_page_rename_path(const char *old_path,const char *new_path){
+    int i;
+    uint32_t moved=0;
+    if(!old_path||!*old_path||!new_path||!*new_path)return;
+    for(i=0;i<C3_FILEPAGE_MAX;++i){
+        if(!g_c3_file_pages[i].used)continue;
+        if(c3_strcmp(g_c3_file_pages[i].path,old_path)!=0)continue;
+        c3_strlcpy(g_c3_file_pages[i].path,new_path,sizeof(g_c3_file_pages[i].path));
+        g_c3_file_pages[i].hash=c3_file_page_hash_for(new_path,g_c3_file_pages[i].page_off);
+        c3_file_page_cache_slot(i);
+        ++moved;
+    }
+    if(moved&&c3_task_is_wayfire_runtime(task_current())){
+        static uint32_t trace_count=0;
+        if(trace_count<32u){
+            ++trace_count;
+            __boot_serial_force_puts("[wf-filepage-rename!] #");
+            __boot_serial_force_putu32(trace_count);
+            __boot_serial_force_puts(" moved=");
+            __boot_serial_force_putu32(moved);
+            __boot_serial_force_puts(" old=");
+            __boot_serial_force_puts(old_path);
+            __boot_serial_force_puts(" new=");
+            __boot_serial_force_puts(new_path);
+            __boot_serial_force_puts("\n");
+        }
     }
 }
 
 static int c3_file_page_find_slot(const char *path,uint64_t page_off){
+    uint64_t h;
+    uint32_t bucket;
+    uint32_t cached;
     int i;
     if(!path||!*path)return -1;
+    h=1469598103934665603ULL;
+    for(i=0;path[i];++i){
+        h^=(uint8_t)path[i];
+        h*=1099511628211ULL;
+    }
+    h^=page_off;
+    h*=1099511628211ULL;
+    bucket=(uint32_t)(h&(C3_FILEPAGE_LOOKUP_MAX-1));
+    cached=g_c3_file_page_lookup[bucket];
+    if(cached){
+        int slot=(int)cached-1;
+        if(slot>=0&&slot<C3_FILEPAGE_MAX&&g_c3_file_pages[slot].used&&
+           g_c3_file_pages[slot].hash==h&&
+           g_c3_file_pages[slot].page_off==page_off&&
+           c3_strcmp(g_c3_file_pages[slot].path,path)==0){
+            return slot;
+        }
+    }
     for(i=0;i<C3_FILEPAGE_MAX;++i){
         if(!g_c3_file_pages[i].used)continue;
         if(g_c3_file_pages[i].page_off!=page_off)continue;
         if(c3_strcmp(g_c3_file_pages[i].path,path)!=0)continue;
+        g_c3_file_page_lookup[bucket]=(uint32_t)i+1U;
         return i;
     }
     return -1;
 }
 
-static int c3_file_page_alloc_slot(void){
+static uint64_t c3_file_page_hash_for(const char *path,uint64_t page_off){
+    uint64_t h=1469598103934665603ULL;
+    int i;
+    if(!path)return 0;
+    for(i=0;path[i];++i){
+        h^=(uint8_t)path[i];
+        h*=1099511628211ULL;
+    }
+    h^=page_off;
+    h*=1099511628211ULL;
+    return h;
+}
+
+static void c3_file_page_cache_slot(int slot){
+    uint32_t bucket;
+    if(slot<0||slot>=C3_FILEPAGE_MAX)return;
+    if(!g_c3_file_pages[slot].used||!g_c3_file_pages[slot].hash)return;
+    bucket=(uint32_t)(g_c3_file_pages[slot].hash&(C3_FILEPAGE_LOOKUP_MAX-1));
+    g_c3_file_page_lookup[bucket]=(uint32_t)slot+1U;
+}
+
+static bool c3_file_page_must_keep(const char *path){
+    return path&&(c3_starts_with(path,C3_MEMFD_PREFIX)||
+                  c3_starts_with(path,C3_DELETED_PREFIX)||
+                  c3_starts_with(path,"/dev/shm/"));
+}
+
+static int c3_file_page_alloc_slot(const char *path){
     int i;
     for(i=0;i<C3_FILEPAGE_MAX;++i){
         if(!g_c3_file_pages[i].used)return i;
     }
+    if(c3_file_page_must_keep(path)){
+        for(i=0;i<C3_FILEPAGE_MAX;++i){
+            if(!g_c3_file_pages[i].used)continue;
+            if(c3_file_page_must_keep(g_c3_file_pages[i].path))continue;
+            {
+                int ridx=c3_phys_ref_index(g_c3_file_pages[i].phys);
+                if(ridx>=0&&g_c3_phys_refcnt[ridx]>0)
+                    c3_phys_ref_release(g_c3_file_pages[i].phys&~0xFFFULL);
+            }
+            {
+                static uint32_t evict_trace=0;
+                if(evict_trace<16){
+                    ++evict_trace;
+                    __boot_serial_puts("[filepage-evict] keep=");
+                    __boot_serial_puts(path);
+                    __boot_serial_puts(" drop=");
+                    __boot_serial_puts(g_c3_file_pages[i].path);
+                    __boot_serial_puts("\n");
+                }
+            }
+            g_c3_file_pages[i].used=false;
+            g_c3_file_pages[i].path[0]=0;
+            g_c3_file_pages[i].page_off=0;
+            g_c3_file_pages[i].phys=0;
+            g_c3_file_pages[i].hash=0;
+            return i;
+        }
+    }
     return -1;
+}
+
+static bool c3_file_page_reclaim_one(void){
+    int i;
+    for(i=0;i<C3_FILEPAGE_MAX;++i){
+        uint64_t phys;
+        int ridx;
+        if(!g_c3_file_pages[i].used)continue;
+        if(c3_file_page_must_keep(g_c3_file_pages[i].path))continue;
+        phys=g_c3_file_pages[i].phys&~0xFFFULL;
+        ridx=c3_phys_ref_index(phys);
+        if(ridx<0)continue;
+        if(g_c3_phys_refcnt[ridx]!=1)continue;
+        g_c3_file_pages[i].used=false;
+        g_c3_file_pages[i].path[0]=0;
+        g_c3_file_pages[i].page_off=0;
+        g_c3_file_pages[i].phys=0;
+        g_c3_file_pages[i].hash=0;
+        g_c3_phys_refcnt[ridx]=0;
+        pmm_free_frame(phys);
+        {
+            static uint32_t reclaim_trace=0;
+            if(reclaim_trace<24){
+                ++reclaim_trace;
+                __boot_serial_puts("[filepage-reclaim] phys=");
+                __boot_serial_puthex64(phys);
+                __boot_serial_puts(" free=");
+                __boot_serial_putu32(pmm_free_count());
+                __boot_serial_puts("\n");
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static uint32_t c3_file_page_reclaim(uint32_t max_pages){
+    uint32_t n=0;
+    while(n<max_pages&&c3_file_page_reclaim_one())++n;
+    return n;
+}
+
+static uint64_t c3_alloc_user_frame(void){
+    uint64_t frame;
+    if(pmm_free_count()<256){
+        c3_file_page_reclaim(128);
+        c3_phys_quarantine_drain(128);
+    }
+    frame=pmm_alloc_frame();
+    if(frame)return frame;
+    c3_file_page_reclaim(512);
+    c3_phys_quarantine_drain(512);
+    frame=pmm_alloc_frame();
+    if(frame)return frame;
+    c3_file_page_reclaim(2048);
+    c3_phys_quarantine_drain(2048);
+    return pmm_alloc_frame();
 }
 
 static uint64_t c3_file_page_get_frame(const char *path,const uint8_t *file_data,uint32_t file_size,uint64_t page_off){
@@ -7753,8 +14703,9 @@ static uint64_t c3_file_page_get_frame(const char *path,const uint8_t *file_data
             return frame;
         }
         g_c3_file_pages[slot].used=false;
+        g_c3_file_pages[slot].hash=0;
     }
-    frame=pmm_alloc_frame();
+    frame=c3_alloc_user_frame();
     if(!frame)return 0;
     c3_phys_ref_set_initial(frame);
     c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
@@ -7763,12 +14714,18 @@ static uint64_t c3_file_page_get_frame(const char *path,const uint8_t *file_data
         uint64_t to_copy=(remain<PAGE_SIZE)?remain:PAGE_SIZE;
         c3_memcpy((void*)PHYS_TO_DMAP(frame),file_data+page_off,(size_t)to_copy);
     }
-    slot=c3_file_page_alloc_slot();
+    slot=c3_file_page_alloc_slot(path);
+    if(slot<0&&c3_file_page_must_keep(path)){
+        c3_phys_ref_release(frame);
+        return 0;
+    }
     if(slot>=0){
         g_c3_file_pages[slot].used=true;
         g_c3_file_pages[slot].page_off=page_off;
         g_c3_file_pages[slot].phys=frame;
         c3_strlcpy(g_c3_file_pages[slot].path,path,sizeof(g_c3_file_pages[slot].path));
+        g_c3_file_pages[slot].hash=c3_file_page_hash_for(path,page_off);
+        c3_file_page_cache_slot(slot);
         c3_phys_ref_retain(frame);
     }
     return frame;
@@ -7778,14 +14735,17 @@ static int c3_mmap_map_private_file(task_t *cur,uint64_t va,uint64_t len,int pro
     const uint8_t *data=0;
     uint32_t size=0;
     const char *memfd_path=0;
+    const char *debug_path=0;
     uint64_t memfd_size=0;
     uint8_t kind;
     uint64_t pflags;
     uint64_t pg;
+    bool share_clean_file=false;
     if(!cur||fd<0||!fd_valid(&cur->fdt,fd))return -EBADF;
     kind=cur->fdt.fds[fd].kind;
     if(kind==FDKIND_VFSFILE){
         const char *vpath=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
+        debug_path=vpath;
         if(vpath&&c3_memfd_path_get_size(vpath,&memfd_size)){
             memfd_path=vpath;
         }else if(!vpath||!kvfs_read(vpath,&data,&size)){
@@ -7804,7 +14764,8 @@ static int c3_mmap_map_private_file(task_t *cur,uint64_t va,uint64_t len,int pro
              kind==FDKIND_SOCKET||kind==FDKIND_PIPE_R||kind==FDKIND_PIPE_W||
              kind==FDKIND_EVENTFD||kind==FDKIND_TIMERFD||kind==FDKIND_SIGNALFD||
              kind==FDKIND_INOTIFY||kind==FDKIND_EPOLL||kind==FDKIND_DIR||
-             kind==FDKIND_DEVTTY||kind==FDKIND_DEVRANDOM){
+             kind==FDKIND_DEVTTY||kind==FDKIND_DEVRANDOM||kind==FDKIND_DEVFUSE||
+             kind==FDKIND_DEVINPUT||kind==FDKIND_DEVSND){
         data=0;
         size=0;
     }else{
@@ -7817,6 +14778,8 @@ static int c3_mmap_map_private_file(task_t *cur,uint64_t va,uint64_t len,int pro
      * DSOs: a later CR0.WP or permission repair path can leave executable
      * pages mapped but still zero-filled, which crashes inside libxul text. */
     pflags=c3_mmap_pte_flags_from_prot(prot);
+    share_clean_file=(kind==FDKIND_VFSFILE)&&debug_path&&data&&
+        !(prot&(C3_PROT_WRITE|C3_PROT_EXEC))&&!memfd_path;
     for(pg=0;pg<len;pg+=PAGE_SIZE){
         uint64_t entry=paging_get_entry(cur->addr_space,va+pg);
         uint64_t frame;
@@ -7824,12 +14787,47 @@ static int c3_mmap_map_private_file(task_t *cur,uint64_t va,uint64_t len,int pro
             c3_mmap_unmap_pages(cur->addr_space,va,pg,true);
             return -EEXIST;
         }
-        frame=pmm_alloc_frame();
+        if(share_clean_file){
+            frame=c3_file_page_get_frame(debug_path,data,size,off+pg);
+            if(!frame){
+                c3_mmap_unmap_pages(cur->addr_space,va,pg,true);
+                return -ENOMEM;
+            }
+            if(!paging_map(cur->addr_space,va+pg,frame,pflags|C3_PAGE_SOFT_COW)){
+                c3_phys_ref_release(frame);
+                c3_mmap_unmap_pages(cur->addr_space,va,pg,true);
+                return -ENOMEM;
+            }
+            continue;
+        }
+        frame=c3_alloc_user_frame();
         if(!frame){
             c3_mmap_unmap_pages(cur->addr_space,va,pg,true);
             return -ENOMEM;
         }
         c3_phys_ref_set_initial(frame);
+        if(debug_path&&c3_task_is_firefox_runtime(cur)&&
+           c3_has_token(debug_path,"libxul.so")&&
+           off+pg==0x000000000ac3b000ULL){
+            static uint32_t copy_trace=0;
+            if(copy_trace<2){
+                uint64_t srcq=0xFFFFFFFFFFFFFFFFULL;
+                if(data&&off+pg+0x570ULL+8<=(uint64_t)size)
+                    srcq=*(const uint64_t*)(const void*)(data+off+pg+0x570ULL);
+                ++copy_trace;
+                __boot_serial_force_puts("[libxul-copy-before!] frame=");
+                __boot_serial_force_puthex64(frame);
+                __boot_serial_force_puts(" srcq=");
+                __boot_serial_force_puthex64(srcq);
+                __boot_serial_force_puts(" src=");
+                __boot_serial_force_puthex64(data?(uint64_t)(uintptr_t)(data+off+pg):0);
+                __boot_serial_force_puts(" off=");
+                __boot_serial_force_puthex64(off+pg);
+                __boot_serial_force_puts(" size=");
+                __boot_serial_force_puthex64((uint64_t)size);
+                __boot_serial_force_puts("\n");
+            }
+        }
         c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
         if(memfd_path&&off<=UINT64_MAX-pg&&off+pg<memfd_size){
             uint64_t remain=memfd_size-(off+pg);
@@ -7839,6 +14837,21 @@ static int c3_mmap_map_private_file(task_t *cur,uint64_t va,uint64_t len,int pro
             uint64_t remain=(uint64_t)size-(off+pg);
             uint64_t to_copy=(remain<PAGE_SIZE)?remain:PAGE_SIZE;
             c3_memcpy((void*)PHYS_TO_DMAP(frame),data+off+pg,(size_t)to_copy);
+        }
+        if(debug_path&&c3_task_is_firefox_runtime(cur)&&
+           c3_has_token(debug_path,"libxul.so")&&
+           off+pg==0x000000000ac3b000ULL){
+            static uint32_t copy_after_trace=0;
+            if(copy_after_trace<2){
+                uint64_t dstq=*(uint64_t*)(uintptr_t)
+                    PHYS_TO_DMAP(frame+0x570ULL);
+                ++copy_after_trace;
+                __boot_serial_force_puts("[libxul-copy-after!] frame=");
+                __boot_serial_force_puthex64(frame);
+                __boot_serial_force_puts(" dstq=");
+                __boot_serial_force_puthex64(dstq);
+                __boot_serial_force_puts("\n");
+            }
         }
         if(!paging_map(cur->addr_space,va+pg,frame,pflags)){
             c3_phys_ref_release(frame);
@@ -7868,6 +14881,26 @@ static int c3_mmap_map_private_file(task_t *cur,uint64_t va,uint64_t len,int pro
             __boot_serial_puts("\n");
         }
     }
+    if(share_clean_file&&c3_task_is_firefox_runtime(cur)){
+        static uint32_t ro_share_trace=0;
+        if(ro_share_trace<24){
+            ++ro_share_trace;
+            __boot_serial_puts("[mmap-private-share] pid=");
+            __boot_serial_putu32((uint32_t)cur->pid);
+            c3_trace_task_name(cur);
+            __boot_serial_puts(" va=");
+            __boot_serial_puthex64(va);
+            __boot_serial_puts(" len=");
+            __boot_serial_puthex64(len);
+            __boot_serial_puts(" prot=");
+            __boot_serial_putu32((uint32_t)prot);
+            __boot_serial_puts(" off=");
+            __boot_serial_puthex64(off);
+            __boot_serial_puts(" path=");
+            __boot_serial_puts(debug_path);
+            __boot_serial_puts("\n");
+        }
+    }
     return 0;
 }
 
@@ -7881,12 +14914,65 @@ static int c3_mmap_map_shared_vfs_file(task_t *cur,uint64_t va,uint64_t len,int 
     if(cur->fdt.fds[fd].kind!=FDKIND_VFSFILE)return -ENODEV;
     path=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
     if(!path||!*path)return -ENOENT;
-    if(!kvfs_read(path,&data,&size)){
+    if(c3_memfd_path_get_size(path,0)){
+        data=0;
+        size=0;
+    }else if(!kvfs_read(path,&data,&size)){
+        if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(path,C3_DELETED_PREFIX)){
+            static uint32_t trace_count=0;
+            if(trace_count<64u){
+                ++trace_count;
+                __boot_serial_force_puts("[wf-mmap-deleted-read-miss!] #");
+                __boot_serial_force_putu32(trace_count);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" va=");
+                __boot_serial_force_puthex64(va);
+                __boot_serial_force_puts(" len=");
+                __boot_serial_force_puthex64(len);
+                __boot_serial_force_puts(" off=");
+                __boot_serial_force_puthex64(off);
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(path);
+                __boot_serial_force_puts("\n");
+            }
+        }
         if(c3_starts_with(path,"/tmp/.ridux-deleted-")||c3_starts_with(path,C3_MEMFD_PREFIX)){
             data=0;
             size=0;
         }else{
             return -ENOENT;
+        }
+    }else if(cur&&c3_task_is_wayfire_runtime(cur)&&c3_starts_with(path,C3_DELETED_PREFIX)){
+        static uint32_t trace_count=0;
+        if(trace_count<64u){
+            uint64_t b0=0;
+            size_t bi,lim=size<8?size:8;
+            for(bi=0;bi<lim;++bi)b0|=((uint64_t)data[bi])<<(bi*8);
+            ++trace_count;
+            __boot_serial_force_puts("[wf-mmap-deleted-read!] #");
+            __boot_serial_force_putu32(trace_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" va=");
+            __boot_serial_force_puthex64(va);
+            __boot_serial_force_puts(" len=");
+            __boot_serial_force_puthex64(len);
+            __boot_serial_force_puts(" off=");
+            __boot_serial_force_puthex64(off);
+            __boot_serial_force_puts(" size=");
+            __boot_serial_force_puthex64((uint64_t)size);
+            __boot_serial_force_puts(" b0=");
+            __boot_serial_force_puthex64(b0);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(path);
+            __boot_serial_force_puts("\n");
         }
     }
     pflags=c3_mmap_pte_flags_from_prot(prot);
@@ -7896,7 +14982,7 @@ static int c3_mmap_map_shared_vfs_file(task_t *cur,uint64_t va,uint64_t len,int 
         if((entry&PAGE_PRESENT)&&(entry&PAGE_USER)){
             static uint32_t collision_trace=0;
             c3_mmap_unmap_pages(cur->addr_space,va,pg,true);
-            if(collision_trace<32){
+            if(c3_wayfire_debug_trace_enabled()&&collision_trace<32){
                 ++collision_trace;
                 __boot_serial_puts("[mmap-shared-vfs-collide] pid=");
                 __boot_serial_putu32((uint32_t)cur->pid);
@@ -7926,7 +15012,7 @@ static int c3_mmap_map_shared_vfs_file(task_t *cur,uint64_t va,uint64_t len,int 
     }
     {
         static uint32_t trace_count=0;
-        if(trace_count<8){
+        if(c3_wayfire_debug_trace_enabled()&&trace_count<8){
             ++trace_count;
             __boot_serial_puts("[mmap-shared-vfs] pid=");
             __boot_serial_putu32((uint32_t)cur->pid);
@@ -7957,7 +15043,7 @@ static int c3_mmap_writeback_vfs_range(task_t *cur,const mmap_entry_t *m,uint64_
     if(!cur||!m||!m->used||!m->backing_path[0])return 0;
     if(!c3_mmap_is_shared(m->flags)||!(m->prot&C3_PROT_WRITE))return 0;
     if(m->backing_kind!=FDKIND_VFSFILE)return 0;
-    if(c3_starts_with(m->backing_path,C3_MEMFD_PREFIX))return 0;
+    if(c3_memfd_path_get_size(m->backing_path,0))return 0;
     if(va<m->virt)return -EINVAL;
     rel=va-m->virt;
     file_start=m->offset+rel;
@@ -7999,10 +15085,13 @@ int64_t real_sys_mmap(uint64_t addr,uint64_t len,int prot,int flags,int fd,uint6
     bool has_overlap;
     bool is_fixed;
     bool is_anon;
+    bool map_no_free_phys=false;
     int slot;
     int r;
     int retry_nohint=0;
     uint64_t pick_hint;
+    uint32_t mapped_drm_handle=0;
+    uint32_t initial_resident_pages=0;
     const int known_prot=C3_PROT_READ|C3_PROT_WRITE|C3_PROT_EXEC;
 #define C3_MMAP_FAIL(_stage) do{ \
         if(g_c3_mmap_fail_trace_count<64){ \
@@ -8065,17 +15154,274 @@ retry_pick:
         C3_MMAP_FAIL("overlap");
         return -ENOMEM;
     }
+    /* User address spaces inherit the kernel's low identity map as
+     * supervisor-only leaves.  mmap hints from ld-linux can land below 4 GiB;
+     * if we only look for PAGE_USER mappings, the range looks free but a later
+     * paging_map() can collide with the supervisor leaf and leave userland
+     * jumping into an unmapped/exec-denied address.  Punch the inherited leaves
+     * out for every low user mmap, not just anonymous reservations. */
+    if(vaddr<0x100000000ULL){
+        uint64_t unmap_end=vaddr+aligned_len;
+        if(unmap_end<vaddr||unmap_end>0x100000000ULL)unmap_end=0x100000000ULL;
+        c3_mmap_force_unmapped_pages(cur->addr_space,vaddr,unmap_end);
+    }
+
     if(is_anon){
         /* Linux reserves anonymous mmap ranges lazily. Browsers routinely
          * reserve very large PROT_NONE / no-reserve arenas; eagerly backing
          * those with physical pages stalls the kernel before userland can
          * render a window. compat3_handle_page_fault backs pages on demand. */
-        r=0;
+        bool eager_small_desktop_anon=cur&&c3_task_is_wayfire_runtime(cur)&&
+            !c3_task_is_hyprland_compositor(cur)&&
+            (prot&(C3_PROT_READ|C3_PROT_WRITE))&&
+            aligned_len>0&&aligned_len<=(2ULL*1024ULL*1024ULL);
+        if(eager_small_desktop_anon){
+            r=c3_mmap_map_pages(cur->addr_space,vaddr,aligned_len,
+                                c3_mmap_pte_flags_from_prot(prot),true);
+            if(r<0){
+                C3_MMAP_FAIL("desktop-anon-eager-map");
+                return r;
+            }
+            initial_resident_pages=c3_mmap_pages_u32(aligned_len);
+        }else{
+            r=0;
+        }
+    }else if(cur->fdt.fds[fd].kind==FDKIND_DEVFB){
+        uint64_t drm_kptr=0,drm_avail=0;
+        uint32_t drm_handle=0;
+        int drm_rc=drm_resolve_mmap_offset(fd,off,aligned_len,&drm_kptr,&drm_avail,&drm_handle);
+        if(drm_rc>0){
+            uint64_t pflags=c3_mmap_pte_flags_from_prot(prot);
+            if(drm_avail<aligned_len){
+                if(drm_handle)drm_mmap_release_handle(drm_handle);
+                C3_MMAP_FAIL("drm-map-short");
+                return -EINVAL;
+            }
+            r=c3_mmap_map_kernel_buffer(cur->addr_space,vaddr,aligned_len,drm_kptr,pflags);
+            if(r<0){
+                if(drm_handle)drm_mmap_release_handle(drm_handle);
+                C3_MMAP_FAIL("drm-map");
+                return r;
+            }
+            map_no_free_phys=true;
+            mapped_drm_handle=drm_handle;
+            initial_resident_pages=c3_mmap_pages_u32(aligned_len);
+        }else if(drm_rc<0){
+            C3_MMAP_FAIL("drm-auth");
+            return drm_rc;
+        }else{
+            r=c3_mmap_map_pages(cur->addr_space,vaddr,aligned_len,
+                                c3_mmap_pte_flags_from_prot(prot),true);
+            if(r<0){
+                C3_MMAP_FAIL("devfb-map");
+                return r;
+            }
+            initial_resident_pages=c3_mmap_pages_u32(aligned_len);
+        }
     }else if(c3_mmap_is_private(flags)){
-        r=c3_mmap_map_private_file(cur,vaddr,aligned_len,prot,fd,off);
-        if(r<0){
-            C3_MMAP_FAIL("private-map");
-            return r;
+        if(cur->fdt.fds[fd].kind==FDKIND_VFSFILE){
+            const char *vpath=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
+            bool clean_large_vfs=vpath&&!(prot&C3_PROT_WRITE)&&
+                aligned_len>=(2ULL*1024ULL*1024ULL);
+            bool eager_vfs_file=(prot&C3_PROT_EXEC)!=0;
+            bool wayfire_own_so=vpath&&c3_task_is_wayfire_runtime(cur)&&
+                c3_has_token(vpath,".so")&&
+                (c3_starts_with(vpath,"/opt/hyprland/")||
+                 c3_starts_with(vpath,"/opt/wayfire/")||
+                 c3_starts_with(vpath,"/third_party/hyprland/")||
+                 c3_starts_with(vpath,"/third_party/wayfire/"));
+            bool wayfire_input_so=vpath&&c3_task_is_wayfire_runtime(cur)&&
+                (c3_has_token(vpath,"/libinput.so.")||
+                 c3_has_token(vpath,"/libudev.so."));
+            bool wayfire_renderer_exec_so=vpath&&c3_task_is_wayfire_runtime(cur)&&
+                (prot&C3_PROT_EXEC)&&
+                c3_has_token(vpath,"/libgallium-");
+            bool wayfire_renderer_large_llvm=vpath&&c3_task_is_wayfire_runtime(cur)&&
+                (prot&C3_PROT_EXEC)&&
+                c3_has_token(vpath,"/libLLVM.so.")&&
+                aligned_len>=(2ULL*1024ULL*1024ULL);
+            bool wayfire_core_so=vpath&&c3_task_is_wayfire_runtime(cur)&&
+                c3_has_token(vpath,".so")&&
+                !c3_has_token(vpath,"/libLLVM.so.")&&
+                !c3_has_token(vpath,"/libgallium-")&&
+                !c3_has_token(vpath,"/dri/")&&
+                !c3_has_token(vpath,"/vulkan/");
+            bool wayfire_wf_dock_so=vpath&&cur&&c3_task_is_wayfire_runtime(cur)&&
+                c3_strcmp(cur->name,"wf-dock")==0&&
+                c3_has_token(vpath,".so");
+            bool wayfire_gtk_shell_client=cur&&c3_task_is_wayfire_runtime(cur)&&
+                (c3_strcmp(cur->name,"waybar")==0||
+                 c3_strcmp(cur->name,"nwg-dock-hyprland")==0||
+                 c3_strcmp(cur->name,"hyprpaper")==0||
+                 c3_strcmp(cur->name,"wf-background")==0||
+                 c3_strcmp(cur->name,"wf-dock")==0||
+                 c3_strcmp(cur->name,"thunar")==0||
+                 c3_strcmp(cur->name,"swaync")==0);
+            bool wayfire_gtk_shell_so=vpath&&wayfire_gtk_shell_client&&
+                c3_has_token(vpath,".so")&&
+                !c3_has_token(vpath,"/libLLVM.so.")&&
+                !c3_has_token(vpath,"/libgallium-")&&
+                !c3_has_token(vpath,"/dri/")&&
+                !c3_has_token(vpath,"/vulkan/");
+            if(wayfire_own_so||wayfire_input_so||wayfire_renderer_exec_so||
+               wayfire_core_so||
+               wayfire_wf_dock_so||wayfire_gtk_shell_so){
+                /* Wayfire dlopen() immediately lets glibc inspect and relocate
+                 * writable PT_LOAD segments containing .dynamic/.got.  If those
+                 * pages stay as lazy zero pages, ld-linux builds a half-empty
+                 * link_map and later crashes inside relocation.  libinput also
+                 * expects its PLT/GOT pages to be real by the time the DRM
+                 * backend creates timers. wf-dock is C++/gtkmm-heavy and touches
+                 * unwind/constructor metadata during ld-linux startup; Waybar,
+                 * wf-background, Thunar, and swaync hit the same GTK/GIO path
+                 * before they ever connect to the Wayland socket, so keep their
+                 * userspace shell libraries physical instead of demand-paged.
+                 * Gallium stays eager for now; the much larger LLVM text segment
+                 * is safe to demand-page and otherwise exhausts low RAM before
+                 * EGL can create the renderer. */
+                eager_vfs_file=true;
+            }
+            if(clean_large_vfs){
+                /*
+                 * Las apps Linux grandes no pueden copiar todas sus .so al
+                 * arrancar. Dejamos el rango reservado y traemos cada pagina
+                 * desde RiduxFS cuando el proceso la toca.
+                 */
+                eager_vfs_file=false;
+                if(wayfire_own_so||wayfire_input_so||wayfire_renderer_exec_so||wayfire_core_so)eager_vfs_file=true;
+                if(wayfire_wf_dock_so)eager_vfs_file=true;
+                if(wayfire_gtk_shell_so)eager_vfs_file=true;
+                if(wayfire_renderer_large_llvm)eager_vfs_file=false;
+            }
+            if(!eager_vfs_file&&vpath&&c3_task_is_firefox_runtime(cur)&&
+               c3_has_token(vpath,"libxul.so")&&(flags&C3_MAP_FIXED)&&
+               (prot&C3_PROT_WRITE)){
+                /*
+                 * libxul pisa partes del mapeo grande con MAP_FIXED. Si esas
+                 * paginas quedan flojas, ld-linux puede leer basura en .dynamic
+                 * y seguir escaneando hasta romperse.
+                 */
+                eager_vfs_file=true;
+            }
+            if(eager_vfs_file){
+                r=c3_mmap_map_private_file(cur,vaddr,aligned_len,prot,fd,off);
+                if(r<0){
+                    C3_MMAP_FAIL("private-eager-map");
+                    return r;
+                }
+                initial_resident_pages=c3_mmap_pages_u32(aligned_len);
+                if((wayfire_own_so||wayfire_input_so||wayfire_renderer_exec_so||
+                    wayfire_core_so||wayfire_wf_dock_so||wayfire_gtk_shell_so)&&
+                   c3_wayfire_debug_trace_enabled()){
+                    static uint32_t wf_eager_so_trace;
+                    if(wf_eager_so_trace<80u){
+                        ++wf_eager_so_trace;
+                        __boot_serial_force_puts("[mmap-wayfire-eager-so!] va=");
+                        __boot_serial_force_puthex64(vaddr);
+                        __boot_serial_force_puts(" len=");
+                        __boot_serial_force_puthex64(aligned_len);
+                        __boot_serial_force_puts(" prot=");
+                        __boot_serial_force_puthex64((uint64_t)prot);
+                        __boot_serial_force_puts(" off=");
+                        __boot_serial_force_puthex64((uint64_t)off);
+                        __boot_serial_force_puts(" path=");
+                        __boot_serial_force_puts(vpath);
+                        __boot_serial_force_puts("\n");
+                    }
+                }
+                if(vpath&&c3_has_token(vpath,"libxul.so")&&
+                   off<=C3_LIBXUL_DYNAMIC_FILE_OFF&&
+                   aligned_len>(C3_LIBXUL_DYNAMIC_FILE_OFF-off)){
+                    static uint32_t dyn_trace=0;
+                    if(dyn_trace<4){
+                        uint64_t dyn_va=vaddr+(C3_LIBXUL_DYNAMIC_FILE_OFF-off);
+                        uint64_t null_va=dyn_va+C3_LIBXUL_DYNAMIC_NULL_DELTA;
+                        uint64_t e0=paging_get_entry(cur->addr_space,dyn_va);
+                        uint64_t en=paging_get_entry(cur->addr_space,null_va);
+                        ++dyn_trace;
+                        __boot_serial_force_puts("[libxul-dyn-map!] pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        c3_force_task_name(cur);
+                        __boot_serial_force_puts(" dyn=");
+                        __boot_serial_force_puthex64(dyn_va);
+                        __boot_serial_force_puts(" pte=");
+                        __boot_serial_force_puthex64(e0);
+                        __boot_serial_force_puts(" q0=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((e0&C3_PTE_ADDR_MASK)+(dyn_va&0xFFFULL)));
+                        __boot_serial_force_puts(" q1=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((e0&C3_PTE_ADDR_MASK)+((dyn_va+8)&0xFFFULL)));
+                        __boot_serial_force_puts(" null=");
+                        __boot_serial_force_puthex64(null_va);
+                        __boot_serial_force_puts(" npte=");
+                        __boot_serial_force_puthex64(en);
+                        __boot_serial_force_puts(" nq0=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((en&C3_PTE_ADDR_MASK)+(null_va&0xFFFULL)));
+                        __boot_serial_force_puts(" nq1=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((en&C3_PTE_ADDR_MASK)+((null_va+8)&0xFFFULL)));
+                        __boot_serial_force_puts("\n");
+                    }
+                }
+                if(c3_task_is_firefox_runtime(cur)){
+                    static uint32_t eager_map_trace=0;
+                    if(eager_map_trace<32){
+                        ++eager_map_trace;
+                        __boot_serial_force_puts("[mmap-vfs-eager!] pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        c3_force_task_name(cur);
+                        __boot_serial_force_puts(" va=");
+                        __boot_serial_force_puthex64(vaddr);
+                        __boot_serial_force_puts(" len=");
+                        __boot_serial_force_puthex64(aligned_len);
+                        __boot_serial_force_puts(" prot=");
+                        __boot_serial_force_putu32((uint32_t)prot);
+                        __boot_serial_force_puts(" flags=");
+                        __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+                        __boot_serial_force_puts(" off=");
+                        __boot_serial_force_puthex64(off);
+                        if(vpath&&*vpath){
+                            __boot_serial_force_puts(" path=");
+                            __boot_serial_force_puts(vpath);
+                        }
+                        __boot_serial_force_puts("\n");
+                    }
+                }
+            }else{
+                c3_mmap_force_unmapped_pages(cur->addr_space,vaddr,vaddr+aligned_len);
+                if(vpath&&clean_large_vfs&&
+                   c3_wayfire_debug_trace_enabled()&&
+                   (c3_task_is_browser_runtime(cur)||c3_task_is_wayfire_runtime(cur))){
+                    static uint32_t lazy_large_trace=0;
+                    if(lazy_large_trace<32){
+                        ++lazy_large_trace;
+                        __boot_serial_force_puts("[mmap-vfs-lazy-large!] pid=");
+                        __boot_serial_force_putu32((uint32_t)cur->pid);
+                        c3_force_task_name(cur);
+                        __boot_serial_force_puts(" va=");
+                        __boot_serial_force_puthex64(vaddr);
+                        __boot_serial_force_puts(" len=");
+                        __boot_serial_force_puthex64(aligned_len);
+                        __boot_serial_force_puts(" prot=");
+                        __boot_serial_force_putu32((uint32_t)prot);
+                        __boot_serial_force_puts(" off=");
+                        __boot_serial_force_puthex64(off);
+                        __boot_serial_force_puts(" path=");
+                        __boot_serial_force_puts(vpath);
+                        __boot_serial_force_puts("\n");
+                    }
+                }
+                r=0;
+            }
+        }else{
+            r=c3_mmap_map_private_file(cur,vaddr,aligned_len,prot,fd,off);
+            if(r<0){
+                C3_MMAP_FAIL("private-map");
+                return r;
+            }
+            initial_resident_pages=c3_mmap_pages_u32(aligned_len);
         }
     }else if(!is_anon&&cur->fdt.fds[fd].kind==FDKIND_VFSFILE){
         r=c3_mmap_map_shared_vfs_file(cur,vaddr,aligned_len,prot,fd,off);
@@ -8087,12 +15433,14 @@ retry_pick:
             C3_MMAP_FAIL("shared-vfs-map");
             return r;
         }
+        initial_resident_pages=c3_mmap_pages_u32(aligned_len);
     }else{
         r=c3_mmap_map_pages(cur->addr_space,vaddr,aligned_len,c3_mmap_pte_flags_from_prot(prot),true);
         if(r<0){
             C3_MMAP_FAIL("anon-map");
             return r;
         }
+        initial_resident_pages=c3_mmap_pages_u32(aligned_len);
         if(!is_anon){
             r=c3_mmap_file_copy(cur,vaddr,aligned_len,fd,off);
             if(r<0){
@@ -8104,7 +15452,12 @@ retry_pick:
     }
     slot=c3_mmap_alloc_slot();
     if(slot<0){
+        c3_mmap_merge_adjacent(cur->addr_space);
+        slot=c3_mmap_alloc_slot();
+    }
+    if(slot<0){
         c3_mmap_unmap_pages(cur->addr_space,vaddr,aligned_len,true);
+        if(mapped_drm_handle)drm_mmap_release_handle(mapped_drm_handle);
         C3_MMAP_FAIL("alloc-slot");
         return -ENOMEM;
     }
@@ -8116,7 +15469,10 @@ retry_pick:
     g_mmap_table[slot].flags=flags;
     g_mmap_table[slot].fd=fd;
     g_mmap_table[slot].offset=off;
+    g_mmap_table[slot].drm_handle=mapped_drm_handle;
+    g_mmap_table[slot].resident_pages=initial_resident_pages;
     g_mmap_table[slot].backing_kind=0;
+    g_mmap_table[slot].no_free_phys=map_no_free_phys?1u:0u;
     g_mmap_table[slot].backing_path[0]=0;
     if(is_anon&&c3_mmap_is_shared(flags)){
         c3_shared_anon_make_path(g_mmap_table[slot].backing_path,
@@ -8150,7 +15506,34 @@ retry_pick:
             c3_strlcpy(g_mmap_table[slot].backing_path,"/dev/null",sizeof(g_mmap_table[slot].backing_path));
         }else if(cur->fdt.fds[fd].kind==FDKIND_DEVFB){
             c3_strlcpy(g_mmap_table[slot].backing_path,"/dev/dri/card0",sizeof(g_mmap_table[slot].backing_path));
+        }else if(cur->fdt.fds[fd].kind==FDKIND_DEVINPUT){
+            c3_strlcpy(g_mmap_table[slot].backing_path,"/dev/input/event0",sizeof(g_mmap_table[slot].backing_path));
+        }else if(cur->fdt.fds[fd].kind==FDKIND_DEVSND){
+            c3_strlcpy(g_mmap_table[slot].backing_path,"/dev/snd/pcmC0D0p",sizeof(g_mmap_table[slot].backing_path));
         }
+    }
+    if(c3_task_is_firefox_runtime(cur)&&
+       c3_has_token(g_mmap_table[slot].backing_path,"libxul.so")){
+        __boot_serial_force_puts("[mmap-libxul!] pid=");
+        __boot_serial_force_putu32((uint32_t)cur->pid);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts(" slot=");
+        __boot_serial_force_putu32((uint32_t)slot);
+        __boot_serial_force_puts(" va=");
+        __boot_serial_force_puthex64(vaddr);
+        __boot_serial_force_puts(" len=");
+        __boot_serial_force_puthex64(aligned_len);
+        __boot_serial_force_puts(" prot=");
+        __boot_serial_force_putu32((uint32_t)prot);
+        __boot_serial_force_puts(" flags=");
+        __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+        __boot_serial_force_puts(" fd=");
+        __boot_serial_force_putu32((uint32_t)(fd>=0?fd:0xFFFFFFFFu));
+        __boot_serial_force_puts(" off=");
+        __boot_serial_force_puthex64(off);
+        __boot_serial_force_puts(" path=");
+        __boot_serial_force_puts(g_mmap_table[slot].backing_path);
+        __boot_serial_force_puts("\n");
     }
     if(c3_task_is_chromium_runtime(cur)){
         static uint32_t chrome_mmap_trace=0;
@@ -8186,7 +15569,116 @@ retry_pick:
             __boot_serial_force_puts("\n");
         }
     }
-    if(g_c3_mmap_trace_count<C3_MMAP_TRACE_MAX){
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_mmap_trace=0;
+        const char *bp=g_mmap_table[slot].backing_path;
+        bool interesting=(fd>=0)||c3_mmap_is_shared(flags)||aligned_len>=(256ULL*1024ULL);
+        if(wf_mmap_trace<180u&&interesting){
+            ++wf_mmap_trace;
+            __boot_serial_force_puts("[wf-mmap!] #");
+            __boot_serial_force_putu32(wf_mmap_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" slot=");
+            __boot_serial_force_putu32((uint32_t)slot);
+            __boot_serial_force_puts(" va=");
+            __boot_serial_force_puthex64(vaddr);
+            __boot_serial_force_puts(" len=");
+            __boot_serial_force_puthex64(aligned_len);
+            __boot_serial_force_puts(" prot=");
+            __boot_serial_force_putu32((uint32_t)prot);
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)(fd>=0?fd:0xFFFFFFFFu));
+            __boot_serial_force_puts(" off=");
+            __boot_serial_force_puthex64(off);
+            if(bp&&bp[0]){
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(bp);
+            }
+            if(is_anon)__boot_serial_force_puts(" anon=1");
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&
+       g_mmap_table[slot].backing_path[0]&&
+       c3_has_token(g_mmap_table[slot].backing_path,C3_MEMFD_PREFIX)){
+        static uint32_t wf_memfd_mmap_trace=0;
+        if(wf_memfd_mmap_trace<128u){
+            const char *bp=g_mmap_table[slot].backing_path;
+            uint64_t logical=0;
+            (void)c3_memfd_path_get_size(bp,&logical);
+            ++wf_memfd_mmap_trace;
+            __boot_serial_force_puts("[wf-mmap-memfd!] #");
+            __boot_serial_force_putu32(wf_memfd_mmap_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" slot=");
+            __boot_serial_force_putu32((uint32_t)slot);
+            __boot_serial_force_puts(" va=");
+            __boot_serial_force_puthex64(vaddr);
+            __boot_serial_force_puts(" len=");
+            __boot_serial_force_puthex64(aligned_len);
+            __boot_serial_force_puts(" prot=");
+            __boot_serial_force_putu32((uint32_t)prot);
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+            __boot_serial_force_puts(" off=");
+            __boot_serial_force_puthex64(off);
+            __boot_serial_force_puts(" size=");
+            __boot_serial_force_puthex64(logical);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(bp);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&
+       g_mmap_table[slot].backing_path[0]&&
+       c3_starts_with(g_mmap_table[slot].backing_path,C3_DELETED_PREFIX)){
+        static uint32_t wf_deleted_mmap_trace=0;
+        if(wf_deleted_mmap_trace<128u){
+            const char *bp=g_mmap_table[slot].backing_path;
+            const uint8_t *data=0;
+            uint32_t size=0;
+            uint64_t b0=0;
+            if(kvfs_read(bp,&data,&size)&&data){
+                size_t bi,lim=size<8?size:8;
+                for(bi=0;bi<lim;++bi)b0|=((uint64_t)data[bi])<<(bi*8);
+            }
+            ++wf_deleted_mmap_trace;
+            __boot_serial_force_puts("[wf-mmap-deleted!] #");
+            __boot_serial_force_putu32(wf_deleted_mmap_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" slot=");
+            __boot_serial_force_putu32((uint32_t)slot);
+            __boot_serial_force_puts(" va=");
+            __boot_serial_force_puthex64(vaddr);
+            __boot_serial_force_puts(" len=");
+            __boot_serial_force_puthex64(aligned_len);
+            __boot_serial_force_puts(" prot=");
+            __boot_serial_force_putu32((uint32_t)prot);
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+            __boot_serial_force_puts(" off=");
+            __boot_serial_force_puthex64(off);
+            __boot_serial_force_puts(" size=");
+            __boot_serial_force_puthex64((uint64_t)size);
+            __boot_serial_force_puts(" b0=");
+            __boot_serial_force_puthex64(b0);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(bp);
+            __boot_serial_force_puts("\n");
+            if(b0==0x6d79656b5f626b78ULL){
+                compat_syscall_trace_wayfire_after_keymap();
+            }
+        }
+    }
+    if(c3_syscall_debug_trace_enabled()&&g_c3_mmap_trace_count<C3_MMAP_TRACE_MAX){
         ++g_c3_mmap_trace_count;
         __boot_serial_puts("[mmap] pid=");
         __boot_serial_putu32((uint32_t)cur->pid);
@@ -8217,6 +15709,7 @@ retry_pick:
         if(is_anon)__boot_serial_puts(" lazy=1");
         __boot_serial_puts("\n");
     }
+    c3_mmap_merge_slot(slot);
     return(int64_t)vaddr;
 #undef C3_MMAP_FAIL
 }
@@ -8239,8 +15732,11 @@ static bool c3_mmap_can_merge(const mmap_entry_t *a,const mmap_entry_t *b){
     if(a->as!=b->as)return false;
     if(a->prot!=b->prot||a->flags!=b->flags)return false;
     if(a->fd!=b->fd||a->backing_kind!=b->backing_kind)return false;
+    if(a->no_free_phys!=b->no_free_phys)return false;
     if(c3_strcmp(a->backing_path,b->backing_path)!=0)return false;
-    return (a->virt+a->size)==b->virt&&(a->offset+a->size)==b->offset;
+    if((a->virt+a->size)!=b->virt)return false;
+    if(c3_mmap_is_anon(a->flags)&&c3_mmap_is_anon(b->flags))return true;
+    return (a->offset+a->size)==b->offset;
 }
 
 static void c3_mmap_merge_adjacent(address_space_t *as){
@@ -8250,8 +15746,37 @@ static void c3_mmap_merge_adjacent(address_space_t *as){
         for(j=0;j<MMAP_REGION_MAX;++j){
             if(i==j||!g_mmap_table[j].used||g_mmap_table[j].as!=as)continue;
             if(c3_mmap_can_merge(&g_mmap_table[i],&g_mmap_table[j])){
+                c3_mmap_resident_add(&g_mmap_table[i],g_mmap_table[j].resident_pages);
                 g_mmap_table[i].size+=g_mmap_table[j].size;
                 g_mmap_table[j].used=false;
+            }
+        }
+    }
+}
+
+static void c3_mmap_merge_slot(int slot){
+    bool changed=true;
+    if(slot<0||slot>=MMAP_REGION_MAX||!g_mmap_table[slot].used)return;
+    while(changed){
+        int i;
+        changed=false;
+        for(i=0;i<MMAP_REGION_MAX;++i){
+            if(i==slot||!g_mmap_table[i].used)continue;
+            if(c3_mmap_can_merge(&g_mmap_table[slot],&g_mmap_table[i])){
+                c3_mmap_resident_add(&g_mmap_table[slot],g_mmap_table[i].resident_pages);
+                g_mmap_table[slot].size+=g_mmap_table[i].size;
+                g_mmap_table[i].used=false;
+                changed=true;
+                break;
+            }
+            if(c3_mmap_can_merge(&g_mmap_table[i],&g_mmap_table[slot])){
+                c3_mmap_resident_add(&g_mmap_table[slot],g_mmap_table[i].resident_pages);
+                g_mmap_table[slot].virt=g_mmap_table[i].virt;
+                g_mmap_table[slot].offset=g_mmap_table[i].offset;
+                g_mmap_table[slot].size+=g_mmap_table[i].size;
+                g_mmap_table[i].used=false;
+                changed=true;
+                break;
             }
         }
     }
@@ -8267,7 +15792,7 @@ static int c3_mprotect_apply_page(address_space_t *as,uint64_t pg,uint64_t pf){
     if((pf&PAGE_WRITABLE)&&(keep&C3_PAGE_SOFT_COW)){
         int ridx=c3_phys_ref_index(phys);
         if(ridx>=0&&g_c3_phys_refcnt[ridx]>1){
-            uint64_t new_frame=pmm_alloc_frame();
+            uint64_t new_frame=c3_alloc_user_frame();
             if(!new_frame)return -ENOMEM;
             c3_phys_ref_set_initial(new_frame);
             c3_memcpy(PHYS_TO_DMAP(new_frame),PHYS_TO_DMAP(phys),PAGE_SIZE);
@@ -8289,14 +15814,42 @@ static void c3_pf_promote_user_parents(address_space_t *as,uint64_t virt);
 
 static uint64_t c3_mmap_alloc_lazy_frame_for_page(const mmap_entry_t *m,uint64_t pg){
     uint64_t frame;
+    if(!c3_browser_memory_reserve_ok(task_current(),"lazy-anon"))return 0;
     if(m&&c3_mmap_is_shared(m->flags)&&m->backing_path[0]&&pg>=m->virt){
         uint64_t rel=pg-m->virt;
         return c3_file_page_get_frame(m->backing_path,0,0,m->offset+rel);
     }
-    frame=pmm_alloc_frame();
+    frame=c3_alloc_user_frame();
     if(!frame)return 0;
     c3_phys_ref_set_initial(frame);
     c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
+    return frame;
+}
+
+static uint64_t c3_mmap_alloc_lazy_file_frame_for_page(const mmap_entry_t *m,uint64_t pg){
+    const uint8_t *data=0;
+    uint32_t size=0;
+    uint64_t frame;
+    uint64_t file_off;
+    if(!m||!c3_mmap_is_lazy_private_file(m)||pg<m->virt)return 0;
+    file_off=m->offset+(pg-m->virt);
+    if(kvfs_read(m->backing_path,&data,&size)&&data&&
+       !(m->prot&(C3_PROT_WRITE|C3_PROT_EXEC))){
+        if(c3_file_page_find_slot(m->backing_path,file_off)<0&&
+           !c3_browser_memory_reserve_ok(task_current(),"lazy-file-share"))
+            return 0;
+        return c3_file_page_get_frame(m->backing_path,data,size,file_off);
+    }
+    if(!c3_browser_memory_reserve_ok(task_current(),"lazy-file"))return 0;
+    frame=c3_alloc_user_frame();
+    if(!frame)return 0;
+    c3_phys_ref_set_initial(frame);
+    c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
+    if(data&&file_off<(uint64_t)size){
+        uint64_t remain=(uint64_t)size-file_off;
+        uint64_t to_copy=(remain<PAGE_SIZE)?remain:PAGE_SIZE;
+        c3_memcpy((void*)PHYS_TO_DMAP(frame),data+file_off,(size_t)to_copy);
+    }
     return frame;
 }
 
@@ -8310,18 +15863,23 @@ static int c3_mmap_materialize_zero_page(address_space_t *as,uint64_t pg,int pro
     if((entry&PAGE_PRESENT)&&(entry&PAGE_USER)&&!(entry&0x080ULL))
         return c3_mprotect_apply_page(as,pg,c3_mmap_pte_flags_from_prot(prot));
     midx=c3_mmap_region_find(as,pg);
-    if(midx>=0&&midx<MMAP_REGION_MAX&&c3_mmap_is_lazy_anon(&g_mmap_table[midx]))
+    if(midx>=0&&midx<MMAP_REGION_MAX)
         m=&g_mmap_table[midx];
-    frame=c3_mmap_alloc_lazy_frame_for_page(m,pg);
+    if(m&&c3_mmap_is_lazy_private_file(m))
+        frame=c3_mmap_alloc_lazy_file_frame_for_page(m,pg);
+    else
+        frame=c3_mmap_alloc_lazy_frame_for_page(
+            (m&&c3_mmap_is_lazy_anon(m))?m:0,pg);
     if(!frame)return -ENOMEM;
     if(!paging_map(as,pg,frame,c3_mmap_pte_flags_from_prot(prot))){
         c3_phys_ref_release(frame);
         return -ENOMEM;
     }
+    if(m)c3_mmap_resident_add(m,1);
     c3_pf_promote_user_parents(as,pg);
     {
         static uint32_t trace_count=0;
-        if(trace_count<32){
+        if(c3_wayfire_debug_trace_enabled()&&trace_count<32){
             ++trace_count;
             __boot_serial_puts("[mprotect-lazy-map] page=");
             __boot_serial_puthex64(pg);
@@ -8353,9 +15911,44 @@ static bool c3_user_qword_read_present(address_space_t *as,uint64_t va,uint64_t 
 static bool c3_user_ptr_plausible(address_space_t *as,uint64_t va){
     uint64_t entry;
     if(!va)return true;
+    if(va<PAGE_SIZE)return false;
     if(!c3_user_low_va(va))return false;
     entry=paging_get_entry(as,va);
-    return (entry&PAGE_PRESENT)&&(entry&PAGE_USER)&&!(entry&0x080ULL);
+    if((entry&PAGE_PRESENT)&&(entry&PAGE_USER)&&!(entry&0x080ULL))return true;
+    return c3_mmap_region_find(as,va&~(PAGE_SIZE-1ULL))>=0;
+}
+
+static void c3_vm_layout_pull_shared(task_t *cur){
+    uint64_t brk_start,brk_current,mmap_base;
+    int i;
+    if(!cur||!cur->addr_space||cur->addr_space==paging_get_kernel_space())return;
+    brk_start=cur->brk_start;
+    brk_current=cur->brk_current;
+    mmap_base=cur->mmap_base;
+    for(i=0;i<TASK_MAX;++i){
+        task_t *t=&g_tasks[i];
+        if(!t->used||t==cur||t->addr_space!=cur->addr_space)continue;
+        if(t->brk_start>=C3_USER_LOW_SAFE&&
+           (brk_start<C3_USER_LOW_SAFE||t->brk_start<brk_start))
+            brk_start=t->brk_start;
+        if(t->brk_current>brk_current)brk_current=t->brk_current;
+        if(t->mmap_base>mmap_base)mmap_base=t->mmap_base;
+    }
+    if(brk_start>=C3_USER_LOW_SAFE)cur->brk_start=brk_start;
+    if(brk_current>=cur->brk_start)cur->brk_current=brk_current;
+    if(mmap_base>=C3_USER_LOW_SAFE)cur->mmap_base=mmap_base;
+}
+
+static void c3_vm_layout_push_shared(task_t *cur){
+    int i;
+    if(!cur||!cur->addr_space||cur->addr_space==paging_get_kernel_space())return;
+    for(i=0;i<TASK_MAX;++i){
+        task_t *t=&g_tasks[i];
+        if(!t->used||t==cur||t->addr_space!=cur->addr_space)continue;
+        t->brk_start=cur->brk_start;
+        t->brk_current=cur->brk_current;
+        t->mmap_base=cur->mmap_base;
+    }
 }
 
 static int c3_clone_materialize_user_page(task_t *cur,uint64_t va,const char *tag){
@@ -8389,9 +15982,10 @@ static int c3_clone_materialize_user_page(task_t *cur,uint64_t va,const char *ta
         __boot_serial_puts("\n");
         return -ENOMEM;
     }
+    c3_mmap_resident_add(&g_mmap_table[midx],1);
     {
         static uint32_t trace_count=0;
-        if(trace_count<8){
+        if(c3_wayfire_debug_trace_enabled()&&trace_count<8){
             ++trace_count;
             __boot_serial_puts("[clone-page] materialized tag=");
             __boot_serial_puts(tag?tag:"?");
@@ -8408,11 +16002,9 @@ static int c3_clone_materialize_user_page(task_t *cur,uint64_t va,const char *ta
 static void c3_clone_prepare_user_tls_stack(task_t *cur,uint64_t child_pid,uint64_t flags,uint64_t child_stack,uint64_t ptid,uint64_t ctid,uint64_t tls){
     static uint32_t trace_count=0;
     uint64_t q510=0,q518=0,q520=0,q528=0;
-    uint32_t fixed_tsd=0;
     uint64_t tls_page=0,stack_page=0;
     uint64_t tls_entry=0,stack_entry=0;
     int tls_midx=-1,stack_midx=-1;
-    uint64_t off;
     if(!cur||!cur->addr_space)return;
     if(!(flags&C3_CLONE_THREAD))return;
     if(flags&C3_CLONE_SETTLS){
@@ -8424,22 +16016,20 @@ static void c3_clone_prepare_user_tls_stack(task_t *cur,uint64_t child_pid,uint6
     if(ctid)c3_clone_materialize_user_page(cur,ctid,"ctid");
 
     if((flags&C3_CLONE_SETTLS)&&tls&&c3_user_low_va(tls+0x610ULL)){
-        for(off=0x518ULL;off<0x610ULL;off+=8ULL){
-            uint64_t va=tls+off;
-            uint64_t q=0;
-            if(!c3_user_qword_read_present(cur->addr_space,va,&q))continue;
-            if(!c3_user_ptr_plausible(cur->addr_space,q)){
-                *(uint64_t*)(uintptr_t)va=0;
-                ++fixed_tsd;
-            }
-        }
+        /*
+         * Do not modify glibc's freshly allocated TCB/TSD slots here.  Mesa's
+         * shader-cache thread uses pthread-specific storage very early; wiping
+         * "implausible" TLS pointers corrupts that state and later shows up as
+         * libgallium faults or malloc tcache damage.  The ABI job is to map the
+         * TLS page and set FS, then let glibc own its layout.
+         */
         (void)c3_user_qword_read_present(cur->addr_space,tls+0x510ULL,&q510);
         (void)c3_user_qword_read_present(cur->addr_space,tls+0x518ULL,&q518);
         (void)c3_user_qword_read_present(cur->addr_space,tls+0x520ULL,&q520);
         (void)c3_user_qword_read_present(cur->addr_space,tls+0x528ULL,&q528);
     }
 
-    if(trace_count<96){
+    if(c3_wayfire_debug_trace_enabled()&&trace_count<96){
         ++trace_count;
         if(tls){
             tls_page=tls&~(PAGE_SIZE-1ULL);
@@ -8478,8 +16068,6 @@ static void c3_clone_prepare_user_tls_stack(task_t *cur,uint64_t child_pid,uint6
         __boot_serial_puthex64(q520);
         __boot_serial_puts(",");
         __boot_serial_puthex64(q528);
-        __boot_serial_puts(" fixed=");
-        __boot_serial_putu32(fixed_tsd);
         __boot_serial_puts("\n");
     }
 }
@@ -8497,7 +16085,7 @@ int64_t real_sys_munmap(uint64_t addr,uint64_t len){
     raw_end=addr+len;
     ue=(raw_end+PAGE_SIZE-1)&~(PAGE_SIZE-1);
     if(ue<raw_end||ue>C3_USER_TOP)return -EINVAL;
-    if(g_c3_munmap_trace_count<C3_MUNMAP_TRACE_MAX){
+    if(c3_wayfire_debug_trace_enabled()&&g_c3_munmap_trace_count<C3_MUNMAP_TRACE_MAX){
         ++g_c3_munmap_trace_count;
         trace=true;
         __boot_serial_puts("[munmap] pid=");
@@ -8534,16 +16122,50 @@ int64_t real_sys_munmap(uint64_t addr,uint64_t len){
             __boot_serial_puthex64(os);
             __boot_serial_puts("+");
             __boot_serial_puthex64(oe-os);
+            __boot_serial_puts(" resident=");
+            __boot_serial_putu32(g_mmap_table[i].resident_pages);
             if(g_mmap_table[i].backing_path[0]){
                 __boot_serial_puts(" path=");
                 __boot_serial_puts(g_mmap_table[i].backing_path);
             }
             __boot_serial_puts("\n");
         }
-        c3_mmap_writeback_vfs_range(cur,&g_mmap_table[i],os,oe-os);
-        c3_mmap_unmap_pages(cur->addr_space,os,oe-os,true);
+        if(((c3_mmap_is_lazy_anon(&g_mmap_table[i])||
+             c3_mmap_is_lazy_private_file(&g_mmap_table[i]))&&
+            g_mmap_table[i].resident_pages==0)){
+            if(trace){
+                __boot_serial_puts("[munmap-skip-empty] pid=");
+                __boot_serial_putu32((uint32_t)cur->pid);
+                c3_trace_task_name(cur);
+                __boot_serial_puts(" slot=");
+                __boot_serial_putu32((uint32_t)i);
+                __boot_serial_puts(" cut=");
+                __boot_serial_puthex64(os);
+                __boot_serial_puts("+");
+                __boot_serial_puthex64(oe-os);
+                if(g_mmap_table[i].backing_path[0]){
+                    __boot_serial_puts(" path=");
+                    __boot_serial_puts(g_mmap_table[i].backing_path);
+                }
+                __boot_serial_puts("\n");
+            }
+        }else{
+            c3_mmap_writeback_vfs_range(cur,&g_mmap_table[i],os,oe-os);
+            c3_mmap_unmap_pages(cur->addr_space,os,oe-os,c3_mmap_owns_phys(&g_mmap_table[i]));
+            if(trace){
+                __boot_serial_puts("[munmap-hit-done] pid=");
+                __boot_serial_putu32((uint32_t)cur->pid);
+                c3_trace_task_name(cur);
+                __boot_serial_puts(" slot=");
+                __boot_serial_putu32((uint32_t)i);
+                __boot_serial_puts("\n");
+            }
+        }
         touched=true;
         if(os==rs&&oe==re){
+            if(g_mmap_table[i].backing_kind==FDKIND_DEVFB&&
+               g_mmap_table[i].drm_handle)
+                drm_mmap_release_handle(g_mmap_table[i].drm_handle);
             g_mmap_table[i].used=false;
             continue;
         }
@@ -8551,10 +16173,12 @@ int64_t real_sys_munmap(uint64_t addr,uint64_t len){
             g_mmap_table[i].virt=oe;
             g_mmap_table[i].size=re-oe;
             g_mmap_table[i].offset+=(oe-rs);
+            c3_mmap_resident_clamp(&g_mmap_table[i]);
             continue;
         }
         if(oe==re){
             g_mmap_table[i].size=os-rs;
+            c3_mmap_resident_clamp(&g_mmap_table[i]);
             continue;
         }
         {
@@ -8565,13 +16189,16 @@ int64_t real_sys_munmap(uint64_t addr,uint64_t len){
                 g_mmap_table[ns].size=re-oe;
                 g_mmap_table[ns].offset+=(oe-rs);
                 g_mmap_table[i].size=os-rs;
+                c3_mmap_resident_clamp(&g_mmap_table[i]);
+                c3_mmap_resident_clamp(&g_mmap_table[ns]);
             }else{
                 /* Out of metadata slots: keep left half only */
                 g_mmap_table[i].size=os-rs;
+                c3_mmap_resident_clamp(&g_mmap_table[i]);
             }
         }
     }
-    if(touched)c3_mmap_merge_adjacent(cur->addr_space);
+    (void)touched;
     return 0;
 }
 
@@ -8586,7 +16213,7 @@ int64_t real_sys_mprotect(uint64_t addr,uint64_t len,int prot){
     if(!len||(addr&(PAGE_SIZE-1)))return -EINVAL;
     us=addr;
     ue=(addr+len+PAGE_SIZE-1)&~(PAGE_SIZE-1);
-    if(g_c3_mprotect_trace_count<C3_MPROTECT_TRACE_MAX){
+    if(c3_wayfire_debug_trace_enabled()&&g_c3_mprotect_trace_count<C3_MPROTECT_TRACE_MAX){
         int midx=c3_mmap_region_find(cur->addr_space,us);
         ++g_c3_mprotect_trace_count;
         __boot_serial_puts("[mprotect] addr=");
@@ -8621,12 +16248,16 @@ int64_t real_sys_mprotect(uint64_t addr,uint64_t len,int prot){
     for(i=0;i<MMAP_REGION_MAX;++i){
         uint64_t rs,re,os,oe,pg;
         bool lazy_anon;
+        bool lazy_file;
+        bool lazy_mapping;
         bool materialize_small_lazy;
         if(!g_mmap_table[i].used||g_mmap_table[i].as!=cur->addr_space)continue;
         rs=g_mmap_table[i].virt;
         re=rs+g_mmap_table[i].size;
         if(ue<=rs||us>=re)continue;
         lazy_anon=c3_mmap_is_lazy_anon(&g_mmap_table[i]);
+        lazy_file=c3_mmap_is_lazy_private_file(&g_mmap_table[i]);
+        lazy_mapping=lazy_anon||lazy_file;
         if((prot&C3_PROT_WRITE)&&c3_mmap_is_shared(g_mmap_table[i].flags)){
             if(g_mmap_table[i].fd>=0&&!c3_mmap_fd_perms_ok(cur,g_mmap_table[i].fd,prot,g_mmap_table[i].flags))
                 return -EACCES;
@@ -8634,9 +16265,9 @@ int64_t real_sys_mprotect(uint64_t addr,uint64_t len,int prot){
         os=(us>rs)?us:rs;
         oe=(ue<re)?ue:re;
         if(oe<=os)continue;
-        materialize_small_lazy=lazy_anon&&(prot&C3_PROT_WRITE)&&
+        materialize_small_lazy=(lazy_anon||lazy_file)&&(prot&C3_PROT_WRITE)&&
             ((oe-os)<=(2ULL*1024ULL*1024ULL));
-        if(lazy_anon&&!materialize_small_lazy&&
+        if(lazy_mapping&&!materialize_small_lazy&&
            (oe-os)>(64ULL*1024ULL*1024ULL)){
             /* Large browser reservations are usually entirely lazy. Updating
              * metadata is enough; future faults will materialize pages with
@@ -8644,7 +16275,7 @@ int64_t real_sys_mprotect(uint64_t addr,uint64_t len,int prot){
         }else{
             for(pg=os;pg<oe;pg+=PAGE_SIZE){
                 int pr;
-                if(lazy_anon){
+                if(lazy_mapping){
                     uint64_t entry=paging_get_entry(cur->addr_space,pg);
                     if(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&0x080ULL)){
                         if(materialize_small_lazy){
@@ -8655,7 +16286,7 @@ int64_t real_sys_mprotect(uint64_t addr,uint64_t len,int prot){
                     }
                 }
                 pr=c3_mprotect_apply_page(cur->addr_space,pg,pf);
-                if(pr==-ENOENT&&lazy_anon){
+                if(pr==-ENOENT&&lazy_mapping){
                     if(materialize_small_lazy){
                         pr=c3_mmap_materialize_zero_page(cur->addr_space,pg,prot);
                         if(pr<0)return pr;
@@ -8725,16 +16356,30 @@ int64_t real_sys_brk(uint64_t addr){
     task_t *cur=task_current();
     uint64_t old_end,new_end,pg;
     if(!cur||!cur->addr_space)return -ESRCH;
+    c3_vm_layout_pull_shared(cur);
+    if(cur->brk_start<C3_USER_LOW_SAFE||cur->brk_current<cur->brk_start){
+        if(!c3_place_user_heap(cur,"brk"))return cur?(int64_t)cur->brk_current:-ENOMEM;
+        c3_vm_layout_push_shared(cur);
+    }
     if(!addr)return(int64_t)cur->brk_current;
+    if(addr>=C3_USER_TOP||addr>C3_USER_TOP-PAGE_SIZE)return(int64_t)cur->brk_current;
     if(addr<cur->brk_start)return(int64_t)cur->brk_current;
     old_end=(cur->brk_current+PAGE_SIZE-1)&~(PAGE_SIZE-1);
     new_end=(addr+PAGE_SIZE-1)&~(PAGE_SIZE-1);
+    if(new_end>C3_USER_TOP-C3_USER_HEAP_GAP)return(int64_t)cur->brk_current;
+    if(cur->mmap_base&&new_end+C3_USER_HEAP_GAP>=cur->mmap_base)
+        return(int64_t)cur->brk_current;
     if(new_end>old_end){
         for(pg=old_end;pg<new_end;pg+=PAGE_SIZE){
-            uint64_t frame=pmm_alloc_frame();
+            uint64_t frame;
+            if(!c3_browser_memory_reserve_ok(cur,"brk"))return(int64_t)cur->brk_current;
+            frame=c3_alloc_user_frame();
             if(!frame)return(int64_t)cur->brk_current;
             c3_phys_ref_set_initial(frame);
-            paging_map(cur->addr_space,pg,frame,c3_mmap_pte_flags_from_prot(C3_PROT_READ|C3_PROT_WRITE));
+            if(!paging_map(cur->addr_space,pg,frame,c3_mmap_pte_flags_from_prot(C3_PROT_READ|C3_PROT_WRITE))){
+                c3_phys_ref_release(frame);
+                return(int64_t)cur->brk_current;
+            }
             c3_memset((void*)(uintptr_t)pg,0,PAGE_SIZE);
         }
     }else if(new_end<old_end){
@@ -8745,6 +16390,7 @@ int64_t real_sys_brk(uint64_t addr){
         }
     }
     cur->brk_current=addr;
+    c3_vm_layout_push_shared(cur);
     return(int64_t)cur->brk_current;
 }
 
@@ -8768,7 +16414,8 @@ int64_t real_sys_mremap(uint64_t old_addr,uint64_t old_size,uint64_t new_size,in
         return (int64_t)old_addr;
     }
     /* Try in-place growth first */
-    if(!c3_mmap_overlap_as(cur->addr_space,old_addr+old_len,old_addr+new_len,idx)){
+    if(!g_mmap_table[idx].no_free_phys&&
+       !c3_mmap_overlap_as(cur->addr_space,old_addr+old_len,old_addr+new_len,idx)){
         uint64_t add=new_len-old_len;
         if(c3_mmap_is_lazy_anon(&g_mmap_table[idx])){
             g_mmap_table[idx].size=new_len;
@@ -8806,19 +16453,69 @@ int64_t real_sys_mremap(uint64_t old_addr,uint64_t old_size,uint64_t new_size,in
     }
 }
 
-static bool c3_va_is_shared_mapping(address_space_t *as,uint64_t va){
-    int idx=c3_mmap_region_find(as,va);
-    if(idx<0)return false;
-    return c3_mmap_is_shared(g_mmap_table[idx].flags);
+typedef struct {
+    int idx;
+    uint64_t next_start;
+} c3_mmap_walk_cache_t;
+
+static int c3_mmap_region_find_walk(address_space_t *as,uint64_t va,c3_mmap_walk_cache_t *cache){
+    int i,best=-1;
+    uint64_t best_size=~0ULL,next=~0ULL;
+    if(!as)return -1;
+    if(cache&&cache->idx>=0&&cache->idx<MMAP_REGION_MAX&&
+       g_mmap_table[cache->idx].used&&g_mmap_table[cache->idx].as==as){
+        uint64_t s=g_mmap_table[cache->idx].virt;
+        uint64_t e=s+g_mmap_table[cache->idx].size;
+        if(va>=s&&va<e)return cache->idx;
+    }
+    if(cache&&cache->next_start&&cache->next_start!=~0ULL&&va<cache->next_start)
+        return -1;
+    for(i=0;i<MMAP_REGION_MAX;++i){
+        uint64_t s,e,sz;
+        if(!g_mmap_table[i].used||g_mmap_table[i].as!=as)continue;
+        s=g_mmap_table[i].virt;
+        e=s+g_mmap_table[i].size;
+        if(s>va&&s<next)next=s;
+        if(va<s||va>=e)continue;
+        sz=g_mmap_table[i].size;
+        if(sz<best_size||(sz==best_size&&i>best)){
+            best=i;
+            best_size=sz;
+        }
+    }
+    if(cache){
+        cache->idx=best;
+        if(best>=0)cache->next_start=g_mmap_table[best].virt+g_mmap_table[best].size;
+        else cache->next_start=next;
+    }
+    return best;
 }
 
 int compat3_fork_address_space(task_t *parent,task_t *child){
     int pml4i,pdpti,pdi,pti;
     address_space_t *pas,*cas;
+    c3_mmap_walk_cache_t mmap_cache;
+    bool parent_tlb_dirty=false;
+    uint32_t user_pages=0,cow_pages=0,shared_pages=0,nofree_pages=0,mmap_regions=0;
     if(!parent||!child)return -EINVAL;
     pas=parent->addr_space;
     cas=child->addr_space;
     if(!pas||!cas||pas==paging_get_kernel_space()||cas==paging_get_kernel_space())return -EINVAL;
+    mmap_cache.idx=-1;
+    mmap_cache.next_start=0;
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(parent)){
+        int mi;
+        for(mi=0;mi<MMAP_REGION_MAX;++mi)
+            if(g_mmap_table[mi].used&&g_mmap_table[mi].as==pas)++mmap_regions;
+        __boot_serial_force_puts("[fork-as!] begin parent=");
+        __boot_serial_force_putu32((uint32_t)parent->pid);
+        __boot_serial_force_puts(" child=");
+        __boot_serial_force_putu32((uint32_t)child->pid);
+        __boot_serial_force_puts(" mmaps=");
+        __boot_serial_force_putu32(mmap_regions);
+        c3_force_task_name(parent);
+        __boot_serial_force_puts("\n");
+    }
     for(pml4i=0;pml4i<256;++pml4i){
         if(!(pas->pml4->entries[pml4i]&PAGE_PRESENT))continue;
         {
@@ -8838,25 +16535,35 @@ int compat3_fork_address_space(task_t *parent,task_t *child){
                                 uint64_t phys;
                                 uint64_t flags;
                                 uint64_t va;
+                                int midx;
                                 bool user;
                                 bool shared;
+                                bool nofree;
                                 if(!(entry&PAGE_PRESENT))continue;
                                 phys=entry&C3_PTE_ADDR_MASK;
                                 flags=entry&C3_PTE_KEEP_MASK;
                                 user=(flags&PAGE_USER)!=0;
                                 if(!user||!phys)continue;
                                 va=((uint64_t)pml4i<<39)|((uint64_t)pdpti<<30)|((uint64_t)pdi<<21)|((uint64_t)pti<<12);
-                                shared=c3_va_is_shared_mapping(pas,va);
+                                midx=c3_mmap_region_find_walk(pas,va,&mmap_cache);
+                                shared=(midx>=0)&&c3_mmap_is_shared(g_mmap_table[midx].flags);
+                                nofree=(midx>=0)&&!c3_mmap_owns_phys(&g_mmap_table[midx]);
+                                ++user_pages;
+                                if(shared)++shared_pages;
+                                if(nofree)++nofree_pages;
                                 if(!shared&&((flags&PAGE_WRITABLE)||(flags&C3_PAGE_SOFT_COW))){
                                     flags&=~PAGE_WRITABLE;
                                     flags|=C3_PAGE_SOFT_COW;
                                     pt->entries[pti]=phys|flags;
-                                    if(task_current()&&task_current()->addr_space==pas)paging_flush_tlb(va);
+                                    parent_tlb_dirty=true;
+                                    ++cow_pages;
                                 }
-                                c3_phys_ref_set_initial(phys);
-                                c3_phys_ref_retain(phys);
+                                if(!nofree){
+                                    c3_phys_ref_set_initial(phys);
+                                    c3_phys_ref_retain(phys);
+                                }
                                 if(!paging_map(cas,va,phys,flags)){
-                                    c3_phys_ref_release(phys);
+                                    if(!nofree)c3_phys_ref_release(phys);
                                     return -ENOMEM;
                                 }
                             }
@@ -8866,17 +16573,33 @@ int compat3_fork_address_space(task_t *parent,task_t *child){
             }
         }
     }
+    if(parent_tlb_dirty&&task_current()&&task_current()->addr_space==pas)
+        paging_switch(pas);
     /* Mirror mmap metadata for the child. */
+    pdpti=0;
     for(pml4i=0;pml4i<MMAP_REGION_MAX;++pml4i){
         if(!g_mmap_table[pml4i].used||g_mmap_table[pml4i].as!=pas)continue;
-        for(pdpti=0;pdpti<MMAP_REGION_MAX;++pdpti){
-            if(!g_mmap_table[pdpti].used){
-                g_mmap_table[pdpti]=g_mmap_table[pml4i];
-                g_mmap_table[pdpti].as=cas;
-                g_mmap_table[pdpti].used=true;
-                break;
-            }
-        }
+        while(pdpti<MMAP_REGION_MAX&&g_mmap_table[pdpti].used)++pdpti;
+        if(pdpti>=MMAP_REGION_MAX)break;
+        g_mmap_table[pdpti]=g_mmap_table[pml4i];
+        g_mmap_table[pdpti].as=cas;
+        g_mmap_table[pdpti].used=true;
+        ++pdpti;
+    }
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(parent)){
+        __boot_serial_force_puts("[fork-as!] done parent=");
+        __boot_serial_force_putu32((uint32_t)parent->pid);
+        __boot_serial_force_puts(" child=");
+        __boot_serial_force_putu32((uint32_t)child->pid);
+        __boot_serial_force_puts(" pages=");
+        __boot_serial_force_putu32(user_pages);
+        __boot_serial_force_puts(" cow=");
+        __boot_serial_force_putu32(cow_pages);
+        __boot_serial_force_puts(" shared=");
+        __boot_serial_force_putu32(shared_pages);
+        __boot_serial_force_puts(" nofree=");
+        __boot_serial_force_putu32(nofree_pages);
+        __boot_serial_force_puts("\n");
     }
     return 0;
 }
@@ -8901,7 +16624,7 @@ static bool c3_pf_rewrite_entry(address_space_t *as,uint64_t page,uint64_t phys,
 /* Promote PAGE_USER on parent entries (PML4E, PDPTE, PDE) for a given
  * virtual address.  When the deep-clone copies kernel identity-map entries
  * as supervisor-only, a later user mapping under that range will have the
- * leaf PTE marked PAGE_USER but the parent entries still lack it — the CPU
+ * leaf PTE marked PAGE_USER but the parent entries still lack it â€” the CPU
  * faults with err=0x2 (supervisor violation) before it even reaches the
  * leaf.  Calling this after any successful user PF fixup ensures the walk
  * succeeds on the next attempt. */
@@ -8909,7 +16632,7 @@ static void c3_pf_promote_user_parents(address_space_t *as,uint64_t virt){
     uint64_t pml4i=(virt>>39)&0x1FF,pdpti=(virt>>30)&0x1FF,pdi=(virt>>21)&0x1FF;
     page_table_t *pdpt,*pd;
     if(!as||!as->pml4)return;
-    /* All page-table frames are reached via DMAP — no CR3 switch needed. */
+    /* All page-table frames are reached via DMAP â€” no CR3 switch needed. */
     if(!(as->pml4->entries[pml4i]&PAGE_PRESENT))goto done;
     if(!(as->pml4->entries[pml4i]&PAGE_USER))
         as->pml4->entries[pml4i]|=PAGE_USER;
@@ -8927,6 +16650,118 @@ done:
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
 }
 
+static bool c3_wayfire_renderer_mapping_path(const char *path){
+    return path&&path[0]&&
+        (c3_has_token(path,"libLLVM.so")||
+         c3_has_token(path,"libgallium"));
+}
+
+static bool c3_wayfire_mmap_slop_fault(task_t *cur,uint64_t page,uint64_t err_code,uint64_t entry){
+    static uint32_t slop_trace;
+    static uint32_t slop_miss_trace;
+    int i,slot;
+    bool has_frame;
+    uint64_t phys=0,keep=0;
+    if(!cur||!cur->addr_space)return false;
+    if(!c3_task_is_wayfire_runtime_loose(cur))return false;
+    if(!(err_code&C3_PFERR_WRITE))return false;
+    if(page<0x40000000ULL||page>=C3_USER_TOP)return false;
+    if(cur->brk_start&&cur->brk_current>=cur->brk_start&&
+       page>=cur->brk_start&&page<cur->brk_current)return false;
+    has_frame=(entry&PAGE_PRESENT)!=0;
+    if(has_frame&&!(entry&PAGE_WRITABLE))return false;
+    for(i=0;i<MMAP_REGION_MAX;++i){
+        mmap_entry_t *m=&g_mmap_table[i];
+        bool adjacent;
+        bool anon_near;
+        bool renderer_file_near;
+        uint64_t gap_before=~0ULL;
+        if(!m->used||m->as!=cur->addr_space)continue;
+        adjacent=((page+PAGE_SIZE)==m->virt)||((m->virt+m->size)==page);
+        if(page<m->virt)gap_before=m->virt-page;
+        anon_near=c3_mmap_is_lazy_anon(m)&&c3_mmap_is_private(m->flags)&&
+            (m->prot&C3_PROT_WRITE)&&adjacent;
+        renderer_file_near=c3_wayfire_renderer_mapping_path(m->backing_path)&&
+            page<m->virt&&gap_before<=0x10000ULL;
+        if(!anon_near&&!renderer_file_near){
+            if(slop_miss_trace<48u&&
+               (adjacent||renderer_file_near||
+                (m->backing_path[0]&&page<m->virt&&gap_before<=0x10000ULL))){
+                ++slop_miss_trace;
+                __boot_serial_force_puts("[wayfire-slop-miss!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" page=");
+                __boot_serial_force_puthex64(page);
+                __boot_serial_force_puts(" cand=");
+                __boot_serial_force_puthex64(m->virt);
+                __boot_serial_force_puts(" gap=");
+                __boot_serial_force_puthex64(gap_before);
+                __boot_serial_force_puts(" prot=");
+                __boot_serial_force_putu32((uint32_t)m->prot);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)m->flags);
+                if(m->backing_path[0]){
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(m->backing_path);
+                }
+                __boot_serial_force_puts("\n");
+            }
+            continue;
+        }
+        slot=c3_mmap_alloc_slot();
+        if(slot<0)return false;
+        if(has_frame){
+            phys=entry&C3_PTE_ADDR_MASK;
+            keep=entry&C3_PTE_KEEP_MASK;
+            keep|=PAGE_USER|PAGE_WRITABLE|PAGE_NX;
+            if(!c3_pf_rewrite_entry(cur->addr_space,page,phys,keep))return false;
+        }else{
+            phys=c3_alloc_user_frame();
+            if(!phys)return false;
+            c3_phys_ref_set_initial(phys);
+            c3_memset((void*)PHYS_TO_DMAP(phys),0,PAGE_SIZE);
+            if(!paging_map(cur->addr_space,page,phys,
+                           c3_mmap_pte_flags_from_prot(C3_PROT_READ|C3_PROT_WRITE))){
+                c3_phys_ref_release(phys);
+                return false;
+            }
+        }
+        c3_memset(&g_mmap_table[slot],0,sizeof(g_mmap_table[slot]));
+        g_mmap_table[slot].used=true;
+        g_mmap_table[slot].as=cur->addr_space;
+        g_mmap_table[slot].virt=page;
+        g_mmap_table[slot].size=PAGE_SIZE;
+        g_mmap_table[slot].prot=C3_PROT_READ|C3_PROT_WRITE;
+        g_mmap_table[slot].flags=C3_MAP_PRIVATE|C3_MAP_ANONYMOUS;
+        g_mmap_table[slot].fd=-1;
+        g_mmap_table[slot].offset=0;
+        g_mmap_table[slot].backing_kind=0;
+        g_mmap_table[slot].no_free_phys=0;
+        if(renderer_file_near)
+            c3_strlcpy(g_mmap_table[slot].backing_path,"[wayfire-renderer-slop]",
+                       sizeof(g_mmap_table[slot].backing_path));
+        c3_pf_promote_user_parents(cur->addr_space,page);
+        if(slop_trace<32u){
+            ++slop_trace;
+            __boot_serial_force_puts("[wayfire-mmap-slop!] pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" page=");
+            __boot_serial_force_puthex64(page);
+            __boot_serial_force_puts(" near=");
+            __boot_serial_force_puthex64(m->virt);
+            __boot_serial_force_puts(" len=");
+            __boot_serial_force_puthex64(m->size);
+            __boot_serial_force_puts(" pte=");
+            __boot_serial_force_puthex64(entry);
+            __boot_serial_force_puts("\n");
+        }
+        return true;
+    }
+    return false;
+}
+
 static int c3_user_prepare_private_write_page(address_space_t *as,uint64_t page,const char *tag){
     uint64_t entry,phys,keep,new_frame;
     if(!as||!c3_user_low_va(page))return -EFAULT;
@@ -8936,7 +16771,7 @@ static int c3_user_prepare_private_write_page(address_space_t *as,uint64_t page,
     keep=entry&C3_PTE_KEEP_MASK;
     if((keep&PAGE_WRITABLE)&&!(keep&C3_PAGE_SOFT_COW))return 0;
     if(!(keep&C3_PAGE_SOFT_COW))return -EFAULT;
-    new_frame=pmm_alloc_frame();
+    new_frame=c3_alloc_user_frame();
     if(!new_frame)return -ENOMEM;
     c3_phys_ref_set_initial(new_frame);
     c3_memcpy(PHYS_TO_DMAP(new_frame),PHYS_TO_DMAP(phys),PAGE_SIZE);
@@ -8948,7 +16783,7 @@ static int c3_user_prepare_private_write_page(address_space_t *as,uint64_t page,
     }
     c3_phys_ref_release(phys);
     c3_pf_promote_user_parents(as,page);
-    {
+    if(c3_syscall_debug_trace_enabled()){
         static uint32_t trace_count=0;
         if(trace_count<16){
             ++trace_count;
@@ -8963,6 +16798,278 @@ static int c3_user_prepare_private_write_page(address_space_t *as,uint64_t page,
             __boot_serial_puts("\n");
         }
     }
+    return 0;
+}
+
+static void c3_usercopy_trace_fault(task_t *cur,uint64_t va,uint64_t page,size_t len,
+                                    const char *tag,const char *why){
+    static uint32_t trace_count=0;
+    int midx;
+    if(trace_count>=256)return;
+    if(!cur||(!c3_task_is_browser_runtime(cur)&&
+              !(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur))))return;
+    ++trace_count;
+    midx=cur->addr_space?c3_mmap_region_find(cur->addr_space,page):-1;
+    __boot_serial_force_puts("[usercopy-fault] tag=");
+    __boot_serial_force_puts(tag?tag:"?");
+    __boot_serial_force_puts(" why=");
+    __boot_serial_force_puts(why?why:"?");
+    __boot_serial_force_puts(" pid=");
+    __boot_serial_force_putu32((uint32_t)cur->pid);
+    c3_force_task_name(cur);
+    __boot_serial_force_puts(" va=");
+    __boot_serial_force_puthex64(va);
+    __boot_serial_force_puts(" page=");
+    __boot_serial_force_puthex64(page);
+    __boot_serial_force_puts(" len=");
+    __boot_serial_force_puthex64((uint64_t)len);
+    __boot_serial_force_puts(" midx=");
+    __boot_serial_force_putu32(midx>=0?(uint32_t)midx:0xFFFFFFFFu);
+    if(midx>=0&&midx<MMAP_REGION_MAX){
+        char perms[5];
+        c3_mmap_perm_text(g_mmap_table[midx].prot,g_mmap_table[midx].flags,perms);
+        __boot_serial_force_puts(" base=");
+        __boot_serial_force_puthex64(g_mmap_table[midx].virt);
+        __boot_serial_force_puts(" prot=");
+        __boot_serial_force_puts(perms);
+        if(g_mmap_table[midx].backing_path[0]){
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(g_mmap_table[midx].backing_path);
+        }
+    }
+    __boot_serial_force_puts("\n");
+}
+
+static int c3_user_materialize_copy_page(task_t *cur,uint64_t page,const char *tag){
+    address_space_t *as;
+    uint64_t entry;
+    int midx;
+    if(!cur||!cur->addr_space||!c3_user_low_va(page))return -EFAULT;
+    as=cur->addr_space;
+    entry=paging_get_entry(as,page);
+    midx=c3_mmap_region_find(as,page);
+    if(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&0x080ULL)){
+        uint64_t frame=0;
+        uint64_t pflags;
+        if(midx>=0&&midx<MMAP_REGION_MAX&&
+           (g_mmap_table[midx].prot&C3_PROT_WRITE)){
+            if(c3_mmap_is_lazy_anon(&g_mmap_table[midx])){
+                frame=c3_mmap_alloc_lazy_frame_for_page(&g_mmap_table[midx],page);
+            }else if(c3_mmap_is_lazy_private_file(&g_mmap_table[midx])){
+                frame=c3_mmap_alloc_lazy_file_frame_for_page(&g_mmap_table[midx],page);
+            }
+            if(!frame)return -ENOMEM;
+            pflags=c3_mmap_pte_flags_from_prot(g_mmap_table[midx].prot);
+            if(!paging_map(as,page,frame,pflags)){
+                c3_phys_ref_release(frame);
+                return -ENOMEM;
+            }
+            c3_mmap_resident_add(&g_mmap_table[midx],1);
+            c3_pf_promote_user_parents(as,page);
+        }else if(page<C3_USER_STACK_TOP&&
+                 page>=(C3_USER_STACK_TOP-C3_USER_STACK_GROW_MAX)){
+            if(!c3_browser_memory_reserve_ok(cur,"usercopy-stack"))return -ENOMEM;
+            frame=c3_alloc_user_frame();
+            if(!frame)return -ENOMEM;
+            c3_phys_ref_set_initial(frame);
+            c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
+            if(!paging_map(as,page,frame,c3_mmap_pte_flags_from_prot(C3_PROT_READ|C3_PROT_WRITE))){
+                c3_phys_ref_release(frame);
+                return -ENOMEM;
+            }
+            c3_pf_promote_user_parents(as,page);
+        }else{
+            c3_usercopy_trace_fault(cur,page,page,PAGE_SIZE,tag,"not-present");
+            return -EFAULT;
+        }
+        entry=paging_get_entry(as,page);
+    }
+    if(!(entry&PAGE_WRITABLE)){
+        if(midx>=0&&midx<MMAP_REGION_MAX&&
+           (g_mmap_table[midx].prot&C3_PROT_WRITE)){
+            int rc;
+            if(entry&C3_PAGE_SOFT_COW){
+                rc=c3_user_prepare_private_write_page(as,page,tag);
+                if(rc<0)return rc;
+            }else{
+                rc=c3_mprotect_apply_page(as,page,
+                    c3_mmap_pte_flags_from_prot(g_mmap_table[midx].prot));
+                if(rc<0)return rc;
+                c3_pf_promote_user_parents(as,page);
+            }
+        }else{
+            c3_usercopy_trace_fault(cur,page,page,PAGE_SIZE,tag,"read-only");
+            return -EFAULT;
+        }
+    }
+    return 0;
+}
+
+static int c3_user_copy_out(task_t *cur,void *dst,const void *src,size_t len,const char *tag){
+    uint64_t base,end;
+    size_t done=0;
+    if(!len)return 0;
+    if(!cur||!cur->addr_space||!dst||!src)return -EFAULT;
+    base=(uint64_t)(uintptr_t)dst;
+    end=base+(uint64_t)len-1ULL;
+    if(end<base||!c3_user_low_va(base)||!c3_user_low_va(end)){
+        c3_usercopy_trace_fault(cur,base,base&~(PAGE_SIZE-1ULL),len,tag,"bad-range");
+        return -EFAULT;
+    }
+    while(done<len){
+        uint64_t va=base+(uint64_t)done;
+        uint64_t page=va&~(PAGE_SIZE-1ULL);
+        size_t in_page=(size_t)(va-page);
+        size_t chunk=PAGE_SIZE-in_page;
+        uint64_t phys;
+        int rc;
+        if(chunk>len-done)chunk=len-done;
+        rc=c3_user_materialize_copy_page(cur,page,tag);
+        if(rc<0)return rc;
+        phys=paging_translate(cur->addr_space,va);
+        if(!phys){
+            c3_usercopy_trace_fault(cur,va,page,chunk,tag,"translate");
+            return -EFAULT;
+        }
+        c3_memcpy((void*)PHYS_TO_DMAP(phys),(const uint8_t*)src+done,chunk);
+        done+=chunk;
+    }
+    return 0;
+}
+
+static int c3_user_copy_in(task_t *cur,void *dst,const void *src,size_t len,const char *tag){
+    uint64_t base,end;
+    size_t done=0;
+    if(!len)return 0;
+    if(!cur||!cur->addr_space||!dst||!src)return -EFAULT;
+    base=(uint64_t)(uintptr_t)src;
+    end=base+(uint64_t)len-1ULL;
+    if(end<base||!c3_user_low_va(base)||!c3_user_low_va(end)){
+        c3_usercopy_trace_fault(cur,base,base&~(PAGE_SIZE-1ULL),len,tag,"bad-read-range");
+        return -EFAULT;
+    }
+    while(done<len){
+        uint64_t va=base+(uint64_t)done;
+        uint64_t page=va&~(PAGE_SIZE-1ULL);
+        size_t in_page=(size_t)(va-page);
+        size_t chunk=PAGE_SIZE-in_page;
+        uint64_t entry,phys;
+        int rc;
+        if(chunk>len-done)chunk=len-done;
+        rc=c3_user_materialize_read_page(cur,page,tag);
+        if(rc<0)return rc;
+        entry=paging_get_entry(cur->addr_space,page);
+        if(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&0x080ULL)){
+            c3_usercopy_trace_fault(cur,va,page,chunk,tag,"not-user-readable");
+            return -EFAULT;
+        }
+        phys=paging_translate(cur->addr_space,va);
+        if(!phys){
+            c3_usercopy_trace_fault(cur,va,page,chunk,tag,"read-translate");
+            return -EFAULT;
+        }
+        c3_memcpy((uint8_t*)dst+done,(const void*)PHYS_TO_DMAP(phys),chunk);
+        done+=chunk;
+    }
+    return 0;
+}
+
+static int c3_user_materialize_read_page(task_t *cur,uint64_t page,const char *tag){
+    address_space_t *as;
+    uint64_t entry;
+    uint64_t frame=0;
+    uint64_t pflags;
+    int midx;
+    if(!cur||!cur->addr_space||!c3_user_low_va(page))return -EFAULT;
+    as=cur->addr_space;
+    entry=paging_get_entry(as,page);
+    if((entry&PAGE_PRESENT)&&!(entry&0x080ULL))return 0;
+    midx=c3_mmap_region_find(as,page);
+    if(midx>=0&&midx<MMAP_REGION_MAX&&
+       (g_mmap_table[midx].prot&(C3_PROT_READ|C3_PROT_WRITE|C3_PROT_EXEC))){
+        if(c3_mmap_is_lazy_anon(&g_mmap_table[midx])){
+            frame=c3_mmap_alloc_lazy_frame_for_page(&g_mmap_table[midx],page);
+        }else if(c3_mmap_is_lazy_private_file(&g_mmap_table[midx])){
+            frame=c3_mmap_alloc_lazy_file_frame_for_page(&g_mmap_table[midx],page);
+        }
+        if(!frame)return -ENOMEM;
+        pflags=c3_mmap_pte_flags_from_prot(g_mmap_table[midx].prot);
+        if(!paging_map(as,page,frame,pflags)){
+            c3_phys_ref_release(frame);
+            return -ENOMEM;
+        }
+        c3_mmap_resident_add(&g_mmap_table[midx],1);
+        c3_pf_promote_user_parents(as,page);
+        return 0;
+    }
+    if(page<C3_USER_STACK_TOP&&page>=(C3_USER_STACK_TOP-C3_USER_STACK_GROW_MAX)){
+        if(!c3_browser_memory_reserve_ok(cur,"userpath-stack"))return -ENOMEM;
+        frame=c3_alloc_user_frame();
+        if(!frame)return -ENOMEM;
+        c3_phys_ref_set_initial(frame);
+        c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
+        if(!paging_map(as,page,frame,c3_mmap_pte_flags_from_prot(C3_PROT_READ|C3_PROT_WRITE))){
+            c3_phys_ref_release(frame);
+            return -ENOMEM;
+        }
+        c3_pf_promote_user_parents(as,page);
+        return 0;
+    }
+    c3_usercopy_trace_fault(cur,page,page,PAGE_SIZE,tag,"path-not-present");
+    return -EFAULT;
+}
+
+static int c3_copy_user_cstr_current(task_t *cur,const char *src,char *dst,size_t cap,const char *tag){
+    uint64_t base;
+    size_t i;
+    if(!cur||!cur->addr_space||!src||!dst||cap==0)return -EFAULT;
+    base=(uint64_t)(uintptr_t)src;
+    dst[0]=0;
+    for(i=0;i<cap;++i){
+        uint64_t va=base+(uint64_t)i;
+        uint64_t page=va&~(PAGE_SIZE-1ULL);
+        uint64_t entry;
+        uint64_t phys;
+        uint8_t ch;
+        int rc;
+        if(va<base||!c3_user_low_va(va))return -EFAULT;
+        entry=paging_get_entry(cur->addr_space,page);
+        if(!(entry&PAGE_PRESENT)||(entry&0x080ULL)){
+            address_space_t *kas=paging_get_kernel_space();
+            if(kas){
+                uint64_t kentry=paging_get_entry(kas,page);
+                if((kentry&PAGE_PRESENT)&&!(kentry&0x080ULL)){
+                    phys=paging_translate(kas,va);
+                    if(!phys)return -EFAULT;
+                    ch=*(volatile uint8_t*)PHYS_TO_DMAP(phys);
+                    dst[i]=(char)ch;
+                    if(ch==0)return 0;
+                    continue;
+                }
+            }
+            rc=c3_user_materialize_read_page(cur,page,tag);
+            if(rc<0)return rc;
+            entry=paging_get_entry(cur->addr_space,page);
+        }
+        if(!(entry&PAGE_PRESENT)||(entry&0x080ULL))return -EFAULT;
+        phys=paging_translate(cur->addr_space,va);
+        if(!phys)return -EFAULT;
+        ch=*(volatile uint8_t*)PHYS_TO_DMAP(phys);
+        dst[i]=(char)ch;
+        if(ch==0)return 0;
+    }
+    dst[cap-1]=0;
+    return -EINVAL;
+}
+
+static int c3_user_path_is_empty(task_t *cur,const char *path,bool *empty,const char *tag){
+    uint8_t ch=0;
+    int rc;
+    if(!empty)return -EFAULT;
+    *empty=false;
+    rc=c3_user_copy_in(cur,&ch,path,1,tag);
+    if(rc<0)return rc;
+    *empty=(ch==0);
     return 0;
 }
 
@@ -9009,14 +17116,16 @@ static bool c3_pf_materialize_lazy_anon(task_t *cur,int midx,uint64_t page,uint6
     frame=c3_mmap_alloc_lazy_frame_for_page(m,page);
     if(!frame)return false;
     pflags=c3_mmap_pte_flags_from_prot(m->prot);
+    if(!(m->prot&C3_PROT_WRITE))pflags|=C3_PAGE_SOFT_COW;
     if(!paging_map(cur->addr_space,page,frame,pflags)){
         c3_phys_ref_release(frame);
         return false;
     }
+    c3_mmap_resident_add(m,1);
     c3_pf_promote_user_parents(cur->addr_space,page);
     {
         static uint32_t trace_count=0;
-        if(trace_count<8){
+        if(c3_loader_debug_trace_enabled()&&trace_count<8){
             ++trace_count;
             __boot_serial_puts("[pf-lazy-anon] page=");
             __boot_serial_puthex64(page);
@@ -9027,6 +17136,136 @@ static bool c3_pf_materialize_lazy_anon(task_t *cur,int midx,uint64_t page,uint6
             __boot_serial_puts(" base=");
             __boot_serial_puthex64(m->virt);
             __boot_serial_puts("\n");
+        }
+    }
+    return true;
+}
+
+static bool c3_pf_materialize_lazy_file(task_t *cur,int midx,uint64_t page,uint64_t err_code){
+    uint64_t frame,pflags;
+    mmap_entry_t *m;
+    static uint32_t fail_trace=0;
+    if(!cur||midx<0||midx>=MMAP_REGION_MAX)return false;
+    m=&g_mmap_table[midx];
+    if(!c3_mmap_is_lazy_private_file(m))return false;
+    if(!c3_pf_mmap_access_allowed(m->prot,err_code))return false;
+    frame=c3_mmap_alloc_lazy_file_frame_for_page(m,page);
+    if(!frame){
+        if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime_loose(cur)&&fail_trace<32u){
+            ++fail_trace;
+            __boot_serial_force_puts("[pf-lazy-file-fail!] pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" page=");
+            __boot_serial_force_puthex64(page);
+            __boot_serial_force_puts(" prot=");
+            __boot_serial_force_putu32((uint32_t)m->prot);
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)m->flags);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(m->backing_path);
+            __boot_serial_force_puts("\n");
+        }
+        return false;
+    }
+    pflags=c3_mmap_pte_flags_from_prot(m->prot);
+    if(!paging_map(cur->addr_space,page,frame,pflags)){
+        c3_phys_ref_release(frame);
+        if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime_loose(cur)&&fail_trace<32u){
+            ++fail_trace;
+            __boot_serial_force_puts("[pf-lazy-file-map-fail!] pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" page=");
+            __boot_serial_force_puthex64(page);
+            __boot_serial_force_puts(" frame=");
+            __boot_serial_force_puthex64(frame);
+            __boot_serial_force_puts(" pte=");
+            __boot_serial_force_puthex64(paging_get_entry(cur->addr_space,page));
+            __boot_serial_force_puts(" as=");
+            __boot_serial_force_puthex64((uint64_t)(uintptr_t)cur->addr_space);
+            __boot_serial_force_puts(" pml4=");
+            __boot_serial_force_puthex64(cur->addr_space?(uint64_t)(uintptr_t)cur->addr_space->pml4:0);
+            __boot_serial_force_puts(" cr3=");
+            __boot_serial_force_puthex64(cur->addr_space?cur->addr_space->cr3_phys:0);
+            __boot_serial_force_puts(" free=");
+            __boot_serial_force_putu32(pmm_free_count());
+            __boot_serial_force_puts("\n");
+        }
+        return false;
+    }
+    c3_mmap_resident_add(m,1);
+    c3_pf_promote_user_parents(cur->addr_space,page);
+    {
+        static uint32_t trace_count=0;
+        if(c3_loader_debug_trace_enabled()&&trace_count<24){
+            ++trace_count;
+            __boot_serial_puts("[pf-lazy-file] page=");
+            __boot_serial_puthex64(page);
+            __boot_serial_puts(" prot=");
+            __boot_serial_putu32((uint32_t)m->prot);
+            __boot_serial_puts(" off=");
+            __boot_serial_puthex64(m->offset+(page-m->virt));
+            __boot_serial_puts(" path=");
+            __boot_serial_puts(m->backing_path);
+            __boot_serial_puts("\n");
+        }
+    }
+    return true;
+}
+
+static bool c3_pf_materialize_wayfire_renderer_file(task_t *cur,int midx,uint64_t page,uint64_t err_code){
+    const uint8_t *data=0;
+    uint32_t size=0;
+    uint64_t frame,pflags,file_off;
+    mmap_entry_t *m;
+    if(!cur||midx<0||midx>=MMAP_REGION_MAX)return false;
+    if(!c3_task_is_wayfire_runtime_loose(cur))return false;
+    m=&g_mmap_table[midx];
+    if(!m->used||!m->backing_path[0])return false;
+    if(!c3_wayfire_renderer_mapping_path(m->backing_path))return false;
+    if(!c3_mmap_is_private(m->flags)||c3_mmap_is_anon(m->flags))return false;
+    if(page<m->virt||page>=m->virt+m->size)return false;
+    if(!c3_pf_mmap_access_allowed(m->prot,err_code))return false;
+    file_off=m->offset+(page-m->virt);
+    frame=c3_alloc_user_frame();
+    if(!frame)return false;
+    c3_phys_ref_set_initial(frame);
+    c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
+    if(kvfs_read(m->backing_path,&data,&size)&&data&&file_off<(uint64_t)size){
+        uint64_t remain=(uint64_t)size-file_off;
+        uint64_t to_copy=(remain<PAGE_SIZE)?remain:PAGE_SIZE;
+        c3_memcpy((void*)PHYS_TO_DMAP(frame),data+file_off,(size_t)to_copy);
+    }
+    pflags=c3_mmap_pte_flags_from_prot(m->prot);
+    if(!paging_map(cur->addr_space,page,frame,pflags)){
+        c3_phys_ref_release(frame);
+        return false;
+    }
+    c3_mmap_resident_add(m,1);
+    c3_pf_promote_user_parents(cur->addr_space,page);
+    {
+        static uint32_t trace_count=0;
+        if(c3_wayfire_debug_trace_enabled()&&trace_count<48u){
+            ++trace_count;
+            __boot_serial_force_puts("[wayfire-renderer-page!] pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" page=");
+            __boot_serial_force_puthex64(page);
+            __boot_serial_force_puts(" prot=");
+            __boot_serial_force_putu32((uint32_t)m->prot);
+            __boot_serial_force_puts(" off=");
+            __boot_serial_force_puthex64(file_off);
+            __boot_serial_force_puts(" frame=");
+            __boot_serial_force_puthex64(frame);
+            __boot_serial_force_puts(" pflags=");
+            __boot_serial_force_puthex64(pflags);
+            __boot_serial_force_puts(" pte=");
+            __boot_serial_force_puthex64(paging_get_entry(cur->addr_space,page));
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(m->backing_path);
+            __boot_serial_force_puts("\n");
         }
     }
     return true;
@@ -9066,7 +17305,67 @@ bool compat3_handle_page_fault(uint64_t fault_addr,uint64_t err_code){
      * deliberate NULL crash into a writable mapping.  Firefox relies on that
      * NULL write to terminate mozalloc_abort instead of recursing forever.
      */
-    if(page<0x10000ULL)return false;
+    if(page<0x10000ULL||page>=C3_USER_TOP)return false;
+    entry=paging_get_entry(cur->addr_space,page);
+    midx=c3_mmap_region_find(cur->addr_space,page);
+    if(c3_wayfire_debug_trace_enabled()&&
+       c3_task_is_wayfire_runtime_loose(cur)&&page>=0x40000000ULL){
+        static uint32_t wf_pf_trace=0;
+        if(wf_pf_trace<320u){
+            ++wf_pf_trace;
+            __boot_serial_force_puts("[wayfire-pf!] pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" addr=");
+            __boot_serial_force_puthex64(fault_addr);
+            __boot_serial_force_puts(" page=");
+            __boot_serial_force_puthex64(page);
+            __boot_serial_force_puts(" err=");
+            __boot_serial_force_puthex64(err_code);
+            __boot_serial_force_puts(" pte=");
+            __boot_serial_force_puthex64(entry);
+            __boot_serial_force_puts(" midx=");
+            __boot_serial_force_putu32(midx>=0?(uint32_t)midx:0xFFFFFFFFu);
+            if(midx>=0&&midx<MMAP_REGION_MAX){
+                __boot_serial_force_puts(" base=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].virt);
+                __boot_serial_force_puts(" size=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].size);
+                __boot_serial_force_puts(" prot=");
+                __boot_serial_force_putu32((uint32_t)g_mmap_table[midx].prot);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)g_mmap_table[midx].flags);
+                __boot_serial_force_puts(" off=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].offset+(page-g_mmap_table[midx].virt));
+                if(g_mmap_table[midx].backing_path[0]){
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(g_mmap_table[midx].backing_path);
+                }
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(midx<0&&c3_wayfire_mmap_slop_fault(cur,page,err_code,entry)){
+        g_c3_pf_loop_addr=0;
+        g_c3_pf_loop_count=0;
+        return true;
+    }
+    /*
+     * Forked desktop helpers hit ordinary Linux copy-on-write on the high
+     * stack page immediately after fork. Handle that before the loop detector:
+     * several short-lived service children can legitimately fault on the same
+     * virtual stack page, and treating that as an infinite loop kills real
+     * PipeWire/portal launchers.
+     */
+    if((err_code&C3_PFERR_WRITE)&&
+       (entry&PAGE_PRESENT)&&(entry&PAGE_USER)&&
+       !(entry&0x080ULL)&&(entry&C3_PAGE_SOFT_COW)){
+        if(c3_user_prepare_private_write_page(cur->addr_space,page,"pf-cow")==0){
+            g_c3_pf_loop_addr=0;
+            g_c3_pf_loop_count=0;
+            return true;
+        }
+    }
     /* PF loop detection */
     if(page==g_c3_pf_loop_addr){
         ++g_c3_pf_loop_count;
@@ -9086,14 +17385,67 @@ bool compat3_handle_page_fault(uint64_t fault_addr,uint64_t err_code){
         entry=paging_get_entry(cur->addr_space,page);
         __boot_serial_puts(" pte=");
         __boot_serial_puthex64(entry);
+        __boot_serial_puts(" midx=");
+        __boot_serial_putu32(midx>=0?(uint32_t)midx:0xFFFFFFFFu);
+        if(midx>=0&&midx<MMAP_REGION_MAX){
+            __boot_serial_puts(" base=");
+            __boot_serial_puthex64(g_mmap_table[midx].virt);
+            __boot_serial_puts(" size=");
+            __boot_serial_puthex64(g_mmap_table[midx].size);
+            __boot_serial_puts(" prot=");
+            __boot_serial_putu32((uint32_t)g_mmap_table[midx].prot);
+            __boot_serial_puts(" flags=");
+            __boot_serial_puthex64((uint64_t)(uint32_t)g_mmap_table[midx].flags);
+            if(g_mmap_table[midx].backing_path[0]){
+                __boot_serial_puts(" path=");
+                __boot_serial_puts(g_mmap_table[midx].backing_path);
+            }
+        }
         __boot_serial_puts("\n");
-        /* Don't fix it anymore — let the exception path print the full
+        /* Don't fix it anymore â€” let the exception path print the full
          * register dump so we can see what instruction is looping. */
         return false;
     }
     ++g_c3_pf_total_handled;
     entry=paging_get_entry(cur->addr_space,page);
     midx=c3_mmap_region_find(cur->addr_space,page);
+    if(midx<0&&c3_wayfire_mmap_slop_fault(cur,page,err_code,entry))return true;
+    if(c3_syscall_debug_trace_enabled()&&c3_task_is_browser_runtime(cur)){
+        static uint32_t browser_pf_trace=0;
+        if(browser_pf_trace<96){
+            ++browser_pf_trace;
+            __boot_serial_force_puts("[pf-browser!] pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" addr=");
+            __boot_serial_force_puthex64(fault_addr);
+            __boot_serial_force_puts(" page=");
+            __boot_serial_force_puthex64(page);
+            __boot_serial_force_puts(" err=");
+            __boot_serial_force_puthex64(err_code);
+            __boot_serial_force_puts(" pte=");
+            __boot_serial_force_puthex64(entry);
+            __boot_serial_force_puts(" midx=");
+            __boot_serial_force_putu32(midx>=0?(uint32_t)midx:0xFFFFFFFFu);
+            if(midx>=0&&midx<MMAP_REGION_MAX){
+                __boot_serial_force_puts(" base=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].virt);
+                __boot_serial_force_puts(" size=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].size);
+                __boot_serial_force_puts(" prot=");
+                __boot_serial_force_putu32((uint32_t)g_mmap_table[midx].prot);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)g_mmap_table[midx].flags);
+                __boot_serial_force_puts(" off=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].offset+(page-g_mmap_table[midx].virt));
+                if(g_mmap_table[midx].backing_path[0]){
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(g_mmap_table[midx].backing_path);
+                }
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
     if(midx>=0&&g_mmap_table[midx].prot==0){
         static uint32_t protnone_trace=0;
         if(protnone_trace<32){
@@ -9112,9 +17464,54 @@ bool compat3_handle_page_fault(uint64_t fault_addr,uint64_t err_code){
         }
         return false;
     }
+    if(midx>=0&&c3_task_is_wayfire_runtime_loose(cur)&&
+       (err_code&C3_PFERR_WRITE)&&
+       (!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&0x080ULL))&&
+       c3_mmap_is_lazy_private_file(&g_mmap_table[midx])&&
+       c3_wayfire_renderer_mapping_path(g_mmap_table[midx].backing_path)&&
+       !(g_mmap_table[midx].prot&C3_PROT_WRITE)){
+        uint64_t frame=c3_alloc_user_frame();
+        if(!frame)return false;
+        c3_phys_ref_set_initial(frame);
+        c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
+        if(!paging_map(cur->addr_space,page,frame,
+                       c3_mmap_pte_flags_from_prot(C3_PROT_READ|C3_PROT_WRITE))){
+            c3_phys_ref_release(frame);
+            return false;
+        }
+        c3_pf_promote_user_parents(cur->addr_space,page);
+        {
+            static uint32_t trace_count=0;
+            if(trace_count<32u){
+                ++trace_count;
+                __boot_serial_force_puts("[wayfire-renderer-tail-zero!] pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" page=");
+                __boot_serial_force_puthex64(page);
+                __boot_serial_force_puts(" map=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].virt);
+                __boot_serial_force_puts(" off=");
+                __boot_serial_force_puthex64(g_mmap_table[midx].offset+(page-g_mmap_table[midx].virt));
+                __boot_serial_force_puts(" prot=");
+                __boot_serial_force_putu32((uint32_t)g_mmap_table[midx].prot);
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(g_mmap_table[midx].backing_path);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return true;
+    }
     if(midx>=0&&c3_mmap_is_lazy_anon(&g_mmap_table[midx])&&
        (!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&0x080ULL))){
         if(c3_pf_materialize_lazy_anon(cur,midx,page,err_code))return true;
+    }
+    if(midx>=0&&(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&0x080ULL))){
+        if(c3_pf_materialize_wayfire_renderer_file(cur,midx,page,err_code))return true;
+    }
+    if(midx>=0&&c3_mmap_is_lazy_private_file(&g_mmap_table[midx])&&
+       (!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&0x080ULL))){
+        if(c3_pf_materialize_lazy_file(cur,midx,page,err_code))return true;
     }
     if(!(entry&PAGE_PRESENT)){
         /* Stack growth: if any code (user OR kernel on behalf of user)
@@ -9124,10 +17521,12 @@ bool compat3_handle_page_fault(uint64_t fault_addr,uint64_t err_code){
          * whose paging-structure caches may still be stale. */
         if(page<C3_USER_STACK_TOP&&
            page>=(C3_USER_STACK_TOP-C3_USER_STACK_GROW_MAX)){
-            uint64_t frame=pmm_alloc_frame();
+            uint64_t frame;
+            if(!c3_browser_memory_reserve_ok(cur,"stack-grow"))return false;
+            frame=c3_alloc_user_frame();
             if(!frame)return false;
             c3_phys_ref_set_initial(frame);
-            /* Zero the frame via DMAP — always reachable. */
+            /* Zero the frame via DMAP â€” always reachable. */
             c3_memset((void*)PHYS_TO_DMAP(frame),0,PAGE_SIZE);
             if(!paging_map(cur->addr_space,page,frame,PAGE_PRESENT|PAGE_WRITABLE|PAGE_USER|PAGE_NX)){
                 c3_phys_ref_release(frame);
@@ -9135,6 +17534,62 @@ bool compat3_handle_page_fault(uint64_t fault_addr,uint64_t err_code){
             }
             c3_pf_promote_user_parents(cur->addr_space,page);
             return true;
+        }
+        if(c3_task_is_firefox_runtime(cur)){
+            static uint32_t dyn_fault_trace=0;
+            int di;
+            if(dyn_fault_trace<4){
+                for(di=0;di<MMAP_REGION_MAX;++di){
+                    uint64_t rel,dyn_va,null_va,e0,en;
+                    if(!g_mmap_table[di].used||g_mmap_table[di].as!=cur->addr_space)continue;
+                    if(!c3_has_token(g_mmap_table[di].backing_path,"libxul.so"))continue;
+                    if(g_mmap_table[di].offset>C3_LIBXUL_DYNAMIC_FILE_OFF)continue;
+                    rel=C3_LIBXUL_DYNAMIC_FILE_OFF-g_mmap_table[di].offset;
+                    if(rel>=g_mmap_table[di].size)continue;
+                    dyn_va=g_mmap_table[di].virt+rel;
+                    null_va=dyn_va+C3_LIBXUL_DYNAMIC_NULL_DELTA;
+                    e0=paging_get_entry(cur->addr_space,dyn_va);
+                    en=paging_get_entry(cur->addr_space,null_va);
+                    ++dyn_fault_trace;
+                    __boot_serial_force_puts("[libxul-dyn-fault!] pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fault=");
+                    __boot_serial_force_puthex64(fault_addr);
+                    __boot_serial_force_puts(" dyn=");
+                    __boot_serial_force_puthex64(dyn_va);
+                    __boot_serial_force_puts(" pte=");
+                    __boot_serial_force_puthex64(e0);
+                    if((e0&PAGE_PRESENT)&&(e0&PAGE_USER)&&!(e0&0x080ULL)){
+                        __boot_serial_force_puts(" q0=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((e0&C3_PTE_ADDR_MASK)+(dyn_va&0xFFFULL)));
+                        __boot_serial_force_puts(" q1=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((e0&C3_PTE_ADDR_MASK)+((dyn_va+8)&0xFFFULL)));
+                    }
+                    __boot_serial_force_puts(" null=");
+                    __boot_serial_force_puthex64(null_va);
+                    __boot_serial_force_puts(" npte=");
+                    __boot_serial_force_puthex64(en);
+                    if((en&PAGE_PRESENT)&&(en&PAGE_USER)&&!(en&0x080ULL)){
+                        __boot_serial_force_puts(" nq0=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((en&C3_PTE_ADDR_MASK)+(null_va&0xFFFULL)));
+                        __boot_serial_force_puts(" nq1=");
+                        __boot_serial_force_puthex64(*(uint64_t*)(uintptr_t)
+                            PHYS_TO_DMAP((en&C3_PTE_ADDR_MASK)+((null_va+8)&0xFFFULL)));
+                    }
+                    __boot_serial_force_puts(" mapbase=");
+                    __boot_serial_force_puthex64(g_mmap_table[di].virt);
+                    __boot_serial_force_puts(" mapsize=");
+                    __boot_serial_force_puthex64(g_mmap_table[di].size);
+                    __boot_serial_force_puts(" mapoff=");
+                    __boot_serial_force_puthex64(g_mmap_table[di].offset);
+                    __boot_serial_force_puts("\n");
+                    break;
+                }
+            }
         }
         return false;
     }
@@ -9207,7 +17662,7 @@ bool compat3_handle_page_fault(uint64_t fault_addr,uint64_t err_code){
         ++g_c3_cow_faults;
         ridx=c3_phys_ref_index(phys);
         if(ridx>=0&&g_c3_phys_refcnt[ridx]>1){
-            uint64_t new_frame=pmm_alloc_frame();
+            uint64_t new_frame=c3_alloc_user_frame();
             if(!new_frame){
                 ++g_c3_cow_fault_fail;
                 return false;
@@ -9234,7 +17689,7 @@ bool compat3_handle_page_fault(uint64_t fault_addr,uint64_t err_code){
     if(midx>=0&&(g_mmap_table[midx].prot&C3_PROT_WRITE)){
         ridx=c3_phys_ref_index(phys);
         if(c3_mmap_is_private(g_mmap_table[midx].flags)&&ridx>=0&&g_c3_phys_refcnt[ridx]>1){
-            uint64_t new_frame=pmm_alloc_frame();
+            uint64_t new_frame=c3_alloc_user_frame();
             if(!new_frame)return false;
             c3_phys_ref_set_initial(new_frame);
             c3_memcpy(PHYS_TO_DMAP(new_frame),PHYS_TO_DMAP(phys),PAGE_SIZE);
@@ -9332,7 +17787,7 @@ static int c3_madvise_discard_anon(task_t *cur,uint64_t us,uint64_t ue){
     }
     if(dropped){
         static uint32_t trace_count=0;
-        if(trace_count<64){
+        if(c3_wayfire_debug_trace_enabled()&&trace_count<64){
             ++trace_count;
             __boot_serial_puts("[madvise-discard] pid=");
             __boot_serial_putu32((uint32_t)cur->pid);
@@ -9816,7 +18271,7 @@ static bool c3_find_shared_object(const char *name,const char *origin_dir,const 
     char p[VFS_PATH_MAX];
     size_t l;
     if(!name||!*name)return false;
-    if(name[0]=='/'&&kvfs_read(name,data,sz)){if(resolved)c3_strlcpy(resolved,name,cap);return true;}
+    if(name[0]=='/'&&c3_kvfs_read_follow(name,data,sz,resolved,cap))return true;
     if(runpath&&*runpath){
         size_t pos=0;
         while(runpath[pos]){
@@ -9846,10 +18301,7 @@ static bool c3_find_shared_object(const char *name,const char *origin_dir,const 
             c3_append_str(p,&l,sizeof(p),base);
             if(l&&p[l-1]!='/')c3_append_ch(p,&l,sizeof(p),'/');
             c3_append_str(p,&l,sizeof(p),name);
-            if(kvfs_read(p,data,sz)){
-                if(resolved)c3_strlcpy(resolved,p,cap);
-                return true;
-            }
+            if(c3_kvfs_read_follow(p,data,sz,resolved,cap))return true;
         }
     }
     if(origin_dir&&*origin_dir){
@@ -9857,19 +18309,13 @@ static bool c3_find_shared_object(const char *name,const char *origin_dir,const 
         c3_append_str(p,&l,sizeof(p),origin_dir);
         if(l&&p[l-1]!='/')c3_append_ch(p,&l,sizeof(p),'/');
         c3_append_str(p,&l,sizeof(p),name);
-        if(kvfs_read(p,data,sz)){
-            if(resolved)c3_strlcpy(resolved,p,cap);
-            return true;
-        }
+        if(c3_kvfs_read_follow(p,data,sz,resolved,cap))return true;
     }
     for(i=0;i<(int)(sizeof(dirs)/sizeof(dirs[0]));++i){
         l=0;p[0]=0;
         c3_append_str(p,&l,sizeof(p),dirs[i]);
         c3_append_str(p,&l,sizeof(p),name);
-        if(kvfs_read(p,data,sz)){
-            if(resolved)c3_strlcpy(resolved,p,cap);
-            return true;
-        }
+        if(c3_kvfs_read_follow(p,data,sz,resolved,cap))return true;
     }
     return false;
 }
@@ -10409,7 +18855,59 @@ done:
     return rc;
 }
 
+static bool c3_elf_defer_to_user_loader_name(const char *obj_name){
+    return obj_name&&(
+        c3_has_token(obj_name,"ridux-shell")||
+        c3_has_token(obj_name,"ridux-panel")||
+        c3_has_token(obj_name,"ridux-dock")||
+        c3_has_token(obj_name,"ridux-dashboard")||
+        c3_has_token(obj_name,"ridux-files-qt")||
+        c3_has_token(obj_name,"ridux-monitor-qt")||
+        c3_has_token(obj_name,"ridux-ui-shell")||
+        c3_has_token(obj_name,"injury-compositor")||
+        c3_has_token(obj_name,"injury-shell")||
+        c3_has_token(obj_name,"ridux-gl-compositor")||
+        c3_has_token(obj_name,"libQt6")||
+        c3_has_token(obj_name,"firefox")||
+        c3_has_token(obj_name,"chromium")||
+        c3_has_token(obj_name,"chrome")||
+        c3_has_token(obj_name,"/opt/hyprland/")||
+        c3_has_token(obj_name,"Hyprland")||
+        c3_has_token(obj_name,"hyprland")||
+        c3_has_token(obj_name,"waybar")||
+        c3_has_token(obj_name,"nwg-dock-hyprland")||
+        c3_has_token(obj_name,"/opt/wayfire/")||
+        c3_has_token(obj_name,"wayfire")||
+        c3_has_token(obj_name,"ld-linux-x86-64.so.2"));
+}
+
+static bool c3_elf_is_user_loader_name(const char *obj_name){
+    return obj_name&&c3_has_token(obj_name,"ld-linux-x86-64.so.2");
+}
+
+static bool c3_elf_obj_is_executable_path(const char *obj_name){
+    if(!obj_name||!*obj_name)return false;
+    return c3_has_token(obj_name,"/bin/")||
+           c3_has_token(obj_name,"/usr/bin/")||
+           c3_has_token(obj_name,"/usr/local/bin/")||
+           c3_has_token(obj_name,"/opt/hyprland/bin/")||
+           c3_has_token(obj_name,"/opt/wayfire/bin/")||
+           c3_has_token(obj_name,"/opt/kde-plasma/bin/");
+}
+
+static bool c3_elf_lazy_ro_segment_ok(const char *obj_name){
+    if(!obj_name||!*obj_name)return false;
+    if(c3_elf_is_user_loader_name(obj_name))return false;
+    if(c3_elf_obj_is_executable_path(obj_name))return false;
+    return c3_has_token(obj_name,".so")||
+           c3_has_token(obj_name,"/lib/")||
+           c3_has_token(obj_name,"/lib64/")||
+           c3_has_token(obj_name,"/usr/lib/")||
+           c3_has_token(obj_name,"/usr/lib64/");
+}
+
 int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
+#define C3_ELF_LOAD_SEG_MAX 16
     const elf64_ehdr_t *eh=(const elf64_ehdr_t*)data;
     int i;
     int rc=0;
@@ -10429,22 +18927,29 @@ int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
     uint64_t dyn_t0=0;
     bool set_brk_for_image;
     bool defer_dyn_to_user_loader=false;
+    uint64_t load_seg_start[C3_ELF_LOAD_SEG_MAX];
+    uint64_t load_seg_end[C3_ELF_LOAD_SEG_MAX];
+    uint64_t load_seg_flags[C3_ELF_LOAD_SEG_MAX];
+    uint32_t load_seg_count=0;
     c3_dyn_info_t di;
     c3_dyn_profile_t *prof=0;
     char obj_name[128];
+    bool trace_elf=c3_loader_debug_trace_enabled();
     c3_force_map_stage("enter","",sz,eh?eh->e_entry:0);
-    __boot_serial_puts("[elf64_map] enter sz=");
-    __boot_serial_putu32(sz);
-    __boot_serial_puts(" e_type=");
-    __boot_serial_putu32(eh->e_type);
-    __boot_serial_puts(" e_phnum=");
-    __boot_serial_putu32(eh->e_phnum);
-    __boot_serial_puts(" e_entry=");
-    __boot_serial_puthex64(eh->e_entry);
-    __boot_serial_puts("\n");
+    if(trace_elf){
+        __boot_serial_puts("[elf64_map] enter sz=");
+        __boot_serial_putu32(sz);
+        __boot_serial_puts(" e_type=");
+        __boot_serial_putu32(eh->e_type);
+        __boot_serial_puts(" e_phnum=");
+        __boot_serial_putu32(eh->e_phnum);
+        __boot_serial_puts(" e_entry=");
+        __boot_serial_puthex64(eh->e_entry);
+        __boot_serial_puts("\n");
+    }
     obj_name[0]=0;
     if(!elf64_validate(data,sz))return -1;
-    __boot_serial_puts("[elf64_map] validate OK\n");
+    if(trace_elf)__boot_serial_puts("[elf64_map] validate OK\n");
     if(!t->addr_space)t->addr_space=paging_create_address_space();
     if(!t->addr_space)return -1;
     if(g_c3_next_image_name[0]){
@@ -10475,9 +18980,11 @@ int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
     set_brk_for_image=(eh->e_type!=ET_DYN)||(t->brk_start==0);
 
     image_phnum=(uint16_t)eh->e_phnum;
-    __boot_serial_puts("[elf64_map] PT loop, load_bias=");
-    __boot_serial_puthex64(load_bias);
-    __boot_serial_puts("\n");
+    if(trace_elf){
+        __boot_serial_puts("[elf64_map] PT loop, load_bias=");
+        __boot_serial_puthex64(load_bias);
+        __boot_serial_puts("\n");
+    }
     for(i=0;i<(int)eh->e_phnum;++i){
         uint64_t off=eh->e_phoff+(uint64_t)i*eh->e_phentsize;
         if(off+sizeof(elf64_phdr_t)>sz)break;
@@ -10500,33 +19007,88 @@ int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
                 uint64_t seg_end=((ph->p_vaddr+load_bias+ph->p_memsz)+PAGE_SIZE-1)&~(PAGE_SIZE-1);
                 uint64_t pg;
                 uint64_t pflags=PAGE_PRESENT|PAGE_USER;
+                uint64_t file_va_start=ph->p_vaddr+load_bias;
+                uint64_t file_va_end=file_va_start+ph->p_filesz;
+                uint64_t lazy_start=0,lazy_end=0;
+                bool lazy_file=false;
                 c3_force_map_stage("load-begin",obj_name[0]?obj_name:"(unset)",ph->p_vaddr+load_bias,ph->p_memsz);
                 if(ph->p_flags&0x2)pflags|=PAGE_WRITABLE;
-                __boot_serial_puts("[elf64_map] PT_LOAD #");
-                __boot_serial_putu32((uint32_t)i);
-                __boot_serial_puts(" vaddr=");
-                __boot_serial_puthex64(ph->p_vaddr+load_bias);
-                __boot_serial_puts(" memsz=");
-                __boot_serial_puthex64(ph->p_memsz);
-                __boot_serial_puts(" filesz=");
-                __boot_serial_puthex64(ph->p_filesz);
-                __boot_serial_puts(" flags=");
-                __boot_serial_puthex64(ph->p_flags);
-                __boot_serial_puts("\n");
+                if(c3_elf_defer_to_user_loader_name(obj_name)&&
+                    c3_elf_lazy_ro_segment_ok(obj_name)&&
+                     !(ph->p_flags&0x3)&&
+                    ph->p_filesz>0&&file_va_end>=file_va_start&&
+                    ph->p_offset<=(uint64_t)sz&&ph->p_filesz<=(uint64_t)sz-ph->p_offset){
+                    uint64_t full_start=(file_va_start+PAGE_SIZE-1)&~(PAGE_SIZE-1ULL);
+                    uint64_t full_end=file_va_end&~(PAGE_SIZE-1ULL);
+                    if(full_start<seg_start)full_start=seg_start;
+                    if(full_end>seg_end)full_end=seg_end;
+                    if(full_end>full_start){
+                        int prot=C3_PROT_READ;
+                        uint64_t file_off=ph->p_offset+(full_start-file_va_start);
+                        if(ph->p_flags&0x1)prot|=C3_PROT_EXEC;
+                        if(c3_mmap_register_lazy_file(t->addr_space,full_start,full_end-full_start,
+                                                       prot,file_off,obj_name)==0){
+                            lazy_start=full_start;
+                            lazy_end=full_end;
+                            lazy_file=true;
+                        }
+                    }
+                }
+                if(load_seg_count<C3_ELF_LOAD_SEG_MAX){
+                    load_seg_start[load_seg_count]=seg_start;
+                    load_seg_end[load_seg_count]=seg_end;
+                    load_seg_flags[load_seg_count]=pflags;
+                    ++load_seg_count;
+                }
+                if(trace_elf){
+                    __boot_serial_puts("[elf64_map] PT_LOAD #");
+                    __boot_serial_putu32((uint32_t)i);
+                    __boot_serial_puts(" vaddr=");
+                    __boot_serial_puthex64(ph->p_vaddr+load_bias);
+                    __boot_serial_puts(" memsz=");
+                    __boot_serial_puthex64(ph->p_memsz);
+                    __boot_serial_puts(" filesz=");
+                    __boot_serial_puthex64(ph->p_filesz);
+                    __boot_serial_puts(" flags=");
+                    __boot_serial_puthex64(ph->p_flags);
+                    __boot_serial_puts("\n");
+                }
                 for(pg=seg_start;pg<seg_end;pg+=PAGE_SIZE){
-                    uint64_t frame=pmm_alloc_frame();
+                    uint64_t frame;
+                    uint8_t *dst;
+                    if(lazy_file&&pg>=lazy_start&&pg<lazy_end)continue;
+                    frame=c3_alloc_user_frame();
                     if(!frame)return -1;
                     c3_phys_ref_set_initial(frame);
-                    paging_map(t->addr_space,pg,frame,pflags);
-                    c3_memset((void*)(uintptr_t)pg,0,PAGE_SIZE);
+                    dst=(uint8_t*)PHYS_TO_DMAP(frame);
+                    c3_memset(dst,0,PAGE_SIZE);
+                    if(ph->p_filesz>0&&file_va_end>=file_va_start&&
+                       ph->p_offset<=(uint64_t)sz&&
+                       ph->p_filesz<=(uint64_t)sz-ph->p_offset){
+                        uint64_t copy_start=(pg>file_va_start)?pg:file_va_start;
+                        uint64_t page_end=pg+PAGE_SIZE;
+                        uint64_t copy_end=(page_end<file_va_end)?page_end:file_va_end;
+                        if(copy_end>copy_start){
+                            uint64_t src_off=ph->p_offset+(copy_start-file_va_start);
+                            uint64_t n=copy_end-copy_start;
+                            if(src_off+n>sz){
+                                c3_phys_ref_release(frame);
+                                return -1;
+                            }
+                            c3_memcpy(dst+(copy_start-pg),data+src_off,(size_t)n);
+                        }
+                    }
+                    if(!paging_map(t->addr_space,pg,frame,pflags|PAGE_WRITABLE)){
+                        c3_phys_ref_release(frame);
+                        return -1;
+                    }
                 }
-                __boot_serial_puts("[elf64_map]   pages mapped, about to memcpy file data\n");
-                if(ph->p_filesz>0&&ph->p_offset+ph->p_filesz<=sz){
-                    c3_memcpy((void*)(uintptr_t)(ph->p_vaddr+load_bias),data+ph->p_offset,(size_t)ph->p_filesz);
+                if(trace_elf){
+                    __boot_serial_puts("[elf64_map]   pages mapped with file data\n");
+                    __boot_serial_puts("[elf64_map]   PT_LOAD #");
+                    __boot_serial_putu32((uint32_t)i);
+                    __boot_serial_puts(" done\n");
                 }
-                __boot_serial_puts("[elf64_map]   PT_LOAD #");
-                __boot_serial_putu32((uint32_t)i);
-                __boot_serial_puts(" done\n");
                 c3_force_map_stage("load-done",obj_name[0]?obj_name:"(unset)",seg_start,seg_end);
                 if(seg_start<image_base)image_base=seg_start;
                 if(seg_end>max_end)max_end=seg_end;
@@ -10537,15 +19099,17 @@ int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
             }
         }
     }
-    __boot_serial_puts("[elf64_map] PT loop done obj=");
-    __boot_serial_puts(obj_name[0]?obj_name:"(unset)");
-    __boot_serial_puts(" dyn_vaddr=");
-    __boot_serial_puthex64(dyn_vaddr);
-    __boot_serial_puts(" dyn_memsz=");
-    __boot_serial_puthex64(dyn_memsz);
-    __boot_serial_puts(" max_end=");
-    __boot_serial_puthex64(max_end);
-    __boot_serial_puts("\n");
+    if(trace_elf){
+        __boot_serial_puts("[elf64_map] PT loop done obj=");
+        __boot_serial_puts(obj_name[0]?obj_name:"(unset)");
+        __boot_serial_puts(" dyn_vaddr=");
+        __boot_serial_puthex64(dyn_vaddr);
+        __boot_serial_puts(" dyn_memsz=");
+        __boot_serial_puthex64(dyn_memsz);
+        __boot_serial_puts(" max_end=");
+        __boot_serial_puthex64(max_end);
+        __boot_serial_puts("\n");
+    }
 
     /* CRITICAL: bump t->mmap_base past this image's max_end BEFORE
      * we recurse into c3_load_needed_objects. Otherwise every
@@ -10561,11 +19125,22 @@ int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
     c3_force_map_stage("pt-done",obj_name[0]?obj_name:"(unset)",max_end,t?t->mmap_base:0);
 
     if(!image_phdr_va)image_phdr_va=load_bias+eh->e_phoff;
-    if(dyn_vaddr&&dyn_memsz&&c3_dyn_parse_info(load_bias,dyn_vaddr,dyn_memsz,&di)){
+    defer_dyn_to_user_loader=c3_elf_defer_to_user_loader_name(obj_name);
+    if(defer_dyn_to_user_loader&&dyn_vaddr&&dyn_memsz){
+        c3_force_map_stage("defer",obj_name[0]?obj_name:"(defer)",dyn_vaddr,dyn_memsz);
+        if(trace_elf){
+            __boot_serial_puts("[elf64_map] defer dynlink to user ld-linux obj=");
+            __boot_serial_puts(obj_name[0]?obj_name:"(defer)");
+            __boot_serial_puts("\n");
+        }
+        ++g_c3_dyn_images_mapped;
+    }else if(dyn_vaddr&&dyn_memsz&&c3_dyn_parse_info(load_bias,dyn_vaddr,dyn_memsz,&di)){
         c3_force_map_stage("dyn",obj_name[0]?obj_name:"(unset)",dyn_vaddr,di.needed_count);
-        __boot_serial_puts("[elf64_map] dyn_parse_info OK, needed_count=");
-        __boot_serial_putu32(di.needed_count);
-        __boot_serial_puts("\n");
+        if(trace_elf){
+            __boot_serial_puts("[elf64_map] dyn_parse_info OK, needed_count=");
+            __boot_serial_putu32(di.needed_count);
+            __boot_serial_puts("\n");
+        }
         if(!obj_name[0]&&di.soname_off&&(!di.strsz||di.soname_off<di.strsz)){
             const char *sn=(const char*)(uintptr_t)(di.strtab_va+di.soname_off);
             if(sn&&*sn)c3_strlcpy(obj_name,sn,sizeof(obj_name));
@@ -10575,46 +19150,52 @@ int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
             c3_append_str(obj_name,&l,sizeof(obj_name),"img");
             c3_append_u32(obj_name,&l,sizeof(obj_name),g_c3_dyn_images_mapped+1);
         }
-        defer_dyn_to_user_loader=
-            c3_has_token(obj_name,"firefox")||
-            c3_has_token(obj_name,"chromium")||
-            c3_has_token(obj_name,"chrome")||
-            c3_has_token(obj_name,"ld-linux-x86-64.so.2");
+        defer_dyn_to_user_loader=c3_elf_defer_to_user_loader_name(obj_name);
         if(defer_dyn_to_user_loader){
             c3_force_map_stage("defer",obj_name,dyn_vaddr,dyn_memsz);
-            __boot_serial_puts("[elf64_map] defer dynlink to user ld-linux obj=");
-            __boot_serial_puts(obj_name);
-            __boot_serial_puts("\n");
+            if(trace_elf){
+                __boot_serial_puts("[elf64_map] defer dynlink to user ld-linux obj=");
+                __boot_serial_puts(obj_name);
+                __boot_serial_puts("\n");
+            }
             ++g_c3_dyn_images_mapped;
         }else{
             prof=c3_dyn_profile_begin(obj_name,(uint16_t)g_c3_dyn_load_depth,di.needed_count);
             dyn_t0=c3_rdtsc();
             dyn_deadline=c3_dyn_deadline_from_ms(g_c3_dyn_timeout_ms);
             tls_module_id=c3_dyn_register_object(obj_name,load_bias,image_base,max_end,image_phdr_va,image_phnum,&di,tls_init_va,tls_filesz,tls_memsz,tls_align);
-            __boot_serial_puts("[elf64_map] calling c3_load_needed_objects obj=");
-            __boot_serial_puts(obj_name);
-            __boot_serial_puts("\n");
+            if(trace_elf){
+                __boot_serial_puts("[elf64_map] calling c3_load_needed_objects obj=");
+                __boot_serial_puts(obj_name);
+                __boot_serial_puts("\n");
+            }
             rc=c3_load_needed_objects(t,&di,obj_name,dyn_deadline,prof);
-            __boot_serial_puts("[elf64_map] c3_load_needed_objects rc=");
-            __boot_serial_putu32((uint32_t)rc);
-            __boot_serial_puts(" obj=");
-            __boot_serial_puts(obj_name);
-            __boot_serial_puts("\n");
+            if(trace_elf){
+                __boot_serial_puts("[elf64_map] c3_load_needed_objects rc=");
+                __boot_serial_putu32((uint32_t)rc);
+                __boot_serial_puts(" obj=");
+                __boot_serial_puts(obj_name);
+                __boot_serial_puts("\n");
+            }
             if(rc<0){
                 uint64_t dt=c3_rdtsc()-dyn_t0;
                 c3_dyn_profile_add_cycle(&g_c3_dyn_cycle_map,dt);
                 if(prof)c3_dyn_profile_add_cycle(&prof->cycle_map,dt);
                 return rc;
             }
-            __boot_serial_puts("[elf64_map] calling c3_apply_dynamic_relocs obj=");
-            __boot_serial_puts(obj_name);
-            __boot_serial_puts("\n");
+            if(trace_elf){
+                __boot_serial_puts("[elf64_map] calling c3_apply_dynamic_relocs obj=");
+                __boot_serial_puts(obj_name);
+                __boot_serial_puts("\n");
+            }
             rc=c3_apply_dynamic_relocs(load_bias,&di,tls_module_id,dyn_deadline,obj_name,prof);
-            __boot_serial_puts("[elf64_map] c3_apply_dynamic_relocs rc=");
-            __boot_serial_putu32((uint32_t)rc);
-            __boot_serial_puts(" obj=");
-            __boot_serial_puts(obj_name);
-            __boot_serial_puts("\n");
+            if(trace_elf){
+                __boot_serial_puts("[elf64_map] c3_apply_dynamic_relocs rc=");
+                __boot_serial_putu32((uint32_t)rc);
+                __boot_serial_puts(" obj=");
+                __boot_serial_puts(obj_name);
+                __boot_serial_puts("\n");
+            }
             if(rc<0){
                 uint64_t dt=c3_rdtsc()-dyn_t0;
                 c3_dyn_profile_add_cycle(&g_c3_dyn_cycle_map,dt);
@@ -10628,18 +19209,31 @@ int elf64_map_into_task(task_t *t,const uint8_t *data,uint32_t sz){
                 if(prof)c3_dyn_profile_add_cycle(&prof->cycle_map,dt);
             }
         }
-    } else {
+    } else if(trace_elf) {
         __boot_serial_puts("[elf64_map] no PT_DYNAMIC or parse failed, skipping relocs\n");
     }
+    for(i=0;i<(int)load_seg_count;++i){
+        uint64_t pg;
+        for(pg=load_seg_start[i];pg<load_seg_end[i];pg+=PAGE_SIZE){
+            uint64_t entry=paging_get_entry(t->addr_space,pg);
+            if(entry&PAGE_PRESENT){
+                uint64_t phys=entry&C3_PTE_ADDR_MASK;
+                (void)paging_set_entry(t->addr_space,pg,phys|load_seg_flags[i]);
+            }
+        }
+    }
     c3_force_map_stage("return",obj_name[0]?obj_name:"(none)",max_end,t?t->mmap_base:0);
-    __boot_serial_puts("[elf64_map] returning 0 obj=");
-    __boot_serial_puts(obj_name[0]?obj_name:"(none)");
-    __boot_serial_puts("\n");
+    if(trace_elf){
+        __boot_serial_puts("[elf64_map] returning 0 obj=");
+        __boot_serial_puts(obj_name[0]?obj_name:"(none)");
+        __boot_serial_puts("\n");
+    }
     if(max_end){
         uint64_t next=(max_end+0x200000ULL+PAGE_SIZE-1)&~(PAGE_SIZE-1);
         if(next>t->mmap_base)t->mmap_base=next;
     }
     if(!t->mmap_base)t->mmap_base=(t->brk_start+0x200000ULL)&~(PAGE_SIZE-1);
+#undef C3_ELF_LOAD_SEG_MAX
     return 0;
 }
 
@@ -10768,6 +19362,26 @@ int64_t real_sys_socket(int domain,int type,int protocol){
     if(type&O_CLOEXEC)ff|=FDFL_CLOEXEC;
     int fd=c3_fd_alloc_for_task(cur,FDKIND_SOCKET,sfd,ff);
     if(fd<0){sock_close(sfd);return -EMFILE;}
+    if(cur&&domain==16&&c3_dbus_debug_trace_enabled()){
+        static uint32_t trace_count;
+        if(trace_count<64u){
+            ++trace_count;
+            __boot_serial_force_puts("[netlink-socket] #");
+            __boot_serial_force_putu32(trace_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)sfd);
+            __boot_serial_force_puts(" type=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)type);
+            __boot_serial_force_puts(" proto=");
+            __boot_serial_force_putu32((uint32_t)protocol);
+            __boot_serial_force_puts("\n");
+        }
+    }
     if(cur&&c3_task_is_browser_runtime(cur)){
         static uint32_t force_socket_trace;
         if(force_socket_trace<12u){
@@ -10775,6 +19389,25 @@ int64_t real_sys_socket(int domain,int type,int protocol){
             __boot_serial_force_puts("[bsock!] pid=");
             __boot_serial_force_putu32((uint32_t)cur->pid);
             c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)sfd);
+            __boot_serial_force_puts(" dom=");
+            __boot_serial_force_putu32((uint32_t)domain);
+            __boot_serial_force_puts(" type=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)type);
+            __boot_serial_force_puts(" proto=");
+            __boot_serial_force_putu32((uint32_t)protocol);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wayfire_socket_trace;
+        if(wayfire_socket_trace<48u){
+            ++wayfire_socket_trace;
+            __boot_serial_force_puts("[wayfire-sock!] #");
+            __boot_serial_force_putu32(wayfire_socket_trace);
             __boot_serial_force_puts(" fd=");
             __boot_serial_force_putu32((uint32_t)fd);
             __boot_serial_force_puts(" ref=");
@@ -10805,20 +19438,100 @@ int64_t real_sys_bind(int fd,const void *addr,uint32_t addrlen){
         (void)addr;
         (void)addrlen;
         g_sockets[ref].local_port=(uint16_t)(cur?cur->pid:0);
+        if(cur&&c3_dbus_debug_trace_enabled()){
+            static uint32_t trace_count;
+            if(trace_count<64u){
+                ++trace_count;
+                __boot_serial_force_puts("[netlink-bind] #");
+                __boot_serial_force_putu32(trace_count);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" ref=");
+                __boot_serial_force_putu32((uint32_t)ref);
+                __boot_serial_force_puts(" local=");
+                __boot_serial_force_putu32((uint32_t)g_sockets[ref].local_port);
+                __boot_serial_force_puts("\n");
+            }
+        }
         return 0;
     }
     upath[0]=0;
     is_unix=(c3_sockaddr_un_path(addr,addrlen,upath,sizeof(upath))==0);
     if(c3_sockaddr_target(addr,addrlen,&ip,&port)<0)return -EINVAL;
     rc=(int64_t)sock_bind(ref,ip,port);
+    if(is_unix)c3_unix_bound_path_set(ref,rc==0?upath:0);
     if(is_unix)c3_trace_unix_socket_addr("bind",fd,ref,upath,port,rc);
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wayfire_bind_trace;
+        if(wayfire_bind_trace<48u){
+            ++wayfire_bind_trace;
+            __boot_serial_force_puts("[wayfire-bind!] #");
+            __boot_serial_force_putu32(wayfire_bind_trace);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)port);
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            if(is_unix){
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(upath[0]?upath:"(empty)");
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
     return rc;
 }
 
 int64_t real_sys_listen(int fd,int backlog){
     task_t *cur=task_current();
+    int ref;
+    int64_t rc;
     if(!fd_valid(&cur->fdt,fd)||cur->fdt.fds[fd].kind!=FDKIND_SOCKET)return -ENOTSOCK;
-    return(int64_t)sock_listen(cur->fdt.fds[fd].ref,backlog);
+    ref=cur->fdt.fds[fd].ref;
+    rc=(int64_t)sock_listen(ref,backlog);
+    if(rc==0&&c3_unix_path_is_wayland_display(g_c3_unix_bound_paths[ref])){
+        static uint32_t wayland_listen_trace;
+        if(wayland_listen_trace<16u){
+            ++wayland_listen_trace;
+            __boot_serial_force_puts("[wayland-listen-real] #");
+            __boot_serial_force_putu32(wayland_listen_trace);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)g_sockets[ref].local_port);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(g_c3_unix_bound_paths[ref]);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wayfire_listen_trace;
+        if(wayfire_listen_trace<48u){
+            ++wayfire_listen_trace;
+            __boot_serial_force_puts("[wayfire-listen!] #");
+            __boot_serial_force_putu32(wayfire_listen_trace);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)g_sockets[ref].local_port);
+            __boot_serial_force_puts(" backlog=");
+            __boot_serial_force_putu32((uint32_t)backlog);
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    return rc;
 }
 
 int64_t real_sys_accept(int fd,void *addr,uint32_t *addrlen){
@@ -10829,14 +19542,40 @@ int64_t real_sys_accept(int fd,void *addr,uint32_t *addrlen){
     int nsfd=sock_accept(cur->fdt.fds[fd].ref,&rip,&rport);
     if(nsfd<0)return nsfd;
     int nfd=c3_fd_alloc_for_task(cur,FDKIND_SOCKET,nsfd,FDFL_READABLE|FDFL_WRITABLE);
+    if(nfd<0){
+        sock_close(nsfd);
+        return nfd;
+    }
+    if(nsfd>=0&&nsfd<SOCK_MAX&&g_sockets[nsfd].used&&
+       g_sockets[nsfd].domain==1&&g_sockets[nsfd].local_port>=39010&&
+       g_sockets[nsfd].local_port<=39019){
+        static uint32_t wayland_accept_trace;
+        if(wayland_accept_trace<48u){
+            ++wayland_accept_trace;
+            __boot_serial_force_puts("[wayland-accept-real] #");
+            __boot_serial_force_putu32(wayland_accept_trace);
+            __boot_serial_force_puts(" lfd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" nfd=");
+            __boot_serial_force_putu32((uint32_t)nfd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)nsfd);
+            __boot_serial_force_puts(" peer=");
+            __boot_serial_force_putu32((uint32_t)g_sockets[nsfd].peer);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)g_sockets[nsfd].local_port);
+            __boot_serial_force_puts("\n");
+        }
+    }
     if(addr&&addrlen&&*addrlen>=sizeof(c3_sockaddr_in_t)){
         c3_sockaddr_in_t *sa=(c3_sockaddr_in_t*)addr;
         c3_memset(sa,0,sizeof(*sa));
         sa->sin_family=2;
         sa->sin_port=c3_ntoh16(rport);
-        sa->sin_addr=rip;
+        c3_sockaddr_ip_write(sa,rip);
         *addrlen=sizeof(*sa);
     }
+    c3_wake_socket_peer_waiters(nsfd,"sock-accept");
     return nfd;
 }
 int64_t real_sys_accept4(int fd,void *addr,uint32_t *addrlen,int flags){
@@ -10854,6 +19593,40 @@ int64_t real_sys_accept4(int fd,void *addr,uint32_t *addrlen,int flags){
         }
     }
     if(flags&O_CLOEXEC)cur->fdt.fds[(int)nfd].flags|=FDFL_CLOEXEC;
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wayfire_accept_trace;
+        if(wayfire_accept_trace<48u){
+            int ref=-1;
+            uint8_t kind=0;
+            if(fd_valid(&cur->fdt,(int)nfd)){
+                kind=cur->fdt.fds[(int)nfd].kind;
+                ref=cur->fdt.fds[(int)nfd].ref;
+            }
+            ++wayfire_accept_trace;
+            __boot_serial_force_puts("[wf-accept!] #");
+            __boot_serial_force_putu32(wayfire_accept_trace);
+            __boot_serial_force_puts(" lfd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" nfd=");
+            __boot_serial_force_putu32((uint32_t)nfd);
+            __boot_serial_force_puts(" kind=");
+            __boot_serial_force_putu32((uint32_t)kind);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+            if(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used){
+                socket_t *s=&g_sockets[ref];
+                __boot_serial_force_puts(" peer=");
+                __boot_serial_force_putu32((uint32_t)s->peer);
+                __boot_serial_force_puts(" rx=");
+                __boot_serial_force_putu32(c3_socket_rx_used(ref));
+                __boot_serial_force_puts(" st=");
+                __boot_serial_force_putu32((uint32_t)s->tcp_state);
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
     return nfd;
 }
 
@@ -10876,7 +19649,64 @@ int64_t real_sys_connect(int fd,const void *addr,uint32_t addrlen){
     upath[0]=0;
     is_unix=(c3_sockaddr_un_path(addr,addrlen,upath,sizeof(upath))==0);
     if(c3_sockaddr_target(addr,addrlen,&ip,&port)<0)return -EINVAL;
+    if(is_unix&&port>=39010&&port<=39019&&c3_task_is_hyprland_compositor(cur)){
+        static uint32_t hypr_wl_fallback_blocks;
+        if(hypr_wl_fallback_blocks<16u){
+            ++hypr_wl_fallback_blocks;
+            __boot_serial_force_puts("[hyprland-drm-only] blocked nested wayland connect fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)port);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(upath[0]?upath:"(empty)");
+            __boot_serial_force_puts("\n");
+        }
+        g_sockets[ref].tcp_state=TCP_CLOSED;
+        g_sockets[ref].error=ECONNREFUSED;
+        return -ECONNREFUSED;
+    }
+    if(is_unix&&c3_unix_path_is_wayland_display(upath)&&
+       !c3_wayland_socket_path_visible(upath)){
+        static uint32_t wayland_fake_blocks;
+        if(wayland_fake_blocks<32u){
+            ++wayland_fake_blocks;
+            __boot_serial_force_puts("[wayland-real-only] blocked fake compositor connect fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)port);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(upath[0]?upath:"(empty)");
+            __boot_serial_force_puts("\n");
+        }
+        g_sockets[ref].tcp_state=TCP_CLOSED;
+        g_sockets[ref].error=ECONNREFUSED;
+        return -ECONNREFUSED;
+    }
     rc=(int64_t)sock_connect(ref,ip,port);
+    if(is_unix&&c3_unix_path_is_wayland_display(upath)){
+        static uint32_t wayland_connect_trace;
+        if(wayland_connect_trace<32u){
+            ++wayland_connect_trace;
+            __boot_serial_force_puts("[wayland-connect-real] #");
+            __boot_serial_force_putu32(wayland_connect_trace);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)port);
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(upath[0]?upath:"(empty)");
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(rc==0)c3_wake_fd_waiters(FDKIND_SOCKET,-1,"sock-connect");
     if(is_unix)c3_trace_unix_socket_addr("conn",fd,ref,upath,port,rc);
     if(cur&&c3_task_is_browser_runtime(cur)){
         static uint32_t force_connect_trace;
@@ -10902,6 +19732,29 @@ int64_t real_sys_connect(int fd,const void *addr,uint32_t addrlen){
             __boot_serial_force_puts("\n");
         }
     }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wayfire_connect_trace;
+        if(wayfire_connect_trace<80u){
+            ++wayfire_connect_trace;
+            __boot_serial_force_puts("[wayfire-conn!] #");
+            __boot_serial_force_putu32(wayfire_connect_trace);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" dom=");
+            __boot_serial_force_putu32((uint32_t)g_sockets[ref].domain);
+            __boot_serial_force_puts(" port=");
+            __boot_serial_force_putu32((uint32_t)port);
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            if(is_unix){
+                __boot_serial_force_puts(" path=");
+                __boot_serial_force_puts(upath[0]?upath:"(empty)");
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
     return rc;
 }
 
@@ -10910,20 +19763,62 @@ int64_t real_sys_sendto(int fd,const void *buf,size_t len,int flags,const void *
     uint32_t ip=0;
     uint16_t port=0;
     int ref;
+    int64_t r;
     if(!fd_valid(&cur->fdt,fd)||cur->fdt.fds[fd].kind!=FDKIND_SOCKET)return -ENOTSOCK;
     ref=cur->fdt.fds[fd].ref;
     if(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used&&g_sockets[ref].domain==16){
-        (void)buf;
-        (void)flags;
         (void)addr;
         (void)addrlen;
-        return (int64_t)len;
+        {
+            iovec_t niov;
+            niov.iov_base=(void*)buf;
+            niov.iov_len=len;
+            return c3_netlink_sendmsg(cur,fd,ref,&niov,1,flags);
+        }
     }
     if(addr&&addrlen>=sizeof(uint16_t)){
         if(c3_sockaddr_target(addr,addrlen,&ip,&port)<0)return -EINVAL;
-        sock_connect(ref,ip,port);
+        if(sock_connect(ref,ip,port)==0)
+            c3_wake_fd_waiters(FDKIND_SOCKET,-1,"sock-sendto-connect");
     }
-    return(int64_t)sock_send(ref,buf,len,flags);
+    r=(int64_t)sock_send(ref,buf,len,flags);
+    if(r>0)c3_wake_socket_peer_waiters(ref,"sock-sendto");
+    if(c3_task_is_browser_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(ref)){
+        static uint32_t browser_sendto_trace=0;
+        if(browser_sendto_trace<180){
+            socket_t *s=(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)?&g_sockets[ref]:0;
+            uint64_t b0=0;
+            size_t bi,lim=len<8?len:8;
+            const uint8_t *wb=(const uint8_t*)buf;
+            if(!wb)lim=0;
+            for(bi=0;bi<lim;++bi)b0|=((uint64_t)wb[bi])<<(bi*8);
+            ++browser_sendto_trace;
+            __boot_serial_puts("[browser-sendto] pid=");
+            __boot_serial_putu32((uint32_t)(cur?cur->pid:0));
+            c3_trace_task_name(cur);
+            __boot_serial_puts(" fd=");
+            __boot_serial_putu32((uint32_t)fd);
+            __boot_serial_puts(" ref=");
+            __boot_serial_putu32((uint32_t)ref);
+            __boot_serial_puts(" count=");
+            __boot_serial_puthex64((uint64_t)len);
+            __boot_serial_puts(" ret=");
+            if(r<0){__boot_serial_puts("-");__boot_serial_putu32((uint32_t)(-r));}
+            else __boot_serial_puthex64((uint64_t)r);
+            if(s){
+                __boot_serial_puts(" port=");
+                __boot_serial_putu32((uint32_t)s->remote_port);
+                __boot_serial_puts(" svc=");
+                __boot_serial_putu32((uint32_t)s->virt_service);
+                __boot_serial_puts(" st=");
+                __boot_serial_putu32((uint32_t)s->tcp_state);
+            }
+            __boot_serial_puts(" b0=");
+            __boot_serial_puthex64(b0);
+            __boot_serial_puts("\n");
+        }
+    }
+    return r;
 }
 
 int64_t real_sys_recvfrom(int fd,void *buf,size_t len,int flags,void *addr,uint32_t *addrlen){
@@ -10935,19 +19830,60 @@ int64_t real_sys_recvfrom(int fd,void *buf,size_t len,int flags,void *addr,uint3
         int ref=cur->fdt.fds[fd].ref;
         uint32_t rx_before=c3_socket_rx_used(ref);
         if(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used&&g_sockets[ref].domain==16){
-            (void)buf;
-            (void)len;
+            int64_t nr;
             if(addr&&addrlen&&*addrlen>=sizeof(c3_sockaddr_nl_t)){
                 c3_sockaddr_nl_t *nl=(c3_sockaddr_nl_t*)addr;
                 c3_memset(nl,0,sizeof(*nl));
                 nl->nl_family=16;
-                nl->nl_pid=(uint32_t)(cur?cur->pid:0);
+                nl->nl_pid=0;
                 *addrlen=sizeof(*nl);
             }
-            return -EAGAIN;
+            if(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)flags|=C3_MSG_DONTWAIT;
+            nr=c3_netlink_recv_user(cur,ref,buf,len,flags);
+            return nr;
         }
         if(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)rflags|=C3_MSG_DONTWAIT;
         r=c3_socket_recv_wait(ref,buf,len,rflags);
+        if(r>0)c3_wake_socket_peer_waiters(ref,"sock-recvfrom");
+        if(c3_task_is_browser_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(ref)){
+            static uint32_t browser_recvfrom_trace=0;
+            if(browser_recvfrom_trace<180){
+                socket_t *s=(ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used)?&g_sockets[ref]:0;
+                uint64_t b0=0;
+                size_t bi,lim=(r>0&&(size_t)r<8)?(size_t)r:8;
+                const uint8_t *rb=(const uint8_t*)buf;
+                if(r<=0||!rb)lim=0;
+                for(bi=0;bi<lim;++bi)b0|=((uint64_t)rb[bi])<<(bi*8);
+                ++browser_recvfrom_trace;
+                __boot_serial_puts("[browser-recvfrom] pid=");
+                __boot_serial_putu32((uint32_t)(cur?cur->pid:0));
+                c3_trace_task_name(cur);
+                __boot_serial_puts(" fd=");
+                __boot_serial_putu32((uint32_t)fd);
+                __boot_serial_puts(" ref=");
+                __boot_serial_putu32((uint32_t)ref);
+                __boot_serial_puts(" count=");
+                __boot_serial_puthex64((uint64_t)len);
+                __boot_serial_puts(" ret=");
+                if(r<0){__boot_serial_puts("-");__boot_serial_putu32((uint32_t)(-r));}
+                else __boot_serial_puthex64((uint64_t)r);
+                __boot_serial_puts(" rx_before=");
+                __boot_serial_putu32(rx_before);
+                if(s){
+                    __boot_serial_puts(" rx_after=");
+                    __boot_serial_putu32(c3_socket_rx_used(ref));
+                    __boot_serial_puts(" port=");
+                    __boot_serial_putu32((uint32_t)s->remote_port);
+                    __boot_serial_puts(" svc=");
+                    __boot_serial_putu32((uint32_t)s->virt_service);
+                    __boot_serial_puts(" st=");
+                    __boot_serial_putu32((uint32_t)s->tcp_state);
+                }
+                __boot_serial_puts(" b0=");
+                __boot_serial_puthex64(b0);
+                __boot_serial_puts("\n");
+            }
+        }
         c3_trace_x11_read_result(fd,ref,len,rflags,r,buf,rx_before);
         if(r>=0&&addr&&addrlen&&*addrlen>=sizeof(c3_sockaddr_in_t)){
             c3_sockaddr_in_t *sa=(c3_sockaddr_in_t*)addr;
@@ -10955,7 +19891,7 @@ int64_t real_sys_recvfrom(int fd,void *buf,size_t len,int flags,void *addr,uint3
             c3_memset(sa,0,sizeof(*sa));
             sa->sin_family=2;
             sa->sin_port=c3_ntoh16(s->remote_port);
-            sa->sin_addr=s->remote_ip;
+            c3_sockaddr_ip_write(sa,s->remote_ip);
             *addrlen=sizeof(*sa);
         }
         return r;
@@ -10974,6 +19910,11 @@ int64_t real_sys_setsockopt(int fd,int level,int optname,const void *optval,uint
         if(v)s->virt_flags|=C3_SOCK_VFLAG_PASSCRED;
         else s->virt_flags&=(uint16_t)~C3_SOCK_VFLAG_PASSCRED;
         return 0;
+    }
+    if(level==C3_SOL_SOCKET&&optname==C3_SO_PASSPIDFD){
+        /* Do not advertise PIDFD credential passing until recvmsg can deliver
+         * SCM_PIDFD exactly like Linux. D-Bus falls back to SO_PEERCRED. */
+        return -ENOPROTOOPT;
     }
     return(int64_t)sock_setsockopt(cur->fdt.fds[fd].ref,level,optname,optval,(size_t)optlen);
 }
@@ -11019,14 +19960,50 @@ int64_t real_sys_getsockopt(int fd,int level,int optname,void *optval,uint32_t *
             *optlen=8;
             return 0;
         case C3_SO_PEERCRED:
+        {
+            task_t *peer=0;
             if(*optlen<12)return -EINVAL;
-            ((int*)optval)[0]=cur->ppid?cur->ppid:cur->pid;
-            ((uint32_t*)optval)[1]=(uint32_t)cur->uid;
-            ((uint32_t*)optval)[2]=(uint32_t)cur->gid;
+            if(s->peer>=0&&s->peer<SOCK_MAX)peer=c3_socket_owner_task(s->peer,cur);
+            if(!peer)peer=c3_socket_owner_task(cur->fdt.fds[fd].ref,cur);
+            if(!peer)peer=cur;
+            ((int*)optval)[0]=(int)(peer->tgid?peer->tgid:peer->pid);
+            ((uint32_t*)optval)[1]=(uint32_t)peer->euid;
+            ((uint32_t*)optval)[2]=(uint32_t)peer->egid;
             *optlen=12;
             return 0;
+        }
+        case C3_SO_PEERGROUPS:
+        {
+            task_t *peer=0;
+            uint32_t gid;
+            if(*optlen<sizeof(uint32_t)){
+                *optlen=sizeof(uint32_t);
+                return -ERANGE;
+            }
+            if(s->peer>=0&&s->peer<SOCK_MAX)peer=c3_socket_owner_task(s->peer,cur);
+            if(!peer)peer=c3_socket_owner_task(cur->fdt.fds[fd].ref,cur);
+            if(!peer)peer=cur;
+            gid=(uint32_t)(peer?peer->egid:0);
+            *(uint32_t*)optval=gid;
+            *optlen=sizeof(uint32_t);
+            return 0;
+        }
+        case C3_SO_PEERSEC:
+        {
+            static const char label[]="unconfined";
+            size_t need=sizeof(label);
+            if(*optlen<need){
+                *optlen=(uint32_t)need;
+                return -ERANGE;
+            }
+            c3_memcpy(optval,label,need);
+            *optlen=(uint32_t)need;
+            return 0;
+        }
+        case C3_SO_PEERPIDFD:
+            return -ENOPROTOOPT;
         default:
-            {
+            if(c3_syscall_debug_trace_enabled()){
                 static uint32_t trace_count=0;
                 if(trace_count<16){
                     ++trace_count;
@@ -11041,7 +20018,29 @@ int64_t real_sys_getsockopt(int fd,int level,int optname,void *optval,uint32_t *
                     __boot_serial_puts("\n");
                 }
             }
-            return -EINVAL;
+            return -ENOPROTOOPT;
+    }
+    if(cur&&c3_task_is_browser_runtime(cur)){
+        static uint32_t trace_count=0;
+        if(trace_count<80){
+            ++trace_count;
+            __boot_serial_puts("[browser-getsockopt] pid=");
+            __boot_serial_putu32((uint32_t)cur->pid);
+            c3_trace_task_name(cur);
+            __boot_serial_puts(" fd=");
+            __boot_serial_putu32((uint32_t)fd);
+            __boot_serial_puts(" ref=");
+            __boot_serial_putu32((uint32_t)cur->fdt.fds[fd].ref);
+            __boot_serial_puts(" opt=");
+            __boot_serial_putu32((uint32_t)optname);
+            __boot_serial_puts(" val=");
+            __boot_serial_putu32((uint32_t)v);
+            __boot_serial_puts(" state=");
+            __boot_serial_putu32((uint32_t)s->tcp_state);
+            __boot_serial_puts(" port=");
+            __boot_serial_putu32((uint32_t)s->remote_port);
+            __boot_serial_puts("\n");
+        }
     }
     *(int*)optval=v;
     *optlen=sizeof(int);
@@ -11078,7 +20077,7 @@ int64_t real_sys_getsockname(int fd,void *addr,uint32_t *addrlen){
     sa=(c3_sockaddr_in_t*)addr;
     c3_memset(sa,0,sizeof(*sa));
     sa->sin_family=2;
-    sa->sin_addr=s->local_ip;
+    c3_sockaddr_ip_write(sa,s->local_ip);
     sa->sin_port=c3_ntoh16(s->local_port);
     *addrlen=sizeof(*sa);
     return 0;
@@ -11099,7 +20098,9 @@ int64_t real_sys_getpeername(int fd,void *addr,uint32_t *addrlen){
         su->sun_family=1;
         if(s->remote_port>=6000&&s->remote_port<6064)c3_strlcpy(su->sun_path,"/tmp/.X11-unix/X0",sizeof(su->sun_path));
         else if(s->remote_port>=39010&&s->remote_port<=39019)c3_strlcpy(su->sun_path,"/run/user/0/wayland-0",sizeof(su->sun_path));
-        else if(s->remote_port==39020||s->remote_port==39021)c3_strlcpy(su->sun_path,"/run/user/0/bus",sizeof(su->sun_path));
+        else if(s->remote_port==39020)c3_strlcpy(su->sun_path,"/run/user/0/bus",sizeof(su->sun_path));
+        else if(s->remote_port==39022)c3_strlcpy(su->sun_path,"/tmp/dbus-ridux-waybar",sizeof(su->sun_path));
+        else if(s->remote_port==39021)c3_strlcpy(su->sun_path,"/run/dbus/system_bus_socket",sizeof(su->sun_path));
         else c3_strlcpy(su->sun_path,"@ridux-peer",sizeof(su->sun_path));
         *addrlen=sizeof(c3_sockaddr_un_t);
         return 0;
@@ -11108,16 +20109,42 @@ int64_t real_sys_getpeername(int fd,void *addr,uint32_t *addrlen){
     sa=(c3_sockaddr_in_t*)addr;
     c3_memset(sa,0,sizeof(*sa));
     sa->sin_family=2;
-    sa->sin_addr=s->remote_ip;
+    c3_sockaddr_ip_write(sa,s->remote_ip);
     sa->sin_port=c3_ntoh16(s->remote_port);
     *addrlen=sizeof(*sa);
     return 0;
 }
 int64_t real_sys_shutdown(int fd,int how){
     task_t *cur=task_current();
-    (void)how;
+    int ref;
+    int64_t rc;
     if(!fd_valid(&cur->fdt,fd)||cur->fdt.fds[fd].kind!=FDKIND_SOCKET)return -ENOTSOCK;
-    sock_close(cur->fdt.fds[fd].ref);return 0;
+    ref=cur->fdt.fds[fd].ref;
+    rc=(int64_t)sock_shutdown(ref,how);
+    if(cur&&c3_dbus_debug_trace_enabled()&&ref>=0&&ref<SOCK_MAX&&g_sockets[ref].used&&
+       g_sockets[ref].domain==1&&
+       (g_sockets[ref].local_port==39030||g_sockets[ref].local_port==39031||
+        g_sockets[ref].remote_port==39030||g_sockets[ref].remote_port==39031)){
+        static uint32_t hypr_shutdown_trace;
+        if(hypr_shutdown_trace<64u){
+            ++hypr_shutdown_trace;
+            __boot_serial_force_puts("[hypr-unix-shutdown!] #");
+            __boot_serial_force_putu32(hypr_shutdown_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" how=");
+            __boot_serial_force_putu32((uint32_t)how);
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    return rc;
 }
 int64_t real_sys_socketpair(int domain,int type,int protocol,int sv[2]){
     task_t *cur=task_current();
@@ -11173,21 +20200,45 @@ int64_t real_sys_socketpair(int domain,int type,int protocol,int sv[2]){
             __boot_serial_puts("\n");
         }
     }
+    if(cur&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wayfire_socketpair_trace=0;
+        if(wayfire_socketpair_trace<48){
+            ++wayfire_socketpair_trace;
+            __boot_serial_force_puts("[wayfire-socketpair!] #");
+            __boot_serial_force_putu32(wayfire_socketpair_trace);
+            __boot_serial_force_puts(" domain=");
+            __boot_serial_force_putu32((uint32_t)domain);
+            __boot_serial_force_puts(" type=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)type);
+            __boot_serial_force_puts(" fd0=");
+            __boot_serial_force_putu32((uint32_t)fd0);
+            __boot_serial_force_puts(" fd1=");
+            __boot_serial_force_putu32((uint32_t)fd1);
+            __boot_serial_force_puts(" ref0=");
+            __boot_serial_force_putu32((uint32_t)refs[0]);
+            __boot_serial_force_puts(" ref1=");
+            __boot_serial_force_putu32((uint32_t)refs[1]);
+            __boot_serial_force_puts("\n");
+        }
+    }
     return 0;
 }
 
 static int64_t c3_sendmsg_iov(int sref,const iovec_t *iov,size_t iovcnt,int flags){
+    task_t *cur=task_current();
     if(c3_socket_ref_is_virtual_stream(sref)){
         return c3_socket_send_iov_coalesced(sref,iov,iovcnt,flags);
     }
     if(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used&&g_sockets[sref].type==2){
         uint8_t pkt[C3_MSG_SCRATCH_SIZE];
         size_t total=0,i;
+        if(!cur)return -ESRCH;
         for(i=0;i<iovcnt;++i){
             if(!iov[i].iov_len)continue;
             if(!iov[i].iov_base)return -EFAULT;
             if(total+iov[i].iov_len>sizeof(pkt))return -EFBIG;
-            c3_memcpy(pkt+total,iov[i].iov_base,iov[i].iov_len);
+            if(c3_user_copy_in(cur,pkt+total,iov[i].iov_base,iov[i].iov_len,
+                               "sendmsg-dgram")<0)return -EFAULT;
             total+=iov[i].iov_len;
         }
         if(!total)return 0;
@@ -11195,23 +20246,38 @@ static int64_t c3_sendmsg_iov(int sref,const iovec_t *iov,size_t iovcnt,int flag
     }
     int64_t total=0;
     size_t i;
+    if(!cur)return -ESRCH;
     for(i=0;i<iovcnt;++i){
-        int64_t rc;
+        const uint8_t *base;
+        size_t off=0;
         if(!iov[i].iov_len)continue;
         if(!iov[i].iov_base)return total?total:-EFAULT;
-        rc=(int64_t)sock_send(sref,iov[i].iov_base,iov[i].iov_len,flags);
-        if(rc<0)return total?total:rc;
-        total+=rc;
-        if((size_t)rc<iov[i].iov_len)break;
+        base=(const uint8_t*)iov[i].iov_base;
+        while(off<iov[i].iov_len){
+            uint8_t pkt[C3_MSG_SCRATCH_SIZE];
+            size_t want=iov[i].iov_len-off;
+            int64_t rc;
+            if(want>sizeof(pkt))want=sizeof(pkt);
+            if(c3_user_copy_in(cur,pkt,base+off,want,"sendmsg-stream")<0)
+                return total?total:-EFAULT;
+            rc=(int64_t)sock_send(sref,pkt,want,flags);
+            if(rc<0)return total?total:rc;
+            if(rc==0)return total;
+            total+=rc;
+            off+=(size_t)rc;
+            if((size_t)rc<want)return total;
+        }
     }
     return total;
 }
 
 static int64_t c3_recvmsg_iov(int sref,const iovec_t *iov,size_t iovcnt,int flags){
+    task_t *cur=task_current();
     if(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used&&g_sockets[sref].type==2){
         uint8_t pkt[C3_MSG_SCRATCH_SIZE];
         size_t cap=0,i,off=0;
         int64_t rc;
+        if(!cur)return -ESRCH;
         for(i=0;i<iovcnt&&cap<sizeof(pkt);++i){
             if(!iov[i].iov_len)continue;
             if(!iov[i].iov_base)return -EFAULT;
@@ -11219,14 +20285,15 @@ static int64_t c3_recvmsg_iov(int sref,const iovec_t *iov,size_t iovcnt,int flag
             if(cap>sizeof(pkt))cap=sizeof(pkt);
         }
         if(!cap)return 0;
-        rc=c3_socket_recv_wait(sref,pkt,cap,flags);
+        rc=c3_socket_recv_kernel_wait(sref,pkt,cap,flags);
         if(rc<=0)return rc;
         for(i=0;i<iovcnt&&off<(size_t)rc;++i){
             size_t cp;
             if(!iov[i].iov_len)continue;
             cp=iov[i].iov_len;
             if(cp>(size_t)rc-off)cp=(size_t)rc-off;
-            c3_memcpy(iov[i].iov_base,pkt+off,cp);
+            if(c3_user_copy_out(cur,iov[i].iov_base,pkt+off,cp,
+                                "recvmsg-dgram")<0)return -EFAULT;
             off+=cp;
         }
         return rc;
@@ -11266,10 +20333,12 @@ static void c3_trace_firefox_ipc_recv_payload(task_t *cur,int fd,int64_t rc,c3_m
     size_t avail;
     size_t qi;
     static uint32_t dump_count=0;
+    bool chrome_child=false;
     if(dump_count>=64)return;
     if(!cur||!mh||rc<=0)return;
-    if(!c3_task_is_firefox_ipc_trace(cur))return;
-    if(!c3_has_token(cur->name,"IPC I/O Child"))return;
+    chrome_child=c3_task_is_chromium_runtime(cur)&&c3_has_token(cur->name,"Chrome_ChildIOThread");
+    if(!c3_task_is_firefox_ipc_trace(cur)&&!chrome_child)return;
+    if(!chrome_child&&!c3_has_token(cur->name,"IPC I/O Child"))return;
     if(!mh->msg_iov||!mh->msg_iovlen)return;
     if(!mh->msg_iov[0].iov_base||!mh->msg_iov[0].iov_len)return;
     avail=mh->msg_iov[0].iov_len;
@@ -11315,8 +20384,8 @@ static size_t c3_cmsg_space(size_t payload_len){
 }
 
 static bool c3_recvmsg_put_cmsg(void *control,size_t cap,size_t *used,
-                                int level,int type,const void *payload,size_t payload_len,
-                                int *msg_flags){
+                                 int level,int type,const void *payload,size_t payload_len,
+                                 int *msg_flags){
     size_t off,len,space;
     c3_cmsghdr_t *ch;
     if(!control||!used)return false;
@@ -11337,6 +20406,49 @@ static bool c3_recvmsg_put_cmsg(void *control,size_t cap,size_t *used,
     return true;
 }
 
+static int  c3_scm_right_store(task_t *sender,int pass_fd);
+static void c3_scm_right_discard(int token);
+
+static int c3_sendmsg_queue_rights(task_t *cur,int sref,const c3_msghdr_t *mh){
+    const uint8_t *control;
+    size_t off=0;
+    int queued=0;
+    if(!cur||!mh||!mh->msg_control||mh->msg_controllen<sizeof(c3_cmsghdr_t))return 0;
+    control=(const uint8_t*)mh->msg_control;
+    while(off+sizeof(c3_cmsghdr_t)<=mh->msg_controllen){
+        const c3_cmsghdr_t *ch=(const c3_cmsghdr_t*)(control+off);
+        size_t hdr=c3_cmsg_align(sizeof(c3_cmsghdr_t));
+        size_t next;
+        if(ch->cmsg_len<sizeof(c3_cmsghdr_t))return queued?queued:-EINVAL;
+        if(off+ch->cmsg_len>mh->msg_controllen)return queued?queued:-EINVAL;
+        next=off+c3_cmsg_align(ch->cmsg_len);
+        if(ch->cmsg_level==C3_SOL_SOCKET&&ch->cmsg_type==C3_SCM_RIGHTS){
+            size_t data_len;
+            const int *fds;
+            size_t i,count;
+            if(ch->cmsg_len<hdr)return queued?queued:-EINVAL;
+            data_len=ch->cmsg_len-hdr;
+            if((data_len%sizeof(int))!=0)return queued?queued:-EINVAL;
+            fds=(const int*)(control+off+hdr);
+            count=data_len/sizeof(int);
+            for(i=0;i<count;++i){
+                int token=c3_scm_right_store(cur,fds[i]);
+                int rc;
+                if(token<0)return queued?queued:token;
+                rc=sock_send_right(sref,token);
+                if(rc<0){
+                    c3_scm_right_discard(token);
+                    return queued?queued:rc;
+                }
+                ++queued;
+            }
+        }
+        if(next<=off)break;
+        off=next;
+    }
+    return queued;
+}
+
 static bool c3_scm_right_is_token(int token){
     return token>=C3_SCM_RIGHTS_TOKEN_BASE&&
            token<C3_SCM_RIGHTS_TOKEN_BASE+C3_SCM_RIGHTS_MAX;
@@ -11352,8 +20464,9 @@ static int c3_scm_right_store(task_t *sender,int pass_fd){
             g_c3_scm_rights[idx].used=true;
             c3_memcpy(&g_c3_scm_rights[idx].fd,src,sizeof(real_fd_t));
             g_c3_scm_rights[idx].fd.flags=(uint16_t)(g_c3_scm_rights[idx].fd.flags&~FDFL_CLOEXEC);
+            g_c3_scm_rights[idx].drm_prime_handle=drm_prime_handle_for_fd(pass_fd);
             g_c3_scm_rights_next=(idx+1)%C3_SCM_RIGHTS_MAX;
-            {
+            if(c3_syscall_debug_trace_enabled()){
                 static uint32_t trace_count=0;
                 if(trace_count<32){
                     ++trace_count;
@@ -11375,6 +20488,33 @@ static int c3_scm_right_store(task_t *sender,int pass_fd){
                         }
                     }
                     __boot_serial_puts("\n");
+                }
+            }
+            if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(sender)){
+                static uint32_t wf_trace_count=0;
+                if(wf_trace_count<96u){
+                    ++wf_trace_count;
+                    __boot_serial_force_puts("[wf-scm-store!] #");
+                    __boot_serial_force_putu32(wf_trace_count);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)sender->pid);
+                    c3_force_task_name(sender);
+                    __boot_serial_force_puts(" oldfd=");
+                    __boot_serial_force_putu32((uint32_t)pass_fd);
+                    __boot_serial_force_puts(" token=");
+                    __boot_serial_force_putu32((uint32_t)(C3_SCM_RIGHTS_TOKEN_BASE+(int)idx));
+                    __boot_serial_force_puts(" kind=");
+                    __boot_serial_force_putu32((uint32_t)src->kind);
+                    __boot_serial_force_puts(" ref=");
+                    __boot_serial_force_putu32((uint32_t)src->ref);
+                    if(src->kind==FDKIND_VFSFILE||src->kind==FDKIND_DIR){
+                        const char *p=c3_vfs_open_slot_path(src->ref);
+                        if(p){
+                            __boot_serial_force_puts(" path=");
+                            __boot_serial_force_puts(p);
+                        }
+                    }
+                    __boot_serial_force_puts("\n");
                 }
             }
             return C3_SCM_RIGHTS_TOKEN_BASE+(int)idx;
@@ -11404,8 +20544,10 @@ static int c3_scm_right_take(task_t *receiver,int token,int recv_flags,int *out_
     if(nfd>=TASK_FD_MAX)return -EMFILE;
     receiver->fdt.fds[nfd].offset=src->offset;
     c3_fd_group_copy_fd(receiver,nfd);
+    if(g_c3_scm_rights[idx].drm_prime_handle)
+        drm_remember_prime_fd(nfd,g_c3_scm_rights[idx].drm_prime_handle);
     *out_fd=nfd;
-    {
+    if(c3_syscall_debug_trace_enabled()){
         static uint32_t trace_count=0;
         if(trace_count<64){
             ++trace_count;
@@ -11430,38 +20572,178 @@ static int c3_scm_right_take(task_t *receiver,int token,int recv_flags,int *out_
             __boot_serial_puts("\n");
         }
     }
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(receiver)){
+        static uint32_t wf_trace_count=0;
+        if(wf_trace_count<128u){
+            ++wf_trace_count;
+            __boot_serial_force_puts("[wf-scm-recv!] #");
+            __boot_serial_force_putu32(wf_trace_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)receiver->pid);
+            c3_force_task_name(receiver);
+            __boot_serial_force_puts(" token=");
+            __boot_serial_force_putu32((uint32_t)token);
+            __boot_serial_force_puts(" newfd=");
+            __boot_serial_force_putu32((uint32_t)nfd);
+            __boot_serial_force_puts(" kind=");
+            __boot_serial_force_putu32((uint32_t)src->kind);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)src->ref);
+            if(src->kind==FDKIND_VFSFILE||src->kind==FDKIND_DIR){
+                const char *p=c3_vfs_open_slot_path(src->ref);
+                if(p){
+                    __boot_serial_force_puts(" path=");
+                    __boot_serial_force_puts(p);
+                }
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
     c3_scm_right_discard(token);
     return 0;
 }
 
+int compat3_take_scm_right(int token,int *out_fd){
+    if(!out_fd)return -EFAULT;
+    if(c3_scm_right_is_token(token))
+        return c3_scm_right_take(task_current(),token,0,out_fd);
+    *out_fd=token;
+    return 0;
+}
+
+int compat3_send_scm_right_from_current(int sock_fd,int pass_fd){
+    task_t *cur=task_current();
+    int sref;
+    if(!cur)return -ESRCH;
+    if(!fd_valid(&cur->fdt,sock_fd)||cur->fdt.fds[sock_fd].kind!=FDKIND_SOCKET)
+        return -ENOTSOCK;
+    if(!fd_valid(&cur->fdt,pass_fd))return -EBADF;
+    sref=cur->fdt.fds[sock_fd].ref;
+    return compat3_send_scm_right_to_socket_ref_from_current(sref,pass_fd);
+}
+
+int compat3_send_scm_right_to_socket_ref_from_current(int sock_ref,int pass_fd){
+    task_t *cur=task_current();
+    int token;
+    int rc;
+    if(!cur)return -ESRCH;
+    if(sock_ref<0||sock_ref>=SOCK_MAX||!g_sockets[sock_ref].used)return -ENOTSOCK;
+    if(!fd_valid(&cur->fdt,pass_fd))return -EBADF;
+    token=c3_scm_right_store(cur,pass_fd);
+    if(token<0)return token;
+    rc=sock_send_right(sock_ref,token);
+    if(rc<0){
+        c3_scm_right_discard(token);
+        return rc;
+    }
+    c3_wake_socket_peer_waiters(sock_ref,"sock-scm-right");
+    return 0;
+}
+
+int compat3_send_devnull_right_to_socket_ref_from_current(int sock_ref){
+    int null_fd;
+    int rc;
+    null_fd=(int)c3_real_open_trusted_kernel_path("/dev/null",O_RDONLY|O_CLOEXEC,0);
+    if(null_fd<0)return null_fd;
+    rc=compat3_send_scm_right_to_socket_ref_from_current(sock_ref,null_fd);
+    (void)real_sys_close(null_fd);
+    return rc;
+}
+
 static int c3_recvmsg_drain_rights(task_t *cur,int sref,void *control,size_t ctrl_cap,
                                    size_t *ctrl_used,int flags,int *msg_flags){
-    int delivered=0;
+    int fds[SOCK_ANCQ];
+    bool allocated[SOCK_ANCQ];
+    int count=0;
+    int deliver;
+    int i;
     if(!control||!ctrl_used||ctrl_cap<sizeof(c3_cmsghdr_t))return 0;
     for(;;){
         int pass_fd;
         int recv_fd;
-        bool allocated=false;
+        bool took_token=false;
         int crc=sock_recv_right(sref,&pass_fd);
         if(crc!=0)break;
         recv_fd=pass_fd;
         if(c3_scm_right_is_token(pass_fd)){
             int trc=c3_scm_right_take(cur,pass_fd,flags,&recv_fd);
-            if(trc<0)return delivered?delivered:trc;
-            allocated=true;
+            if(trc<0)return count?count:trc;
+            took_token=true;
         }else if(!cur||!fd_valid(&cur->fdt,pass_fd)){
-            return delivered?delivered:-EBADF;
+            return count?count:-EBADF;
+        }
+        fds[count]=recv_fd;
+        allocated[count]=took_token;
+        ++count;
+        if(count>=SOCK_ANCQ)break;
+    }
+    if(!count)return 0;
+    {
+        size_t off=c3_cmsg_align(*ctrl_used);
+        size_t hdr=c3_cmsg_align(sizeof(c3_cmsghdr_t));
+        size_t room=0;
+        if(off+hdr<ctrl_cap)room=ctrl_cap-off-hdr;
+        deliver=(int)(room/sizeof(int));
+        if(deliver>count)deliver=count;
+        if(deliver<=0){
+            if(msg_flags)*msg_flags|=C3_MSG_CTRUNC;
+            for(i=0;i<count;++i)if(allocated[i])(void)c3_close_fd_for_task(cur,fds[i]);
+            return 0;
         }
         if(!c3_recvmsg_put_cmsg(control,ctrl_cap,ctrl_used,
                                 C3_SOL_SOCKET,C3_SCM_RIGHTS,
-                                &recv_fd,sizeof(recv_fd),msg_flags)){
-            if(allocated)(void)c3_close_fd_for_task(cur,recv_fd);
-            break;
+                                fds,(size_t)deliver*sizeof(int),msg_flags)){
+            for(i=0;i<count;++i)if(allocated[i])(void)c3_close_fd_for_task(cur,fds[i]);
+            return 0;
         }
-        ++delivered;
-        if(delivered>=8)break;
+        if(deliver<count){
+            if(msg_flags)*msg_flags|=C3_MSG_CTRUNC;
+            for(i=deliver;i<count;++i)if(allocated[i])(void)c3_close_fd_for_task(cur,fds[i]);
+        }
+        {
+            static uint32_t trace_count=0;
+            if(trace_count<32&&(c3_task_is_chromium_runtime(cur)||c3_task_is_firefox_runtime(cur))){
+                ++trace_count;
+                __boot_serial_puts("[recvmsg-rights] pid=");
+                __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
+                c3_trace_task_name(cur);
+                __boot_serial_puts(" count=");
+                __boot_serial_putu32((uint32_t)count);
+                __boot_serial_puts(" delivered=");
+                __boot_serial_putu32((uint32_t)deliver);
+                __boot_serial_puts(" ctrl=");
+                __boot_serial_puthex64((uint64_t)*ctrl_used);
+                __boot_serial_puts("\n");
+            }
+        }
+        if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t wf_trace_count=0;
+            if(wf_trace_count<128u){
+                ++wf_trace_count;
+                __boot_serial_force_puts("[wf-recvmsg-rights!] #");
+                __boot_serial_force_putu32(wf_trace_count);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32(cur?(uint32_t)cur->pid:0);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" sref=");
+                __boot_serial_force_putu32((uint32_t)sref);
+                __boot_serial_force_puts(" count=");
+                __boot_serial_force_putu32((uint32_t)count);
+                __boot_serial_force_puts(" delivered=");
+                __boot_serial_force_putu32((uint32_t)deliver);
+                __boot_serial_force_puts(" ctrl=");
+                __boot_serial_force_puthex64((uint64_t)*ctrl_used);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)(msg_flags?*msg_flags:0));
+                if(deliver>0){
+                    __boot_serial_force_puts(" fd0=");
+                    __boot_serial_force_putu32((uint32_t)fds[0]);
+                }
+                __boot_serial_force_puts("\n");
+            }
+        }
     }
-    return delivered;
+    return deliver;
 }
 
 static task_t *c3_socket_owner_task(int sref,const task_t *skip){
@@ -11504,22 +20786,152 @@ static void c3_recvmsg_make_ucred(task_t *cur,int sref,c3_ucred_t *uc){
     }
 }
 
+static int c3_msghdr_copy_in(task_t *cur,c3_msghdr_t *dst,const void *user_msg,
+                             iovec_t *iov_buf,size_t iov_cap,
+                             uint8_t *control_buf,size_t control_cap,
+                             iovec_t **user_iov_out,void **user_control_out,
+                             bool copy_control_in,
+                             const char *tag){
+    c3_msghdr_t tmp;
+    if(!cur||!dst||!user_msg)return -EFAULT;
+    if(c3_user_copy_in(cur,&tmp,user_msg,sizeof(tmp),tag)<0)return -EFAULT;
+    if(tmp.msg_iovlen>C3_MSG_IOV_MAX)return -EINVAL;
+    if(tmp.msg_iovlen>iov_cap)return -EINVAL;
+    if(user_iov_out)*user_iov_out=tmp.msg_iov;
+    if(user_control_out)*user_control_out=tmp.msg_control;
+    if(tmp.msg_iovlen){
+        size_t bytes=tmp.msg_iovlen*sizeof(iovec_t);
+        if(!tmp.msg_iov)return -EFAULT;
+        if(c3_user_copy_in(cur,iov_buf,tmp.msg_iov,bytes,"msghdr-iov")<0)return -EFAULT;
+        tmp.msg_iov=iov_buf;
+    }else{
+        tmp.msg_iov=0;
+    }
+    if(tmp.msg_control&&tmp.msg_controllen){
+        size_t cp=tmp.msg_controllen;
+        if(cp>control_cap)cp=control_cap;
+        if(cp&&copy_control_in){
+            if(c3_user_copy_in(cur,control_buf,tmp.msg_control,cp,"msghdr-control")<0)
+                return -EFAULT;
+        }else if(cp){
+            c3_memset(control_buf,0,cp);
+        }
+        tmp.msg_control=control_buf;
+        tmp.msg_controllen=cp;
+    }else{
+        tmp.msg_control=0;
+        tmp.msg_controllen=0;
+    }
+    *dst=tmp;
+    return 0;
+}
+
+static int c3_msghdr_copy_recv_out(task_t *cur,void *user_msg,const c3_msghdr_t *mh,
+                                   void *user_name,uint32_t user_namelen,
+                                   const void *name_buf,uint32_t name_len,
+                                   iovec_t *user_iov,
+                                   void *user_control,const void *control_buf,
+                                   size_t control_len){
+    c3_msghdr_t out;
+    if(!cur||!user_msg||!mh)return -EFAULT;
+    out=*mh;
+    out.msg_name=user_name;
+    out.msg_iov=mh->msg_iov;
+    out.msg_control=user_control;
+    if(user_name&&name_buf&&name_len){
+        size_t cp=name_len;
+        if(cp>user_namelen)cp=user_namelen;
+        if(cp&&c3_user_copy_out(cur,user_name,name_buf,cp,"recvmsg-name")<0)
+            return -EFAULT;
+    }
+    if(user_control&&control_buf&&control_len){
+        if(c3_user_copy_out(cur,user_control,control_buf,control_len,"recvmsg-control")<0)
+            return -EFAULT;
+    }
+    out.msg_iov=user_iov;
+    return c3_user_copy_out(cur,user_msg,&out,sizeof(out),"recvmsg-header");
+}
+
 int64_t real_sys_sendmsg(int fd,const void *msg,int flags){
     task_t *cur=task_current();
-    const c3_msghdr_t *mh=(const c3_msghdr_t*)msg;
-    const c3_cmsghdr_t *ch;
-    size_t cneed=sizeof(c3_cmsghdr_t)+sizeof(int);
+    c3_msghdr_t mh_local;
+    const c3_msghdr_t *mh=&mh_local;
+    iovec_t iov_local[C3_MSG_IOV_LOCAL_MAX];
+    uint8_t control_local[C3_MSG_CONTROL_LOCAL_MAX];
     uint32_t ip=0;
     uint16_t port=0;
     int sref;
-    int rc;
+    int rights_queued=0;
     int64_t out_rc;
-    if(!fd_valid(&cur->fdt,fd)||cur->fdt.fds[fd].kind!=FDKIND_SOCKET)return -ENOTSOCK;
-    if(!mh)return -EFAULT;
+    if(!fd_valid(&cur->fdt,fd)||cur->fdt.fds[fd].kind!=FDKIND_SOCKET){
+        if(cur&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t sendmsg_notsock_trace;
+            if(sendmsg_notsock_trace<48u){
+                ++sendmsg_notsock_trace;
+                __boot_serial_force_puts("[sendmsg-notsock!] #");
+                __boot_serial_force_putu32(sendmsg_notsock_trace);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts("\n");
+                if(fd>=0&&fd<TASK_FD_MAX)c3_force_one_fd("[sendmsg-notsock-fd!]",cur,fd);
+            }
+        }
+        return -ENOTSOCK;
+    }
+    if(!msg)return -EFAULT;
+    {
+        int cr=c3_msghdr_copy_in(cur,&mh_local,msg,
+                                 iov_local,C3_MSG_IOV_LOCAL_MAX,
+                                 control_local,sizeof(control_local),
+                                 0,0,true,"sendmsg-header");
+        if(cr<0)return cr;
+    }
     if(mh->msg_iovlen>C3_MSG_IOV_MAX)return -EINVAL;
     if(mh->msg_iovlen&&(!mh->msg_iov))return -EFAULT;
     sref=cur->fdt.fds[fd].ref;
-    if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_virtual_service(sref)==SOCK_VIRT_NONE){
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_sendmsg_entry_trace;
+        if(wf_sendmsg_entry_trace<160u){
+            socket_t *s=(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used)?&g_sockets[sref]:0;
+            ++wf_sendmsg_entry_trace;
+            __boot_serial_force_puts("[wf-sendmsg!] #");
+            __boot_serial_force_putu32(wf_sendmsg_entry_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)sref);
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+            __boot_serial_force_puts(" iovlen=");
+            __boot_serial_force_putu32((uint32_t)mh->msg_iovlen);
+            __boot_serial_force_puts(" ctrl=");
+            __boot_serial_force_puthex64((uint64_t)mh->msg_controllen);
+            if(s){
+                __boot_serial_force_puts(" peer=");
+                __boot_serial_force_putu32((uint32_t)s->peer);
+                __boot_serial_force_puts(" rx=");
+                __boot_serial_force_putu32(c3_socket_rx_used(sref));
+                __boot_serial_force_puts(" peer_rx=");
+                __boot_serial_force_putu32(c3_socket_rx_used(s->peer));
+                __boot_serial_force_puts(" st=");
+                __boot_serial_force_putu32((uint32_t)s->tcp_state);
+            }
+            __boot_serial_force_puts("\n");
+        }
+        c3_trace_wayland_iov("tx",cur,fd,sref,mh->msg_iov,mh->msg_iovlen,2048u);
+        c3_trace_dbus_iov("tx",cur,fd,sref,mh->msg_iov,mh->msg_iovlen,4096u);
+    }
+    if(cur&&c3_dbus_debug_trace_enabled()&&!c3_wayfire_debug_trace_enabled()&&
+       c3_task_is_wayfire_runtime(cur)){
+        c3_trace_dbus_iov("tx",cur,fd,sref,mh->msg_iov,mh->msg_iovlen,4096u);
+    }
+    if(c3_task_is_browser_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(sref)){
         static uint32_t sendmsg_entry_trace=0;
         if(sendmsg_entry_trace<140){
             socket_t *s=(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used)?&g_sockets[sref]:0;
@@ -11553,36 +20965,36 @@ int64_t real_sys_sendmsg(int fd,const void *msg,int flags){
         }
     }
     if(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used&&g_sockets[sref].domain==16){
-        size_t i,total=0;
         if(mh->msg_name&&mh->msg_namelen>=sizeof(uint16_t)){
             const c3_sockaddr_nl_t *nl=(const c3_sockaddr_nl_t*)mh->msg_name;
             if(nl->nl_family!=16)return -EINVAL;
         }
-        for(i=0;i<mh->msg_iovlen;++i){
-            if(mh->msg_iov[i].iov_len&&!mh->msg_iov[i].iov_base)return -EFAULT;
-            total+=mh->msg_iov[i].iov_len;
-        }
-        (void)flags;
-        return (int64_t)total;
+        return c3_netlink_sendmsg(cur,fd,sref,mh->msg_iov,mh->msg_iovlen,flags);
     }
     if(mh->msg_name){
         if(mh->msg_namelen<sizeof(uint16_t))return -EINVAL;
         if(c3_sockaddr_target(mh->msg_name,mh->msg_namelen,&ip,&port)<0)return -EINVAL;
-        sock_connect(sref,ip,port);
+        if(sock_connect(sref,ip,port)==0)
+            c3_wake_fd_waiters(FDKIND_SOCKET,-1,"sock-sendmsg-connect");
     }
     if(mh->msg_control&&mh->msg_controllen>=sizeof(c3_cmsghdr_t)){
-        ch=(const c3_cmsghdr_t*)mh->msg_control;
-        if(ch->cmsg_level==C3_SOL_SOCKET&&ch->cmsg_type==C3_SCM_RIGHTS){
-            int pass_fd;
-            int queued_fd;
-            if(ch->cmsg_len<cneed||mh->msg_controllen<cneed)return -EINVAL;
-            pass_fd=*(const int*)((const uint8_t*)mh->msg_control+sizeof(c3_cmsghdr_t));
-            queued_fd=c3_scm_right_store(cur,pass_fd);
-            if(queued_fd<0)return queued_fd;
-            rc=sock_send_right(sref,queued_fd);
-            if(rc<0){
-                c3_scm_right_discard(queued_fd);
-                return rc;
+        int rights_rc=c3_sendmsg_queue_rights(cur,sref,mh);
+        if(rights_rc<0)return rights_rc;
+        rights_queued=rights_rc;
+        if(rights_rc>0&&(c3_task_is_chromium_runtime(cur)||c3_task_is_firefox_runtime(cur))){
+            static uint32_t trace_count=0;
+            if(trace_count<32){
+                ++trace_count;
+                __boot_serial_puts("[sendmsg-rights] pid=");
+                __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
+                c3_trace_task_name(cur);
+                __boot_serial_puts(" fd=");
+                __boot_serial_putu32((uint32_t)fd);
+                __boot_serial_puts(" ref=");
+                __boot_serial_putu32((uint32_t)sref);
+                __boot_serial_puts(" count=");
+                __boot_serial_putu32((uint32_t)rights_rc);
+                __boot_serial_puts("\n");
             }
         }
     }
@@ -11591,7 +21003,35 @@ int64_t real_sys_sendmsg(int fd,const void *msg,int flags){
     }else{
         out_rc=c3_sendmsg_iov(sref,mh->msg_iov,mh->msg_iovlen,flags);
     }
-    if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_virtual_service(sref)==SOCK_VIRT_NONE){
+    if(out_rc>0||rights_queued>0)c3_wake_socket_peer_waiters(sref,"sock-sendmsg");
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_sendmsg_ret_trace;
+        if(wf_sendmsg_ret_trace<160u){
+            socket_t *s=(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used)?&g_sockets[sref]:0;
+            ++wf_sendmsg_ret_trace;
+            __boot_serial_force_puts("[wf-sendmsg-ret!] #");
+            __boot_serial_force_putu32(wf_sendmsg_ret_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)sref);
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(out_rc);
+            if(s){
+                __boot_serial_force_puts(" rx=");
+                __boot_serial_force_putu32(c3_socket_rx_used(sref));
+                __boot_serial_force_puts(" peer_rx=");
+                __boot_serial_force_putu32(c3_socket_rx_used(s->peer));
+                __boot_serial_force_puts(" anc=");
+                __boot_serial_force_putu32((uint32_t)(uint8_t)(s->anc_head-s->anc_tail));
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(c3_task_is_browser_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(sref)){
         static uint32_t sendmsg_ret_trace=0;
         if(sendmsg_ret_trace<140){
             ++sendmsg_ret_trace;
@@ -11622,17 +21062,88 @@ int64_t real_sys_sendmsg(int fd,const void *msg,int flags){
 
 int64_t real_sys_recvmsg(int fd,void *msg,int flags){
     task_t *cur=task_current();
-    c3_msghdr_t *mh=(c3_msghdr_t*)msg;
+    c3_msghdr_t mh_local;
+    c3_msghdr_t *mh=&mh_local;
+    iovec_t iov_local[C3_MSG_IOV_LOCAL_MAX];
+    iovec_t *user_iov=0;
+    uint8_t control_local[C3_MSG_CONTROL_LOCAL_MAX];
+    void *user_control=0;
+    uint8_t name_local[128];
+    void *user_name=0;
+    uint32_t user_namelen=0;
+    uint32_t name_len=0;
     int sref;
     size_t ctrl_cap;
     size_t ctrl_used=0;
     int64_t rc;
     if(!fd_valid(&cur->fdt,fd)||cur->fdt.fds[fd].kind!=FDKIND_SOCKET)return -ENOTSOCK;
-    if(!mh)return -EFAULT;
+    if(!msg)return -EFAULT;
+    {
+        int cr=c3_msghdr_copy_in(cur,&mh_local,msg,
+                                 iov_local,C3_MSG_IOV_LOCAL_MAX,
+                                 control_local,sizeof(control_local),
+                                 &user_iov,&user_control,false,"recvmsg-header");
+        if(cr<0){
+            if(cur&&c3_task_is_wayfire_runtime(cur)){
+                static uint32_t wf_recvmsg_fault_trace;
+                if(wf_recvmsg_fault_trace<32u){
+                    ++wf_recvmsg_fault_trace;
+                    __boot_serial_force_puts("[wf-recvmsg-fault!] #");
+                    __boot_serial_force_putu32(wf_recvmsg_fault_trace);
+                    __boot_serial_force_puts(" stage=copyin pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" msg=");
+                    __boot_serial_force_puthex64((uint64_t)(uintptr_t)msg);
+                    __boot_serial_force_puts(" rc=");
+                    c3_force_rc(cr);
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            return cr;
+        }
+    }
+    user_name=mh->msg_name;
+    user_namelen=mh->msg_namelen;
     if(mh->msg_iovlen>C3_MSG_IOV_MAX)return -EINVAL;
     if(mh->msg_iovlen&&(!mh->msg_iov))return -EFAULT;
     sref=cur->fdt.fds[fd].ref;
-    if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_virtual_service(sref)==SOCK_VIRT_NONE){
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_recvmsg_entry_trace;
+        if(wf_recvmsg_entry_trace<180u){
+            socket_t *s=(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used)?&g_sockets[sref]:0;
+            ++wf_recvmsg_entry_trace;
+            __boot_serial_force_puts("[wf-recvmsg!] #");
+            __boot_serial_force_putu32(wf_recvmsg_entry_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)sref);
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+            __boot_serial_force_puts(" iovlen=");
+            __boot_serial_force_putu32((uint32_t)mh->msg_iovlen);
+            __boot_serial_force_puts(" ctrl=");
+            __boot_serial_force_puthex64((uint64_t)mh->msg_controllen);
+            if(s){
+                __boot_serial_force_puts(" peer=");
+                __boot_serial_force_putu32((uint32_t)s->peer);
+                __boot_serial_force_puts(" rx=");
+                __boot_serial_force_putu32(c3_socket_rx_used(sref));
+                __boot_serial_force_puts(" anc=");
+                __boot_serial_force_putu32((uint32_t)(uint8_t)(s->anc_head-s->anc_tail));
+                __boot_serial_force_puts(" st=");
+                __boot_serial_force_putu32((uint32_t)s->tcp_state);
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(c3_task_is_browser_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(sref)){
         static uint32_t recvmsg_entry_trace=0;
         if(recvmsg_entry_trace<140){
             socket_t *s=(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used)?&g_sockets[sref]:0;
@@ -11664,27 +21175,83 @@ int64_t real_sys_recvmsg(int fd,void *msg,int flags){
         }
     }
     if(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used&&g_sockets[sref].domain==16){
-        if(mh->msg_name){
+        uint8_t pkt[C3_MSG_SCRATCH_SIZE];
+        size_t cap=0,off=0,i;
+        int msg_flags=0;
+        int64_t nrc;
+        if(user_name){
             c3_sockaddr_nl_t *nl;
-            if(mh->msg_namelen<sizeof(c3_sockaddr_nl_t))return -EINVAL;
-            nl=(c3_sockaddr_nl_t*)mh->msg_name;
+            if(user_namelen<sizeof(c3_sockaddr_nl_t))return -EINVAL;
+            nl=(c3_sockaddr_nl_t*)name_local;
             c3_memset(nl,0,sizeof(*nl));
             nl->nl_family=16;
-            nl->nl_pid=(uint32_t)(cur?cur->pid:0);
+            nl->nl_pid=0;
             mh->msg_namelen=sizeof(*nl);
+            name_len=sizeof(*nl);
         }else{
             mh->msg_namelen=0;
         }
-        mh->msg_flags=0;
+        for(i=0;i<mh->msg_iovlen&&cap<sizeof(pkt);++i){
+            if(!mh->msg_iov[i].iov_len)continue;
+            if(!mh->msg_iov[i].iov_base)return -EFAULT;
+            cap+=mh->msg_iov[i].iov_len;
+            if(cap>sizeof(pkt))cap=sizeof(pkt);
+        }
+        if(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)flags|=C3_MSG_DONTWAIT;
+        for(;;){
+            nrc=c3_netlink_recv_kernel(sref,pkt,cap,flags,&msg_flags);
+            if(nrc!=-EAGAIN||flags&C3_MSG_DONTWAIT)break;
+            if(c3_task_has_unblocked_signal(cur))return -EINTR;
+            c3_poll_wait_slice(cur,0);
+        }
+        if(nrc<0)return nrc;
+        for(i=0;i<mh->msg_iovlen&&off<(size_t)nrc&&off<cap;++i){
+            size_t cp;
+            if(!mh->msg_iov[i].iov_len)continue;
+            cp=mh->msg_iov[i].iov_len;
+            if(cp>(size_t)nrc-off)cp=(size_t)nrc-off;
+            if(cp>cap-off)cp=cap-off;
+            if(cp&&c3_user_copy_out(cur,mh->msg_iov[i].iov_base,pkt+off,cp,
+                                    "netlink-recvmsg")<0)return -EFAULT;
+            off+=cp;
+        }
+        mh->msg_flags=msg_flags;
         mh->msg_controllen=0;
-        (void)flags;
-        return -EAGAIN;
+        if(c3_msghdr_copy_recv_out(cur,msg,mh,user_name,user_namelen,
+                                   name_local,name_len,user_iov,
+                                   user_control,control_local,0)<0)
+            return -EFAULT;
+        if(cur&&((c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur))||
+                 c3_dbus_debug_trace_enabled())){
+            static uint32_t trace_count;
+            if(trace_count<48u){
+                ++trace_count;
+                __boot_serial_force_puts("[netlink-recvmsg] #");
+                __boot_serial_force_putu32(trace_count);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" ref=");
+                __boot_serial_force_putu32((uint32_t)sref);
+                __boot_serial_force_puts(" rc=");
+                c3_force_rc(nrc);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)msg_flags);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return nrc;
     }
-    if(mh->msg_name){
-        uint32_t nlen=mh->msg_namelen;
-        int64_t nrc=real_sys_getpeername(fd,mh->msg_name,&nlen);
+    if(user_name){
+        uint32_t nlen=user_namelen;
+        int64_t nrc;
+        if(nlen>sizeof(name_local))nlen=sizeof(name_local);
+        nrc=real_sys_getpeername(fd,name_local,&nlen);
         if(nrc<0)return nrc;
         mh->msg_namelen=nlen;
+        name_len=nlen;
     }else{
         mh->msg_namelen=0;
     }
@@ -11727,7 +21294,7 @@ int64_t real_sys_recvmsg(int fd,void *msg,int flags){
     }
     if(!mh->msg_iovlen){
         if(mh->msg_control&&ctrl_cap>=sizeof(c3_cmsghdr_t))mh->msg_controllen=ctrl_used;
-        if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_virtual_service(sref)==SOCK_VIRT_NONE){
+        if(c3_task_is_browser_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(sref)){
             static uint32_t recvmsg_zero_trace=0;
             if(recvmsg_zero_trace<80){
                 ++recvmsg_zero_trace;
@@ -11743,14 +21310,109 @@ int64_t real_sys_recvmsg(int fd,void *msg,int flags){
                 __boot_serial_puts("\n");
             }
         }
+        if(c3_msghdr_copy_recv_out(cur,msg,mh,user_name,user_namelen,
+                                   name_local,name_len,user_iov,
+                                   user_control,control_local,mh->msg_controllen)<0){
+            if(cur&&c3_task_is_wayfire_runtime(cur)){
+                static uint32_t wf_recvmsg_fault_trace;
+                if(wf_recvmsg_fault_trace<32u){
+                    ++wf_recvmsg_fault_trace;
+                    __boot_serial_force_puts("[wf-recvmsg-fault!] #");
+                    __boot_serial_force_putu32(wf_recvmsg_fault_trace);
+                    __boot_serial_force_puts(" stage=copyout0 pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)fd);
+                    __boot_serial_force_puts(" msg=");
+                    __boot_serial_force_puthex64((uint64_t)(uintptr_t)msg);
+                    __boot_serial_force_puts(" ctrl=");
+                    __boot_serial_force_puthex64((uint64_t)(uintptr_t)user_control);
+                    __boot_serial_force_puts(" ctrl_len=");
+                    __boot_serial_force_puthex64((uint64_t)mh->msg_controllen);
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            return -EFAULT;
+        }
         return 0;
     }
     if(cur->fdt.fds[fd].flags&FDFL_NONBLOCK)flags|=C3_MSG_DONTWAIT;
     rc=c3_recvmsg_iov(sref,mh->msg_iov,mh->msg_iovlen,flags);
+    if(rc>0)c3_wake_socket_peer_waiters(sref,"sock-recvmsg");
     if(mh->msg_control&&ctrl_cap>=sizeof(c3_cmsghdr_t))mh->msg_controllen=ctrl_used;
     else mh->msg_controllen=0;
+    if(rc>=0&&c3_msghdr_copy_recv_out(cur,msg,mh,user_name,user_namelen,
+                                      name_local,name_len,user_iov,
+                                      user_control,control_local,mh->msg_controllen)<0){
+        if(cur&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t wf_recvmsg_fault_trace;
+            if(wf_recvmsg_fault_trace<32u){
+                ++wf_recvmsg_fault_trace;
+                __boot_serial_force_puts("[wf-recvmsg-fault!] #");
+                __boot_serial_force_putu32(wf_recvmsg_fault_trace);
+                __boot_serial_force_puts(" stage=copyout pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" rc=");
+                c3_force_rc(rc);
+                __boot_serial_force_puts(" msg=");
+                __boot_serial_force_puthex64((uint64_t)(uintptr_t)msg);
+                __boot_serial_force_puts(" ctrl=");
+                __boot_serial_force_puthex64((uint64_t)(uintptr_t)user_control);
+                __boot_serial_force_puts(" ctrl_len=");
+                __boot_serial_force_puthex64((uint64_t)mh->msg_controllen);
+                __boot_serial_force_puts("\n");
+            }
+        }
+        return -EFAULT;
+    }
     c3_trace_firefox_ipc_recv_payload(cur,fd,rc,mh);
-    if(c3_task_is_firefox_ipc_trace(cur)&&c3_socket_ref_virtual_service(sref)==SOCK_VIRT_NONE){
+    if(rc>0&&cur&&c3_dbus_debug_trace_enabled()&&!c3_wayfire_debug_trace_enabled()&&
+       c3_task_is_wayfire_runtime(cur)){
+        c3_trace_dbus_iov("rx",cur,fd,sref,mh->msg_iov,mh->msg_iovlen,(size_t)rc);
+    }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        if(rc>0)c3_trace_wayland_iov("rx",cur,fd,sref,mh->msg_iov,mh->msg_iovlen,(size_t)rc);
+        if(rc>0)c3_trace_dbus_iov("rx",cur,fd,sref,mh->msg_iov,mh->msg_iovlen,(size_t)rc);
+        static uint32_t wf_recvmsg_ret_trace;
+        if(wf_recvmsg_ret_trace<180u){
+            socket_t *s=(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used)?&g_sockets[sref]:0;
+            uint64_t b0=0;
+            size_t bi,lim=(rc>0&&(size_t)rc<8)?(size_t)rc:8;
+            if(rc<=0)lim=0;
+            if(mh->msg_iov&&mh->msg_iovlen&&mh->msg_iov[0].iov_base){
+                const uint8_t *rb=(const uint8_t*)mh->msg_iov[0].iov_base;
+                for(bi=0;bi<lim;++bi)b0|=((uint64_t)rb[bi])<<(bi*8);
+            }
+            ++wf_recvmsg_ret_trace;
+            __boot_serial_force_puts("[wf-recvmsg-ret!] #");
+            __boot_serial_force_putu32(wf_recvmsg_ret_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)sref);
+            __boot_serial_force_puts(" rc=");
+            c3_force_rc(rc);
+            __boot_serial_force_puts(" ctrl=");
+            __boot_serial_force_puthex64((uint64_t)mh->msg_controllen);
+            if(s){
+                __boot_serial_force_puts(" rx_after=");
+                __boot_serial_force_putu32(c3_socket_rx_used(sref));
+                __boot_serial_force_puts(" anc_after=");
+                __boot_serial_force_putu32((uint32_t)(uint8_t)(s->anc_head-s->anc_tail));
+            }
+            __boot_serial_force_puts(" b0=");
+            __boot_serial_force_puthex64(b0);
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(c3_task_is_browser_ipc_trace(cur)&&c3_socket_ref_should_trace_browser_io(sref)){
         static uint32_t recvmsg_ret_trace=0;
         if(recvmsg_ret_trace<140){
             socket_t *s=(sref>=0&&sref<SOCK_MAX&&g_sockets[sref].used)?&g_sockets[sref]:0;
@@ -11810,7 +21472,7 @@ int64_t real_sys_recvmmsg(int fd,void *vmessages,unsigned int vlen,unsigned int 
         if(timeout->tv_sec<0||timeout->tv_nsec<0||timeout->tv_nsec>=1000000000LL)return -EINVAL;
         if(timeout->tv_sec||timeout->tv_nsec){
             uint64_t ns=(uint64_t)timeout->tv_sec*1000000000ULL+(uint64_t)timeout->tv_nsec;
-            deadline=c3_rdtsc()+(ns*g_tsc_freq_approx)/1000000000ULL;
+            deadline=c3_add_sat_u64(c3_rdtsc(),c3_muldiv_u64_sat(ns,g_tsc_freq_approx,1000000000ULL));
         }else{
             rflags|=C3_MSG_DONTWAIT;
         }
@@ -11854,13 +21516,14 @@ int64_t real_sys_recvmmsg(int fd,void *vmessages,unsigned int vlen,unsigned int 
 #define C3_CLOCK_BOOTTIME            7
 #define C3_REALTIME_BOOT_EPOCH_SEC   1777248000LL /* 2026-04-27 00:00:00 UTC */
 
-static uint64_t tsc_to_ns(uint64_t tsc){return tsc*1000000000ULL/g_tsc_freq_approx;}
+static uint64_t tsc_to_ns(uint64_t tsc){return c3_muldiv_u64_sat(tsc,1000000000ULL,g_tsc_freq_approx);}
 
 int64_t real_sys_clock_gettime(int clockid,timespec_t *tp){
     uint64_t elapsed_ns;
     if(!tp)return -EFAULT;
     if(!g_boot_tsc)g_boot_tsc=c3_rdtsc();
-    elapsed_ns=tsc_to_ns(c3_rdtsc()-g_boot_tsc);
+    elapsed_ns=c3_kernel_monotonic_ns();
+    if(!elapsed_ns)elapsed_ns=tsc_to_ns(c3_rdtsc()-g_boot_tsc);
     switch(clockid){
         case C3_CLOCK_REALTIME:
         case C3_CLOCK_REALTIME_COARSE:
@@ -11932,13 +21595,13 @@ int64_t real_sys_nanosleep(const timespec_t *req,timespec_t *rem){
     ns=(uint64_t)req->tv_sec*1000000000ULL+(uint64_t)req->tv_nsec;
     ticks=ns/10000000ULL; /* ~10ms per tick */
     if(ticks<1&&ns)ticks=1;
-    deadline=c3_rdtsc()+ticks*g_tsc_freq_approx/100;
+    deadline=c3_add_sat_u64(c3_rdtsc(),c3_muldiv_u64_sat(ticks,g_tsc_freq_approx,100ULL));
     for(;;){
         now=c3_rdtsc();
         if(now>=deadline)break;
         if(c3_task_has_unblocked_signal(cur)){
             if(rem){
-                uint64_t left_ns=(deadline>now)?((deadline-now)*1000000000ULL/g_tsc_freq_approx):0;
+                uint64_t left_ns=(deadline>now)?tsc_to_ns(deadline-now):0;
                 rem->tv_sec=(int64_t)(left_ns/1000000000ULL);
                 rem->tv_nsec=(int64_t)(left_ns%1000000000ULL);
             }
@@ -12108,6 +21771,131 @@ int64_t real_sys_prlimit64(int pid,int resource,const void *new_rlim,void *old_r
     return 0;
 }
 
+#define C3_RSEQ_FLAG_UNREGISTER 1u
+#define C3_RSEQ_UNREGISTERED_CPU 0xFFFFFFFFu
+#define C3_MEMBARRIER_CMD_QUERY 0
+#define C3_MEMBARRIER_CMD_PRIVATE_EXPEDITED (1<<3)
+#define C3_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED (1<<4)
+#define C3_MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE (1<<5)
+
+static int c3_current_task_index_live(void){
+    if(g_current_task<0||g_current_task>=TASK_MAX)return -1;
+    if(!g_tasks[g_current_task].used)return -1;
+    return g_current_task;
+}
+
+static void c3_rseq_forget_task(int tidx){
+    if(tidx<0||tidx>=TASK_MAX)return;
+    c3_memset(&g_c3_rseq_state[tidx],0,sizeof(g_c3_rseq_state[tidx]));
+    g_c3_membarrier_reg[tidx]=0;
+}
+
+static void c3_rseq_reset_if_stale(int tidx,const task_t *cur){
+    if(tidx<0||tidx>=TASK_MAX||!cur)return;
+    if(g_c3_rseq_state[tidx].registered&&g_c3_rseq_state[tidx].owner_pid!=cur->pid)
+        c3_rseq_forget_task(tidx);
+}
+
+static void c3_rseq_publish_cpu(int tidx,uint32_t cpu){
+    c3_rseq_state_t *st;
+    c3_rseq_user_t *usr;
+    if(tidx<0||tidx>=TASK_MAX)return;
+    st=&g_c3_rseq_state[tidx];
+    if(!st->registered||!st->user_ptr||st->user_len<sizeof(uint32_t)*2)return;
+    usr=(c3_rseq_user_t*)(uintptr_t)st->user_ptr;
+    usr->cpu_id_start=cpu;
+    usr->cpu_id=cpu;
+}
+
+static void c3_rseq_mark_unregistered(int tidx){
+    c3_rseq_state_t *st;
+    c3_rseq_user_t *usr;
+    if(tidx<0||tidx>=TASK_MAX)return;
+    st=&g_c3_rseq_state[tidx];
+    if(st->user_ptr&&st->user_len>=sizeof(uint32_t)*2){
+        usr=(c3_rseq_user_t*)(uintptr_t)st->user_ptr;
+        usr->cpu_id_start=C3_RSEQ_UNREGISTERED_CPU;
+        usr->cpu_id=C3_RSEQ_UNREGISTERED_CPU;
+    }
+    c3_rseq_forget_task(tidx);
+}
+
+int64_t real_sys_getcpu(uint32_t *cpu,uint32_t *node,void *unused){
+    int tidx=c3_current_task_index_live();
+    (void)unused;
+    if(cpu)*cpu=0;
+    if(node)*node=0;
+    if(tidx>=0)c3_rseq_publish_cpu(tidx,0);
+    return 0;
+}
+
+int64_t real_sys_rseq(void *rseq,uint32_t rseq_len,int flags,uint32_t sig){
+    task_t *cur=task_current();
+    int tidx=c3_current_task_index_live();
+    c3_rseq_state_t *st;
+    c3_rseq_user_t *usr;
+    static uint32_t trace_count;
+    if(!cur||tidx<0)return -ESRCH;
+    if(!rseq)return -EFAULT;
+    if(rseq_len<sizeof(c3_rseq_user_t))return -EINVAL;
+    if(flags!=(int)0&&flags!=(int)C3_RSEQ_FLAG_UNREGISTER)return -EINVAL;
+    c3_rseq_reset_if_stale(tidx,cur);
+    st=&g_c3_rseq_state[tidx];
+    if(flags&(int)C3_RSEQ_FLAG_UNREGISTER){
+        if(!st->registered)return -EINVAL;
+        if(st->user_ptr!=(uint64_t)(uintptr_t)rseq)return -EINVAL;
+        c3_rseq_mark_unregistered(tidx);
+        return 0;
+    }
+    if(st->registered){
+        if(st->user_ptr==(uint64_t)(uintptr_t)rseq)return 0;
+        return -EBUSY;
+    }
+    st->registered=1;
+    st->owner_pid=cur->pid;
+    st->user_ptr=(uint64_t)(uintptr_t)rseq;
+    st->user_len=rseq_len;
+    st->signature=sig;
+    usr=(c3_rseq_user_t*)rseq;
+    usr->cpu_id_start=0;
+    usr->cpu_id=0;
+    usr->rseq_cs=0;
+    usr->flags=0;
+    if(trace_count<32&&c3_task_is_wayfire_runtime(cur)){
+        ++trace_count;
+        __boot_serial_puts("[rseq] pid=");
+        __boot_serial_putu32((uint32_t)cur->pid);
+        c3_trace_task_name(cur);
+        __boot_serial_puts(" ptr=");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)rseq);
+        __boot_serial_puts(" len=");
+        __boot_serial_putu32(rseq_len);
+        __boot_serial_puts("\n");
+    }
+    return 0;
+}
+
+int64_t real_sys_membarrier(int cmd,int flags,int cpu_id){
+    int tidx=c3_current_task_index_live();
+    if(tidx<0)return -ESRCH;
+    if(flags!=0)return -EINVAL;
+    if(cpu_id!=0)return -EINVAL;
+    if(cmd==C3_MEMBARRIER_CMD_QUERY)
+        return C3_MEMBARRIER_CMD_PRIVATE_EXPEDITED|
+               C3_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED|
+               C3_MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE;
+    if(cmd==C3_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED){
+        g_c3_membarrier_reg[tidx]=1;
+        return 0;
+    }
+    if(cmd==C3_MEMBARRIER_CMD_PRIVATE_EXPEDITED||
+       cmd==C3_MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE){
+        if(!g_c3_membarrier_reg[tidx])return -EPERM;
+        return 0;
+    }
+    return -EINVAL;
+}
+
 typedef struct __attribute__((packed)){
     int64_t  f_type;
     int64_t  f_bsize;
@@ -12124,13 +21912,21 @@ typedef struct __attribute__((packed)){
 } c3_statfs_t;
 
 #define C3_TMPFS_MAGIC 0x01021994LL
+#define C3_SYSFS_MAGIC 0x62656572LL
+#define C3_PROC_SUPER_MAGIC 0x00009FA0LL
 
-static void c3_fill_statfs(c3_statfs_t *st){
+static int64_t c3_statfs_magic_for_path(const char *path){
+    if(path&&c3_starts_with(path,"/sys"))return C3_SYSFS_MAGIC;
+    if(path&&c3_starts_with(path,"/proc"))return C3_PROC_SUPER_MAGIC;
+    return C3_TMPFS_MAGIC;
+}
+
+static void c3_fill_statfs(c3_statfs_t *st,int64_t f_type){
     uint64_t free_pages=pmm_free_count();
     uint64_t total_pages=pmm_total_count();
     if(!st)return;
     c3_memset(st,0,sizeof(*st));
-    st->f_type=C3_TMPFS_MAGIC;
+    st->f_type=f_type;
     st->f_bsize=PAGE_SIZE;
     st->f_frsize=PAGE_SIZE;
     st->f_blocks=total_pages?total_pages:1;
@@ -12145,17 +21941,83 @@ static void c3_fill_statfs(c3_statfs_t *st){
 }
 
 int64_t real_sys_statfs(const char *path,void *buf){
+    task_t *cur=task_current();
+    char npath[VFS_PATH_MAX];
     if(!path||!buf)return -EFAULT;
-    c3_fill_statfs((c3_statfs_t*)buf);
+    if(c3_resolve_user_path(cur,AT_FDCWD,path,npath,sizeof(npath))<0)return -EINVAL;
+    c3_fill_statfs((c3_statfs_t*)buf,c3_statfs_magic_for_path(npath));
     return 0;
 }
 
 int64_t real_sys_fstatfs(int fd,void *buf){
     task_t *cur=task_current();
+    const char *path=0;
     if(!cur)return -ESRCH;
     if(!buf)return -EFAULT;
     if(fd<0||!fd_valid(&cur->fdt,fd))return -EBADF;
-    c3_fill_statfs((c3_statfs_t*)buf);
+    if(cur->fdt.fds[fd].kind==FDKIND_VFSFILE||
+       cur->fdt.fds[fd].kind==FDKIND_DIR||
+       cur->fdt.fds[fd].kind==FDKIND_SYMLINK)
+        path=c3_vfs_open_slot_path(cur->fdt.fds[fd].ref);
+    c3_fill_statfs((c3_statfs_t*)buf,c3_statfs_magic_for_path(path));
+    return 0;
+}
+
+int64_t real_sys_mount(const char *source,const char *target,const char *filesystemtype,
+                       unsigned long mountflags,const void *data){
+    task_t *cur=task_current();
+    char src[VFS_PATH_MAX];
+    char tgt[VFS_PATH_MAX];
+    char fs[64];
+    int i;
+    (void)mountflags;
+    (void)data;
+    if(!cur)return -ESRCH;
+    if(!target)return -EFAULT;
+    src[0]=0;
+    fs[0]=0;
+    if(source){
+        int rc=c3_copy_user_cstr_current(cur,source,src,sizeof(src),"mount-source");
+        if(rc<0)return rc;
+    }else{
+        c3_strlcpy(src,"none",sizeof(src));
+    }
+    if(filesystemtype){
+        int rc=c3_copy_user_cstr_current(cur,filesystemtype,fs,sizeof(fs),"mount-fstype");
+        if(rc<0)return rc;
+    }else{
+        c3_strlcpy(fs,"none",sizeof(fs));
+    }
+    if(c3_resolve_user_path(cur,AT_FDCWD,target,tgt,sizeof(tgt))<0)return -EINVAL;
+    if(!c3_path_is_dir(tgt))c3_ensure_dir_abs(tgt,0755);
+    if(!c3_path_is_dir(tgt))return -ENOENT;
+    for(i=0;i<g_mount_count;++i){
+        if(g_mounts[i].used&&c3_strcmp(g_mounts[i].target,tgt)==0)return 0;
+    }
+    if(!vfs_ext_mount(src[0]?src:"none",tgt,fs[0]?fs:"none")){
+        /* The compat mount table is only for proc visibility; a full table
+         * should not make a successful kernel-side virtual mount fail. */
+        return 0;
+    }
+    if(c3_starts_with(fs,"fuse")||c3_strcmp(tgt,"/run/user/1000/doc")==0){
+        kvfs_write("/run/user/1000/doc/.ridux-fuse-mounted","ok\n");
+    }
+    {
+        static uint32_t mount_trace;
+        if(mount_trace<24u){
+            ++mount_trace;
+            __boot_serial_puts("[mount] pid=");
+            __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
+            c3_trace_task_name(cur);
+            __boot_serial_puts(" src=");
+            __boot_serial_puts(src[0]?src:"none");
+            __boot_serial_puts(" target=");
+            __boot_serial_puts(tgt);
+            __boot_serial_puts(" fs=");
+            __boot_serial_puts(fs[0]?fs:"none");
+            __boot_serial_puts("\n");
+        }
+    }
     return 0;
 }
 
@@ -12179,6 +22041,7 @@ int64_t real_sys_readahead(int fd,uint64_t offset,size_t count){
 #define PR_SET_NO_NEW_PRIVS 38
 #define PR_GET_NO_NEW_PRIVS 39
 #define PR_SET_PTRACER 0x59616d61
+#define PR_SET_VMA 0x53564d41
 
 #define C3_SECCOMP_SET_MODE_STRICT 0u
 #define C3_SECCOMP_SET_MODE_FILTER 1u
@@ -12425,7 +22288,7 @@ int64_t real_sys_prctl(int option,uint64_t a2,uint64_t a3,uint64_t a4,uint64_t a
                     __boot_serial_puts("\n");
                 }
             }
-            {
+            if(c3_wayfire_debug_trace_enabled()){
                 static uint32_t trace_count=0;
                 if(trace_count<64){
                     ++trace_count;
@@ -12456,6 +22319,13 @@ int64_t real_sys_prctl(int option,uint64_t a2,uint64_t a3,uint64_t a4,uint64_t a
             return 0;
         case PR_SET_PTRACER:
             return 0;
+        case PR_SET_VMA:
+            /*
+             * glibc usa esto para ponerle nombre a rangos anonimos de mmap.
+             * No cambia permisos ni memoria, asi que para Ridux alcanza con
+             * aceptarlo y seguir.
+             */
+            return 0;
     }
     return -EINVAL;
 }
@@ -12468,9 +22338,25 @@ int64_t real_sys_prctl(int option,uint64_t a2,uint64_t a3,uint64_t a4,uint64_t a
 int64_t real_sys_arch_prctl(int code,uint64_t addr){
     task_t *cur=task_current();
     static uint32_t trace_count=0;
+    static uint32_t desktop_preempt_trace_count=0;
     switch(code){
         case ARCH_SET_FS: cur->ctx.fs_base=addr;
-            if(trace_count<32){
+    if(cur&&cur->no_timer_preempt&&c3_task_is_wayfire_runtime(cur)){
+        bool enable_timer_preempt = true;
+        cur->no_timer_preempt=false;
+        if(c3_wayfire_debug_trace_enabled()&&desktop_preempt_trace_count<64){
+                    ++desktop_preempt_trace_count;
+                    __boot_serial_puts(enable_timer_preempt ?
+                        "[desktop-loader-preempt-enable] pid=" :
+                        "[desktop-loader-preempt-keep-coop] pid=");
+                    __boot_serial_putu32((uint32_t)cur->pid);
+                    c3_trace_task_name(cur);
+                    __boot_serial_puts(" fs=");
+                    __boot_serial_puthex64(addr);
+                    __boot_serial_puts("\n");
+                }
+            }
+            if(c3_syscall_debug_trace_enabled()&&trace_count<32){
                 ++trace_count;
                 __boot_serial_puts("[arch_prctl] pid=");
                 __boot_serial_putu32((uint32_t)(cur?cur->pid:0));
@@ -12482,7 +22368,7 @@ int64_t real_sys_arch_prctl(int code,uint64_t addr){
             {uint32_t lo=(uint32_t)addr,hi=(uint32_t)(addr>>32);
              __asm__ volatile("wrmsr"::"c"(0xC0000100u),"a"(lo),"d"(hi));}return 0;
         case ARCH_SET_GS: cur->ctx.gs_base=addr;
-            if(trace_count<32){
+            if(c3_syscall_debug_trace_enabled()&&trace_count<32){
                 ++trace_count;
                 __boot_serial_puts("[arch_prctl] pid=");
                 __boot_serial_putu32((uint32_t)(cur?cur->pid:0));
@@ -12511,7 +22397,7 @@ int64_t real_sys_set_robust_list(uint64_t head,size_t len){
     if(!cur)return -ESRCH;
     cur->robust_list_head=head;
     cur->robust_list_len=len;
-    {
+    if(c3_syscall_debug_trace_enabled()){
         static uint32_t trace_count=0;
         if(trace_count<32){
             ++trace_count;
@@ -12551,6 +22437,26 @@ int64_t real_sys_get_robust_list(int pid,uint64_t *head,size_t *len){
 #define C3_FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFu
 #define C3_FUTEX_OP_OPARG_SHIFT 8u
 #define C3_FUTEX_SPURIOUS_STALLS 0xFFFFFFFFu
+
+static volatile int g_c3_futex_table_lock=0;
+static volatile int g_c3_futex_table_lock_owner=0;
+
+static void c3_futex_table_lock_acquire(task_t *cur){
+    uint32_t spins=0;
+    while(__sync_lock_test_and_set(&g_c3_futex_table_lock,1)){
+        if((spins++&0x3fU)==0){
+            task_schedule();
+        }else{
+            __asm__ volatile("pause");
+        }
+    }
+    g_c3_futex_table_lock_owner=cur?cur->pid:0;
+}
+
+static void c3_futex_table_lock_release(void){
+    g_c3_futex_table_lock_owner=0;
+    __sync_lock_release(&g_c3_futex_table_lock);
+}
 
 static uint32_t c3_futex_hash(uint32_t *uaddr,uintptr_t mm_key){
     uintptr_t x=(uintptr_t)uaddr;
@@ -12622,7 +22528,7 @@ static void c3_futex_waiter_remove_task_uaddr(int task_index,uint32_t *uaddr,uin
     }
 }
 
-static uint32_t c3_futex_wake_n(uint32_t *uaddr,uint32_t want,uintptr_t mm_key,bool exact_key,uint32_t bitset){
+static uint32_t c3_futex_wake_n_unlocked(uint32_t *uaddr,uint32_t want,uintptr_t mm_key,bool exact_key,uint32_t bitset){
     uint32_t woken=0;
     uint32_t b;
     int prev=-1,it;
@@ -12637,8 +22543,20 @@ static uint32_t c3_futex_wake_n(uint32_t *uaddr,uint32_t want,uintptr_t mm_key,b
             ti=g_c3_futex_waiters[i].task_index;
             c3_futex_waiter_remove_idx(i);
             if(ti>=0&&ti<TASK_MAX&&g_tasks[ti].used&&g_tasks[ti].state==TASK_SLEEPING){
-                g_tasks[ti].sleep_until=0;
-                g_tasks[ti].state=TASK_RUNNABLE;
+                bool ok=task_make_runnable(ti);
+                if(!ok&&c3_wayfire_debug_trace_enabled()&&
+                   (c3_has_token(g_tasks[ti].name,"xdg-document-portal")||
+                    c3_has_token(g_tasks[ti].name,"xdg-desktop-portal")||
+                    c3_has_token(g_tasks[ti].name,"fuse"))){
+                    __boot_serial_force_puts("[futex-wake-runnable-fail!] ti=");
+                    __boot_serial_force_putu32((uint32_t)ti);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)g_tasks[ti].pid);
+                    c3_force_task_name(&g_tasks[ti]);
+                    __boot_serial_force_puts(" ksp=");
+                    __boot_serial_force_puthex64(g_tasks[ti].kernel_rsp_saved);
+                    __boot_serial_force_puts("\n");
+                }
             }
             ++woken;
         }
@@ -12661,8 +22579,20 @@ static uint32_t c3_futex_wake_n(uint32_t *uaddr,uint32_t want,uintptr_t mm_key,b
             g_c3_futex_waiters[it].next=-1;
             g_c3_futex_waiters[it].seq=0;
             if(ti>=0&&ti<TASK_MAX&&g_tasks[ti].used&&g_tasks[ti].state==TASK_SLEEPING){
-                g_tasks[ti].sleep_until=0;
-                g_tasks[ti].state=TASK_RUNNABLE;
+                bool ok=task_make_runnable(ti);
+                if(!ok&&c3_wayfire_debug_trace_enabled()&&
+                   (c3_has_token(g_tasks[ti].name,"xdg-document-portal")||
+                    c3_has_token(g_tasks[ti].name,"xdg-desktop-portal")||
+                    c3_has_token(g_tasks[ti].name,"fuse"))){
+                    __boot_serial_force_puts("[futex-wake-runnable-fail!] ti=");
+                    __boot_serial_force_putu32((uint32_t)ti);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)g_tasks[ti].pid);
+                    c3_force_task_name(&g_tasks[ti]);
+                    __boot_serial_force_puts(" ksp=");
+                    __boot_serial_force_puthex64(g_tasks[ti].kernel_rsp_saved);
+                    __boot_serial_force_puts("\n");
+                }
             }
             ++woken;
         }else{
@@ -12670,6 +22600,14 @@ static uint32_t c3_futex_wake_n(uint32_t *uaddr,uint32_t want,uintptr_t mm_key,b
         }
         it=next;
     }
+    return woken;
+}
+
+static uint32_t c3_futex_wake_n(uint32_t *uaddr,uint32_t want,uintptr_t mm_key,bool exact_key,uint32_t bitset){
+    uint32_t woken;
+    c3_futex_table_lock_acquire(task_current());
+    woken=c3_futex_wake_n_unlocked(uaddr,want,mm_key,exact_key,bitset);
+    c3_futex_table_lock_release();
     return woken;
 }
 
@@ -12751,7 +22689,7 @@ static uint64_t c3_futex_timeout_deadline(const timespec_t *timeout,bool absolut
         add_ns=(uint64_t)timeout->tv_sec*1000000000ULL+(uint64_t)timeout->tv_nsec;
     }
     if(!add_ns)return c3_rdtsc();
-    return c3_rdtsc()+(add_ns*g_tsc_freq_approx)/1000000000ULL;
+    return c3_add_sat_u64(c3_rdtsc(),c3_muldiv_u64_sat(add_ns,g_tsc_freq_approx,1000000000ULL));
 }
 
 static uint32_t c3_futex_waiter_count(uint32_t *uaddr,uintptr_t mm_key,bool exact_key,uint32_t bitset){
@@ -12770,10 +22708,21 @@ static uint32_t c3_futex_waiter_count(uint32_t *uaddr,uintptr_t mm_key,bool exac
 static void c3_futex_trace_wake(const char *tag,const task_t *cur,int op,uint32_t *uaddr,uint32_t want,
                                 uint32_t before,uint32_t exact_woken,uint32_t broad_woken,uint32_t *uaddr2,uint32_t aux){
     static uint32_t trace_count=0;
+    static uint32_t portal_trace_count=0;
     uint64_t ret0=0;
-    if(trace_count>=8)return;
+    bool portal_trace=cur&&(c3_has_token(cur->name,"xdg-document-portal")||
+                            c3_has_token(cur->name,"xdg-desktop-portal")||
+                            c3_has_token(cur->name,"fuse")||
+                            c3_has_token(cur->name,"gdbus"));
+    if(!c3_wayfire_debug_trace_enabled())return;
+    if(portal_trace){
+        if(portal_trace_count>=96)return;
+        ++portal_trace_count;
+    }else{
+        if(trace_count>=8)return;
+        ++trace_count;
+    }
     if(cur&&cur->ctx.rsp>=0x10000ULL)ret0=*(uint64_t*)(uintptr_t)cur->ctx.rsp;
-    ++trace_count;
     __boot_serial_puts("[futex-");
     __boot_serial_puts(tag?tag:"wake");
     __boot_serial_puts("] pid=");
@@ -12808,6 +22757,7 @@ static void c3_futex_trace_stall(const task_t *cur,uint32_t *uaddr,int op,uint32
     static uint32_t trace_count=0;
     uint64_t ret0=0;
     int i;
+    if(!c3_wayfire_debug_trace_enabled())return;
     if(trace_count>=4)return;
     if(cur&&cur->ctx.rsp>=0x10000ULL)ret0=*(uint64_t*)(uintptr_t)cur->ctx.rsp;
     ++trace_count;
@@ -12845,14 +22795,26 @@ static void c3_futex_trace_wait_event(const char *stage,const task_t *cur,int op
                                       uint32_t val,uint32_t seen,const timespec_t *timeout,
                                       uint64_t deadline,uint32_t bitset,const char *reason){
     static uint32_t trace_count=0;
+    static uint32_t portal_trace_count=0;
     uint64_t user_rip=0;
     uint64_t user_rsp=0;
     uint64_t stk[28];
     int stk_n=0;
     int i;
+    bool portal_trace=cur&&(c3_has_token(cur->name,"xdg-document-portal")||
+                            c3_has_token(cur->name,"xdg-desktop-portal")||
+                            c3_has_token(cur->name,"fuse")||
+                            c3_has_token(cur->name,"gdbus"));
     if(!cur)return;
-    if(cur->pid!=2&&cur->pid!=6&&cur->pid!=7&&cur->pid!=8)return;
-    if(trace_count>=8)return;
+    if(!c3_wayfire_debug_trace_enabled())return;
+    if(!c3_task_is_wayfire_runtime(cur))return;
+    if(portal_trace){
+        if(portal_trace_count>=160)return;
+        ++portal_trace_count;
+    }else{
+        if(trace_count>=64)return;
+        ++trace_count;
+    }
     for(i=0;i<(int)(sizeof(stk)/sizeof(stk[0]));++i)stk[i]=0;
     {
         uint64_t *f=task_syscall_user_frame(cur);
@@ -12869,7 +22831,6 @@ static void c3_futex_trace_wait_event(const char *stage,const task_t *cur,int op
             }
         }
     }
-    ++trace_count;
     __boot_serial_puts("[futex-wait-");
     __boot_serial_puts(stage?stage:"?");
     __boot_serial_puts("] pid=");
@@ -12933,15 +22894,9 @@ int64_t real_sys_futex(uint32_t *uaddr,int op,uint32_t val,const timespec_t *tim
         uint32_t seen_now;
         const char *exit_reason=0;
         if(!cur)return -ESRCH;
-        seen_now=*uaddr;
-        if(seen_now!=val){
-            c3_futex_trace_wait_event("eagain",cur,op,uaddr,val,seen_now,timeout,0,bitset,"mismatch");
-            return -EAGAIN;
-        }
-        (void)seen_now;
         if(!timeout){
             static uint32_t coop_wait_trace=0;
-            if(coop_wait_trace<4){
+            if(c3_wayfire_debug_trace_enabled()&&coop_wait_trace<4){
                 int i;
                 ++coop_wait_trace;
                 __boot_serial_puts("[futex-coopwait] pid=");
@@ -12972,9 +22927,25 @@ int64_t real_sys_futex(uint32_t *uaddr,int op,uint32_t val,const timespec_t *tim
             if(!c3_timespec_valid(timeout))return -EINVAL;
             deadline=c3_futex_timeout_deadline(timeout,absolute_timeout,timeout_clock);
         }
+        /* Linux futex WAIT atomically checks the user value and queues the
+         * waiter before any matching WAKE can observe the futex. Ridux can
+         * preempt inside syscalls, so protect this check+queue pair; otherwise
+         * GLib condition variables can lose the portal/FUSE startup wake. */
+        c3_futex_table_lock_acquire(cur);
+        seen_now=*uaddr;
+        if(seen_now!=val){
+            c3_futex_table_lock_release();
+            c3_futex_trace_wait_event("eagain",cur,op,uaddr,val,seen_now,timeout,0,bitset,"mismatch");
+            return -EAGAIN;
+        }
         waiter_idx=c3_futex_waiter_add(uaddr,g_current_task,mm_key,bitset);
-        if(waiter_idx<0)return -EAGAIN;
+        if(waiter_idx<0){
+            c3_futex_table_lock_release();
+            return -EAGAIN;
+        }
         waiter_seq=g_c3_futex_waiters[waiter_idx].seq;
+        seen_now=*uaddr;
+        c3_futex_table_lock_release();
         c3_futex_trace_wait_event("enter",cur,op,uaddr,val,*uaddr,timeout,deadline,bitset,0);
         for(;;){
             if(!c3_futex_waiter_active(waiter_idx,waiter_seq)){exit_reason="woken";break;}
@@ -13229,6 +23200,7 @@ static void c3_inotify_notify_path(const char *path,uint32_t mask,uint32_t cooki
     char parent[VFS_PATH_MAX];
     char base[C3_INOTIFY_NAME_MAX];
     int i;
+    bool queued=false;
     if(!path||!*path||!mask)return;
     c3_path_dirname(path,parent,sizeof(parent));
     c3_inotify_basename(path,base,sizeof(base));
@@ -13240,25 +23212,34 @@ static void c3_inotify_notify_path(const char *path,uint32_t mask,uint32_t cooki
         if(w->inst_ref<0||w->inst_ref>=C3_INOTIFY_INST_MAX||!g_c3_inotify_inst[w->inst_ref].used)continue;
         if(c3_strcmp(w->path,path)==0){
             ev=mask&w->mask;
-            if(ev)c3_inotify_enqueue(w->inst_ref,w->wd,ev,cookie,0);
+            if(ev){
+                c3_inotify_enqueue(w->inst_ref,w->wd,ev,cookie,0);
+                queued=true;
+            }
             if((w->mask&C3_IN_ONESHOT)&&ev){
                 int32_t wd=w->wd;
                 w->used=false;
                 c3_inotify_enqueue(w->inst_ref,wd,C3_IN_IGNORED,0,0);
+                queued=true;
             }
             continue;
         }
         if(c3_strcmp(w->path,parent)==0){
             ev=mask&w->mask;
-            if(ev)c3_inotify_enqueue(w->inst_ref,w->wd,ev,cookie,base);
+            if(ev){
+                c3_inotify_enqueue(w->inst_ref,w->wd,ev,cookie,base);
+                queued=true;
+            }
             oneshot=(w->mask&C3_IN_ONESHOT)&&ev;
             if(oneshot){
                 int32_t wd=w->wd;
                 w->used=false;
                 c3_inotify_enqueue(w->inst_ref,wd,C3_IN_IGNORED,0,0);
+                queued=true;
             }
         }
     }
+    if(queued)c3_wake_fd_waiters(FDKIND_INOTIFY,-1,"inotify");
 }
 
 static int64_t c3_inotify_read(int ref,void *buf,size_t count,int flags){
@@ -13315,7 +23296,7 @@ static int c3_eventfd_alloc(uint64_t initval,bool semaphore){
         {
             static uint32_t trace_count=0;
             task_t *cur=task_current();
-            if(trace_count<32){
+            if(c3_wayfire_debug_trace_enabled()&&trace_count<32){
                 ++trace_count;
                 __boot_serial_puts("[eventfd-alloc] pid=");
                 __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
@@ -13354,7 +23335,7 @@ static int64_t c3_eventfd_read(int ref,void *buf,size_t count,int flags){
     while(!e->counter){
         if(flags&C3_MSG_DONTWAIT)return -EAGAIN;
         if(cur&&c3_task_has_unblocked_signal(cur))return -EINTR;
-        if(waits<8){
+        if(c3_wayfire_debug_trace_enabled()&&waits<8){
             ++waits;
             __boot_serial_puts("[eventfd-read-wait] pid=");
             __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
@@ -13375,6 +23356,22 @@ static int64_t c3_eventfd_read(int ref,void *buf,size_t count,int flags){
         e->counter=0;
     }
     c3_memcpy(buf,&v,sizeof(v));
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_ridux_qt_runtime(cur)){
+        static uint32_t trace_count=0;
+        if(trace_count<64){
+            ++trace_count;
+            __boot_serial_puts("[eventfd-read] pid=");
+            __boot_serial_putu32((uint32_t)cur->pid);
+            c3_trace_task_name(cur);
+            __boot_serial_puts(" ref=");
+            __boot_serial_putu32((uint32_t)ref);
+            __boot_serial_puts(" val=");
+            __boot_serial_puthex64(v);
+            __boot_serial_puts(" left=");
+            __boot_serial_puthex64(e->counter);
+            __boot_serial_puts("\n");
+        }
+    }
     return (int64_t)sizeof(v);
 }
 
@@ -13382,7 +23379,6 @@ static int64_t c3_eventfd_write(int ref,const void *buf,size_t count){
     c3_eventfd_t *e;
     uint64_t v;
     task_t *cur=task_current();
-    int i;
     if(ref<0||ref>=C3_EVENTFD_MAX||!g_c3_eventfds[ref].used)return -EBADF;
     if(!buf)return -EFAULT;
     if(count<sizeof(uint64_t))return -EINVAL;
@@ -13391,17 +23387,10 @@ static int64_t c3_eventfd_write(int ref,const void *buf,size_t count){
     e=&g_c3_eventfds[ref];
     if(e->counter>~0ULL-v)return -EAGAIN;
     e->counter+=v;
-    if(cur){
-        for(i=0;i<TASK_MAX;++i){
-            if(!g_tasks[i].used||g_tasks[i].state!=TASK_SLEEPING)continue;
-            if(g_tasks[i].addr_space!=cur->addr_space)continue;
-            g_tasks[i].sleep_until=0;
-            g_tasks[i].state=TASK_RUNNABLE;
-        }
-    }
+    c3_wake_fd_waiters(FDKIND_EVENTFD,ref,"eventfd");
     {
         static uint32_t trace_count=0;
-        if(trace_count<32){
+        if(c3_wayfire_debug_trace_enabled()&&trace_count<32){
             ++trace_count;
             __boot_serial_puts("[eventfd-write] pid=");
             __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
@@ -13425,7 +23414,7 @@ typedef struct {
 
 static uint64_t c3_ns_to_tsc(uint64_t ns){
     if(!ns||!g_tsc_freq_approx)return 0;
-    return (ns*g_tsc_freq_approx)/1000000000ULL;
+    return c3_muldiv_u64_sat(ns,g_tsc_freq_approx,1000000000ULL);
 }
 
 static uint64_t c3_timespec_to_ns(const timespec_t *ts){
@@ -13508,6 +23497,28 @@ static int64_t c3_timerfd_read_ready(int ref,void *buf,size_t count,int flags){
         expirations=c3_timerfd_consume_expired(t,now);
         if(!expirations)return 0;
     }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t timerfd_read_trace=0;
+        if(timerfd_read_trace<96u){
+            ++timerfd_read_trace;
+            __boot_serial_force_puts("[timerfd-read!] #");
+            __boot_serial_force_putu32(timerfd_read_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" exp=");
+            __boot_serial_force_puthex64(expirations);
+            __boot_serial_force_puts(" next=");
+            __boot_serial_force_puthex64(t->next_tsc);
+            __boot_serial_force_puts(" int=");
+            __boot_serial_force_puthex64(t->interval_tsc);
+            __boot_serial_force_puts(" armed=");
+            __boot_serial_force_putu32(t->armed?1u:0u);
+            __boot_serial_force_puts("\n");
+        }
+    }
     c3_memcpy(buf,&expirations,sizeof(expirations));
     return (int64_t)sizeof(expirations);
 }
@@ -13558,9 +23569,36 @@ static int64_t c3_timerfd_settime_ref(int ref,int flags,const void *nv,void *ov)
 
     t->interval_tsc=c3_ns_to_tsc(int_ns);
     if(int_ns&&t->interval_tsc==0)t->interval_tsc=1;
-    t->next_tsc=now_tsc+c3_ns_to_tsc(val_ns);
+    t->next_tsc=c3_add_sat_u64(now_tsc,c3_ns_to_tsc(val_ns));
     if(t->next_tsc<=now_tsc)t->next_tsc=now_tsc+1;
     t->armed=true;
+    {
+        task_t *cur=task_current();
+        if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t timerfd_set_trace=0;
+            if(timerfd_set_trace<96u){
+                ++timerfd_set_trace;
+                __boot_serial_force_puts("[timerfd-set!] #");
+                __boot_serial_force_putu32(timerfd_set_trace);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" ref=");
+                __boot_serial_force_putu32((uint32_t)ref);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+                __boot_serial_force_puts(" val_ns=");
+                __boot_serial_force_puthex64(val_ns);
+                __boot_serial_force_puts(" int_ns=");
+                __boot_serial_force_puthex64(int_ns);
+                __boot_serial_force_puts(" next=");
+                __boot_serial_force_puthex64(t->next_tsc);
+                __boot_serial_force_puts(" int=");
+                __boot_serial_force_puthex64(t->interval_tsc);
+                __boot_serial_force_puts("\n");
+            }
+        }
+    }
     return 0;
 }
 
@@ -13569,6 +23607,17 @@ static int c3_epoll_ref_from_fd(task_t *cur,int epfd){
     if(cur->fdt.fds[epfd].kind!=FDKIND_EPOLL)return -EBADF;
     if(cur->fdt.fds[epfd].ref<0||cur->fdt.fds[epfd].ref>=EPOLL_INSTANCES)return -EBADF;
     return cur->fdt.fds[epfd].ref;
+}
+
+static bool c3_pidfd_target_running(int pid){
+    int i;
+    if(pid<=0)return false;
+    for(i=0;i<TASK_MAX;++i){
+        if(!g_tasks[i].used)continue;
+        if(g_tasks[i].pid!=pid)continue;
+        return g_tasks[i].state!=TASK_ZOMBIE&&g_tasks[i].state!=TASK_FREE;
+    }
+    return false;
 }
 
 static uint32_t c3_fd_ready_mask(task_t *cur,int fd){
@@ -13585,14 +23634,17 @@ static uint32_t c3_fd_ready_mask(task_t *cur,int fd){
             if(fe->ref<0||fe->ref>=SOCK_MAX)return EPOLLERR|EPOLLHUP;
             s=&g_sockets[fe->ref];
             if(!s->used)return EPOLLERR|EPOLLHUP;
+            if(s->type==1&&net_is_real_external(s->remote_ip))c3_net_pump_once();
             rx=(size_t)(s->rx_head-s->rx_tail);
             if(rx>SOCK_BUF_SIZE)rx=SOCK_BUF_SIZE;
             aq=(int)((s->accept_head+SOCK_ACCEPTQ-s->accept_tail)%SOCK_ACCEPTQ);
             unix_peerless_idle=(s->domain==1&&s->peer<0&&s->virt_service==SOCK_VIRT_NONE&&
                                 !rx&&s->anc_head==s->anc_tail);
             if(rx||s->anc_head!=s->anc_tail||(s->tcp_state==TCP_LISTEN&&aq>0))m|=EPOLLIN;
+            if(s->shutdown_rx)m|=EPOLLIN|EPOLLHUP;
             if(s->type==1){
-                if((s->tcp_state==TCP_ESTABLISHED||s->tcp_state==TCP_SYN_SENT||s->tcp_state==TCP_LISTEN)&&
+                if(s->error)m|=EPOLLOUT|EPOLLERR;
+                if(s->tcp_state==TCP_ESTABLISHED&&!s->shutdown_tx&&
                    c3_socket_send_space(fe->ref)>0)m|=EPOLLOUT;
                 /*
                  * The tiny socket layer uses TCP_CLOSED both for real EOF and
@@ -13630,25 +23682,63 @@ static uint32_t c3_fd_ready_mask(task_t *cur,int fd){
         }
         case FDKIND_EVENTFD:
             if(fe->ref<0||fe->ref>=C3_EVENTFD_MAX||!g_c3_eventfds[fe->ref].used)return EPOLLERR|EPOLLHUP;
-            return (g_c3_eventfds[fe->ref].counter?EPOLLIN:0)|EPOLLOUT;
+            return (g_c3_eventfds[fe->ref].counter?EPOLLIN:0)|
+                   (g_c3_eventfds[fe->ref].counter<(~0ULL-1ULL)?EPOLLOUT:0);
         case FDKIND_TIMERFD:
             if(fe->ref<0||fe->ref>=C3_TIMERFD_MAX||!g_c3_timerfds[fe->ref].used)return EPOLLERR|EPOLLHUP;
-            return (c3_timerfd_is_ready(fe->ref,c3_rdtsc())?EPOLLIN:0)|EPOLLOUT;
-        case FDKIND_SIGNALFD: return c3_task_has_unblocked_signal(cur)?EPOLLIN:EPOLLOUT;
+            return c3_timerfd_is_ready(fe->ref,c3_rdtsc())?EPOLLIN:0;
+        case FDKIND_SIGNALFD:
+            return c3_task_has_unblocked_signal(cur)?EPOLLIN:0;
         case FDKIND_INOTIFY:
             if(fe->ref<0||fe->ref>=C3_INOTIFY_INST_MAX||!g_c3_inotify_inst[fe->ref].used)return EPOLLERR|EPOLLHUP;
             return c3_inotify_q_empty(&g_c3_inotify_inst[fe->ref])?0:EPOLLIN;
+        case FDKIND_EPOLL: {
+            epoll_instance_t *nested;
+            int i;
+            if(fe->ref<0||fe->ref>=EPOLL_INSTANCES||!g_epoll_instances[fe->ref].used)
+                return EPOLLERR|EPOLLHUP;
+            nested=&g_epoll_instances[fe->ref];
+            for(i=0;i<nested->count;++i){
+                uint32_t want,mask;
+                if(!nested->items[i].used)continue;
+                want=nested->items[i].events?nested->items[i].events:(EPOLLIN|EPOLLOUT);
+                mask=c3_fd_ready_mask(cur,nested->items[i].fd);
+                if(mask&(want|EPOLLERR|EPOLLHUP))
+                    return EPOLLIN;
+            }
+            return 0;
+        }
+        case FDKIND_DEVINPUT:
+            if(fe->ref==0)return (g_evdev_kbd.head!=g_evdev_kbd.tail)?EPOLLIN:0;
+            if(fe->ref==1)return (g_evdev_mouse.head!=g_evdev_mouse.tail)?EPOLLIN:0;
+            return 0;
+        case FDKIND_DEVFB:
+            if(fe->ref==1)
+                return c3_drm_event_has_fd(fd)?EPOLLIN:0;
+            if(fe->ref==2)
+                return 0;
+            return EPOLLIN|EPOLLOUT;
+        case FDKIND_DEVSND:
+            return EPOLLOUT;
+        case FDKIND_DEVFUSE:
+            return (fe->offset==0)?(EPOLLIN|EPOLLOUT):EPOLLOUT;
+        case FDKIND_PIDFD:
+            return c3_pidfd_target_running(fe->ref)?0:(EPOLLIN|EPOLLHUP);
         case FDKIND_VFSFILE:
         case FDKIND_DEVNULL:
         case FDKIND_DEVZERO:
         case FDKIND_DEVRANDOM:
-        case FDKIND_DEVFB:
         case FDKIND_DEVTTY:
         case FDKIND_PROC:
         case FDKIND_DIR:
             return EPOLLIN|EPOLLOUT;
         default: return EPOLLERR|EPOLLHUP;
     }
+}
+
+int64_t real_sys_epoll_create(int size){
+    if(size<=0)return -EINVAL;
+    return real_sys_epoll_create1(0);
 }
 
 int64_t real_sys_epoll_create1(int flags){
@@ -13663,7 +23753,7 @@ int64_t real_sys_epoll_create1(int flags){
         if(flags&O_CLOEXEC)ff|=FDFL_CLOEXEC;
         fd=c3_fd_alloc_for_task(cur,FDKIND_EPOLL,i,ff);
         if(fd<0){g_epoll_instances[i].used=false;return -EMFILE;}
-        {
+        if(c3_syscall_debug_trace_enabled()){
             static uint32_t trace_count=0;
             if(trace_count<24){
                 ++trace_count;
@@ -13691,7 +23781,79 @@ int64_t real_sys_epoll_ctl(int epfd,int op,int fd,void *event){
     if(ref<0)return ref;
     ep=&g_epoll_instances[ref];
     if((op==EPOLL_CTL_ADD||op==EPOLL_CTL_MOD)&&!fd_valid(&cur->fdt,fd))return -EBADF;
-    {
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_epoll_ctl_trace;
+        if(wf_epoll_ctl_trace<160u){
+            uint8_t kind=0;
+            int item_ref=-1;
+            uint32_t events=ev?ev->events:0;
+            uint32_t mask=0;
+            if(fd_valid(&cur->fdt,fd)){
+                kind=cur->fdt.fds[fd].kind;
+                item_ref=cur->fdt.fds[fd].ref;
+                mask=c3_fd_ready_mask(cur,fd);
+            }
+            ++wf_epoll_ctl_trace;
+            __boot_serial_force_puts("[wf-epoll-ctl!] #");
+            __boot_serial_force_putu32(wf_epoll_ctl_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" epfd=");
+            __boot_serial_force_putu32((uint32_t)epfd);
+            __boot_serial_force_puts(" op=");
+            __boot_serial_force_putu32((uint32_t)op);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)fd);
+            __boot_serial_force_puts(" kind=");
+            __boot_serial_force_putu32((uint32_t)kind);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)item_ref);
+            __boot_serial_force_puts(" ev=");
+            __boot_serial_force_puthex64((uint64_t)events);
+            __boot_serial_force_puts(" mask=");
+            __boot_serial_force_puthex64((uint64_t)mask);
+            if(ev){
+                __boot_serial_force_puts(" data=");
+                __boot_serial_force_puthex64(ev->data);
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&fd_valid(&cur->fdt,fd)){
+        uint8_t kind=cur->fdt.fds[fd].kind;
+        if(kind==FDKIND_DEVINPUT||kind==FDKIND_EPOLL){
+            static uint32_t wf_input_epoll_ctl_trace;
+            if(wf_input_epoll_ctl_trace<96u){
+                ++wf_input_epoll_ctl_trace;
+                __boot_serial_force_puts("[wf-input-epoll-ctl!] #");
+                __boot_serial_force_putu32(wf_input_epoll_ctl_trace);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" epfd=");
+                __boot_serial_force_putu32((uint32_t)epfd);
+                __boot_serial_force_puts(" op=");
+                __boot_serial_force_putu32((uint32_t)op);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" kind=");
+                __boot_serial_force_putu32((uint32_t)kind);
+                __boot_serial_force_puts(" ref=");
+                __boot_serial_force_putu32((uint32_t)cur->fdt.fds[fd].ref);
+                __boot_serial_force_puts(" ev=");
+                __boot_serial_force_puthex64((uint64_t)(ev?ev->events:0));
+                __boot_serial_force_puts(" mask=");
+                __boot_serial_force_puthex64((uint64_t)c3_fd_ready_mask(cur,fd));
+                if(ev){
+                    __boot_serial_force_puts(" data=");
+                    __boot_serial_force_puthex64(ev->data);
+                }
+                __boot_serial_force_puts("\n");
+            }
+        }
+    }
+    if(c3_syscall_debug_trace_enabled()){
         static uint32_t trace_count=0;
         if(trace_count<96){
             uint8_t kind=0;
@@ -13766,7 +23928,35 @@ int64_t real_sys_epoll_wait(int epfd,void *events,int maxevents,int timeout){
     if(!out)return -EFAULT;
     ep=&g_epoll_instances[ref];
     if(timeout>0)deadline=c3_dyn_deadline_from_ms((uint32_t)timeout);
-    {
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_epoll_wait_trace;
+        if(wf_epoll_wait_trace<160u){
+            ++wf_epoll_wait_trace;
+            __boot_serial_force_puts("[wf-epoll-wait!] #");
+            __boot_serial_force_putu32(wf_epoll_wait_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" epfd=");
+            __boot_serial_force_putu32((uint32_t)epfd);
+            __boot_serial_force_puts(" ref=");
+            __boot_serial_force_putu32((uint32_t)ref);
+            __boot_serial_force_puts(" count=");
+            __boot_serial_force_putu32((uint32_t)ep->count);
+            __boot_serial_force_puts(" timeout=");
+            __boot_serial_force_putu32((uint32_t)timeout);
+            if(ep->count>0&&ep->items[0].used){
+                __boot_serial_force_puts(" fd0=");
+                __boot_serial_force_putu32((uint32_t)ep->items[0].fd);
+                __boot_serial_force_puts(" ev0=");
+                __boot_serial_force_puthex64((uint64_t)ep->items[0].events);
+                __boot_serial_force_puts(" mask0=");
+                __boot_serial_force_puthex64((uint64_t)c3_fd_ready_mask(cur,ep->items[0].fd));
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
+    if(c3_syscall_debug_trace_enabled()){
         static uint32_t trace_count=0;
         if(trace_count<48){
             ++trace_count;
@@ -13793,15 +23983,64 @@ int64_t real_sys_epoll_wait(int epfd,void *events,int maxevents,int timeout){
         }
     }
     for(;;){
-        int i,n=0;
-        for(i=0;i<ep->count&&n<maxevents;++i){
+        int scan,n=0,last_ready=-1;
+        int count=ep->count;
+        int start=ep->next_scan;
+        if(count<0)count=0;
+        if(count>EPOLL_MAX_EVENTS)count=EPOLL_MAX_EVENTS;
+        if(start<0||start>=count)start=0;
+        for(scan=0;scan<count&&n<maxevents;++scan){
+            int i=(start+scan)%count;
             uint32_t want,mask,ready;
             if(!ep->items[i].used)continue;
             want=ep->items[i].events?ep->items[i].events:(EPOLLIN|EPOLLOUT);
             mask=c3_fd_ready_mask(cur,ep->items[i].fd);
             ready=mask&(want|EPOLLERR|EPOLLHUP);
             if(!ready)continue;
-            {
+            if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+                static uint32_t wf_epoll_ready_trace;
+                if(wf_epoll_ready_trace<220u){
+                    real_fd_t *fe=0;
+                    ++wf_epoll_ready_trace;
+                    if(fd_valid(&cur->fdt,ep->items[i].fd))fe=&cur->fdt.fds[ep->items[i].fd];
+                    __boot_serial_force_puts("[wf-epoll-ready!] #");
+                    __boot_serial_force_putu32(wf_epoll_ready_trace);
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)cur->pid);
+                    c3_force_task_name(cur);
+                    __boot_serial_force_puts(" epfd=");
+                    __boot_serial_force_putu32((uint32_t)epfd);
+                    __boot_serial_force_puts(" fd=");
+                    __boot_serial_force_putu32((uint32_t)ep->items[i].fd);
+                    __boot_serial_force_puts(" kind=");
+                    __boot_serial_force_putu32(fe?(uint32_t)fe->kind:0);
+                    __boot_serial_force_puts(" ref=");
+                    __boot_serial_force_putu32(fe?(uint32_t)fe->ref:0xFFFFFFFFu);
+                    __boot_serial_force_puts(" want=");
+                    __boot_serial_force_puthex64((uint64_t)want);
+                    __boot_serial_force_puts(" mask=");
+                    __boot_serial_force_puthex64((uint64_t)mask);
+                    __boot_serial_force_puts(" ready=");
+                    __boot_serial_force_puthex64((uint64_t)ready);
+                    __boot_serial_force_puts(" data=");
+                    __boot_serial_force_puthex64(ep->items[i].data);
+                    if(fe&&fe->kind==FDKIND_SOCKET&&fe->ref>=0&&fe->ref<SOCK_MAX&&g_sockets[fe->ref].used){
+                        socket_t *s=&g_sockets[fe->ref];
+                        __boot_serial_force_puts(" rx=");
+                        __boot_serial_force_putu32(c3_socket_rx_used(fe->ref));
+                        __boot_serial_force_puts(" anc=");
+                        __boot_serial_force_putu32((uint32_t)(uint8_t)(s->anc_head-s->anc_tail));
+                        __boot_serial_force_puts(" peer=");
+                        __boot_serial_force_putu32((uint32_t)s->peer);
+                        __boot_serial_force_puts(" svc=");
+                        __boot_serial_force_putu32((uint32_t)s->virt_service);
+                        __boot_serial_force_puts(" st=");
+                        __boot_serial_force_putu32((uint32_t)s->tcp_state);
+                    }
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            if(c3_syscall_debug_trace_enabled()){
                 static uint32_t ready_trace_count=0;
                 if(ready_trace_count<96){
                     real_fd_t *fe=0;
@@ -13871,9 +24110,13 @@ int64_t real_sys_epoll_wait(int epfd,void *events,int maxevents,int timeout){
             }
             out[n].events=ready;
             out[n].data=ep->items[i].data?ep->items[i].data:(uint64_t)(uint32_t)ep->items[i].fd;
+            last_ready=i;
             ++n;
         }
-        if(n>0)return n;
+        if(n>0){
+            if(count>0&&last_ready>=0)ep->next_scan=(last_ready+1)%count;
+            return n;
+        }
         if(timeout==0)return 0;
         if(c3_task_has_unblocked_signal(cur))return -EINTR;
         if(deadline&&c3_dyn_deadline_expired(deadline))return 0;
@@ -13886,13 +24129,16 @@ int64_t real_sys_poll(void *fds,uint64_t nfds,int timeout){
     c3_pollfd_t *pf=(c3_pollfd_t*)fds;
     uint64_t deadline=0;
     bool trace_this=false;
+    bool wf_trace_this=false;
     uint32_t trace_no=0;
+    uint32_t wf_trace_no=0;
     uint32_t trace_waits=0;
     static uint32_t poll_trace_count=0;
+    static uint32_t wf_poll_trace_count=0;
     if(nfds&&(!pf))return -EFAULT;
     if(nfds>4096)nfds=4096;
     if(timeout>0)deadline=c3_dyn_deadline_from_ms((uint32_t)timeout);
-    if(poll_trace_count<160){
+    if(c3_wayfire_debug_trace_enabled()&&poll_trace_count<160){
         trace_this=true;
         trace_no=++poll_trace_count;
         __boot_serial_puts("[poll] #");
@@ -13931,13 +24177,58 @@ int64_t real_sys_poll(void *fds,uint64_t nfds,int timeout){
         }
         __boot_serial_puts("\n");
     }
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)&&wf_poll_trace_count<240u){
+        uint64_t lim=nfds<3?nfds:3;
+        uint64_t j;
+        wf_trace_this=true;
+        wf_trace_no=++wf_poll_trace_count;
+        __boot_serial_force_puts("[wf-poll!] #");
+        __boot_serial_force_putu32(wf_trace_no);
+        __boot_serial_force_puts(" pid=");
+        __boot_serial_force_putu32((uint32_t)cur->pid);
+        c3_force_task_name(cur);
+        __boot_serial_force_puts(" nfds=");
+        __boot_serial_force_putu32((uint32_t)nfds);
+        __boot_serial_force_puts(" timeout=");
+        __boot_serial_force_putu32((uint32_t)timeout);
+        for(j=0;j<lim;++j){
+            __boot_serial_force_puts(" fd");
+            __boot_serial_force_putu32((uint32_t)j);
+            __boot_serial_force_puts("=");
+            __boot_serial_force_putu32((uint32_t)pf[j].fd);
+            __boot_serial_force_puts("/");
+            __boot_serial_force_puthex64((uint64_t)(uint16_t)pf[j].events);
+            if(fd_valid(&cur->fdt,pf[j].fd)){
+                real_fd_t *fe=&cur->fdt.fds[pf[j].fd];
+                __boot_serial_force_puts("/k");
+                __boot_serial_force_putu32((uint32_t)fe->kind);
+                __boot_serial_force_puts("r");
+                __boot_serial_force_putu32((uint32_t)fe->ref);
+                __boot_serial_force_puts("m");
+                __boot_serial_force_puthex64((uint64_t)c3_fd_ready_mask(cur,pf[j].fd));
+            }
+        }
+        __boot_serial_force_puts("\n");
+    }
     for(;;){
         uint64_t i,ready=0;
         uint32_t mask0=0,want0=0,rev0=0;
+        cur=task_current();
+        if(!cur)return -ESRCH;
         for(i=0;i<nfds;++i){
             uint32_t mask;
             uint32_t want;
             if(pf[i].fd<0){pf[i].revents=0;continue;}
+            if(!fd_valid(&cur->fdt,pf[i].fd)){
+                pf[i].revents=(short)C3_POLLNVAL;
+                if(i==0){
+                    mask0=0;
+                    want0=(uint16_t)pf[i].events;
+                    rev0=C3_POLLNVAL;
+                }
+                ++ready;
+                continue;
+            }
             mask=c3_fd_ready_mask(cur,pf[i].fd);
             want=(uint16_t)pf[i].events;
             pf[i].revents=(short)(mask&(want|C3_POLLERR|C3_POLLHUP));
@@ -13950,6 +24241,31 @@ int64_t real_sys_poll(void *fds,uint64_t nfds,int timeout){
         }
         if(ready){
             if(trace_this){
+                if(cur&&c3_task_is_ridux_qt_runtime(cur)){
+                    uint64_t j,lim=nfds<12?nfds:12;
+                    for(j=0;j<lim;++j){
+                        __boot_serial_puts("[poll-fd] #");
+                        __boot_serial_putu32(trace_no);
+                        __boot_serial_puts(" i=");
+                        __boot_serial_putu32((uint32_t)j);
+                        __boot_serial_puts(" fd=");
+                        __boot_serial_putu32((uint32_t)pf[j].fd);
+                        __boot_serial_puts(" ev=");
+                        __boot_serial_puthex64((uint64_t)(uint16_t)pf[j].events);
+                        __boot_serial_puts(" rev=");
+                        __boot_serial_puthex64((uint64_t)(uint16_t)pf[j].revents);
+                        if(fd_valid(&cur->fdt,pf[j].fd)){
+                            real_fd_t *fe=&cur->fdt.fds[pf[j].fd];
+                            __boot_serial_puts(" kind=");
+                            __boot_serial_putu32((uint32_t)fe->kind);
+                            __boot_serial_puts(" ref=");
+                            __boot_serial_putu32((uint32_t)fe->ref);
+                            __boot_serial_puts(" mask=");
+                            __boot_serial_puthex64((uint64_t)c3_fd_ready_mask(cur,pf[j].fd));
+                        }
+                        __boot_serial_puts("\n");
+                    }
+                }
                 __boot_serial_puts("[poll-ret] #");
                 __boot_serial_putu32(trace_no);
                 __boot_serial_puts(" ready=");
@@ -13961,6 +24277,19 @@ int64_t real_sys_poll(void *fds,uint64_t nfds,int timeout){
                 __boot_serial_puts(" rev0=");
                 __boot_serial_puthex64(rev0);
                 __boot_serial_puts("\n");
+            }
+            if(wf_trace_this){
+                __boot_serial_force_puts("[wf-poll-ret!] #");
+                __boot_serial_force_putu32(wf_trace_no);
+                __boot_serial_force_puts(" ready=");
+                __boot_serial_force_putu32((uint32_t)ready);
+                __boot_serial_force_puts(" mask0=");
+                __boot_serial_force_puthex64(mask0);
+                __boot_serial_force_puts(" want0=");
+                __boot_serial_force_puthex64(want0);
+                __boot_serial_force_puts(" rev0=");
+                __boot_serial_force_puthex64(rev0);
+                __boot_serial_force_puts("\n");
             }
             return (int64_t)ready;
         }
@@ -13979,6 +24308,19 @@ int64_t real_sys_poll(void *fds,uint64_t nfds,int timeout){
             __boot_serial_puts(" rev0=");
             __boot_serial_puthex64(rev0);
             __boot_serial_puts("\n");
+        }
+        if(wf_trace_this&&trace_waits<4){
+            __boot_serial_force_puts("[wf-poll-wait!] #");
+            __boot_serial_force_putu32(wf_trace_no);
+            __boot_serial_force_puts(" wait=");
+            __boot_serial_force_putu32(trace_waits);
+            __boot_serial_force_puts(" mask0=");
+            __boot_serial_force_puthex64(mask0);
+            __boot_serial_force_puts(" want0=");
+            __boot_serial_force_puthex64(want0);
+            __boot_serial_force_puts(" rev0=");
+            __boot_serial_force_puthex64(rev0);
+            __boot_serial_force_puts("\n");
         }
         ++trace_waits;
         c3_poll_wait_slice(cur,deadline);
@@ -14013,6 +24355,8 @@ int64_t real_sys_select(int nfds,void *rfds,void *wfds,void *efds,timeval_t *tim
     }
     for(;;){
         int fd,ready=0;
+        cur=task_current();
+        if(!cur)return -ESRCH;
         c3_memset(out_r,0,sizeof(out_r));
         c3_memset(out_w,0,sizeof(out_w));
         c3_memset(out_e,0,sizeof(out_e));
@@ -14079,6 +24423,40 @@ static void c3_restore_temp_sigmask(task_t *cur,const sigset_t2 *saved){
     sig_check_pending(cur);
 }
 
+int64_t real_sys_epoll_pwait(int epfd,void *events,int maxevents,int timeout,
+                             const void *sigmask,size_t sigsetsize){
+    task_t *cur=task_current();
+    sigset_t2 saved;
+    int rc_mask;
+    int64_t rc;
+    if(!cur)return -ESRCH;
+    rc_mask=c3_apply_temp_sigmask(cur,sigmask,sigsetsize,&saved);
+    if(rc_mask<0)return rc_mask;
+    rc=real_sys_epoll_wait(epfd,events,maxevents,timeout);
+    c3_restore_temp_sigmask(cur,&saved);
+    return rc;
+}
+
+int64_t real_sys_epoll_pwait2(int epfd,void *events,int maxevents,
+                              const timespec_t *timeout,const void *sigmask,
+                              size_t sigsetsize){
+    task_t *cur=task_current();
+    sigset_t2 saved;
+    int rc_mask;
+    int timeout_ms=-1;
+    int64_t rc;
+    if(!cur)return -ESRCH;
+    if(timeout){
+        if(timeout->tv_sec<0||timeout->tv_nsec<0||timeout->tv_nsec>=1000000000LL)return -EINVAL;
+        timeout_ms=(int)c3_timespec_to_ms_ceil(timeout);
+    }
+    rc_mask=c3_apply_temp_sigmask(cur,sigmask,sigsetsize,&saved);
+    if(rc_mask<0)return rc_mask;
+    rc=real_sys_epoll_wait(epfd,events,maxevents,timeout_ms);
+    c3_restore_temp_sigmask(cur,&saved);
+    return rc;
+}
+
 int64_t real_sys_ppoll(void *fds,uint64_t nfds,const timespec_t *timeout,const void *sigmask,size_t sigsetsize){
     task_t *cur=task_current();
     sigset_t2 saved;
@@ -14092,7 +24470,7 @@ int64_t real_sys_ppoll(void *fds,uint64_t nfds,const timespec_t *timeout,const v
     }
     {
         static uint32_t ppoll_trace_count=0;
-        if(ppoll_trace_count<48){
+        if(c3_wayfire_debug_trace_enabled()&&ppoll_trace_count<48){
             c3_pollfd_t *pf=(c3_pollfd_t*)fds;
             ++ppoll_trace_count;
             __boot_serial_puts("[ppoll] pid=");
@@ -14168,7 +24546,7 @@ int64_t real_sys_eventfd2(unsigned int initval,int flags){
         if(fd<0){c3_eventfd_free(ref);return -EMFILE;}
         {
             static uint32_t trace_count=0;
-            if(trace_count<32){
+            if(c3_wayfire_debug_trace_enabled()&&trace_count<32){
                 ++trace_count;
                 __boot_serial_puts("[eventfd-fd] pid=");
                 __boot_serial_putu32(cur?(uint32_t)cur->pid:0);
@@ -14198,6 +24576,26 @@ int64_t real_sys_timerfd_create(int clockid,int flags){
     {
         int fd=c3_fd_alloc_for_task(cur,FDKIND_TIMERFD,ref,ff);
         if(fd<0){c3_timerfd_free(ref);return fd;}
+        if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+            static uint32_t timerfd_create_trace=0;
+            if(timerfd_create_trace<64u){
+                ++timerfd_create_trace;
+                __boot_serial_force_puts("[timerfd-create!] #");
+                __boot_serial_force_putu32(timerfd_create_trace);
+                __boot_serial_force_puts(" pid=");
+                __boot_serial_force_putu32((uint32_t)cur->pid);
+                c3_force_task_name(cur);
+                __boot_serial_force_puts(" fd=");
+                __boot_serial_force_putu32((uint32_t)fd);
+                __boot_serial_force_puts(" ref=");
+                __boot_serial_force_putu32((uint32_t)ref);
+                __boot_serial_force_puts(" clock=");
+                __boot_serial_force_putu32((uint32_t)clockid);
+                __boot_serial_force_puts(" flags=");
+                __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+                __boot_serial_force_puts("\n");
+            }
+        }
         return fd;
     }
 }
@@ -14290,6 +24688,51 @@ static int c3_sched_affinity_target(task_t *cur,int pid){
     return idx;
 }
 
+#define C3_SCHED_OTHER 0
+#define C3_SCHED_FIFO  1
+#define C3_SCHED_RR    2
+#define C3_SCHED_BATCH 3
+#define C3_SCHED_IDLE  5
+#define C3_SCHED_RESET_ON_FORK 0x40000000
+
+typedef struct {
+    int sched_priority;
+} c3_sched_param_t;
+
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+} c3_linux_timespec_t;
+
+static int c3_sched_base_policy(int policy){
+    return policy&~C3_SCHED_RESET_ON_FORK;
+}
+
+static bool c3_sched_policy_supported(int policy){
+    switch(c3_sched_base_policy(policy)){
+        case C3_SCHED_OTHER:
+        case C3_SCHED_FIFO:
+        case C3_SCHED_RR:
+        case C3_SCHED_BATCH:
+        case C3_SCHED_IDLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool c3_sched_policy_realtime(int policy){
+    int base=c3_sched_base_policy(policy);
+    return base==C3_SCHED_FIFO||base==C3_SCHED_RR;
+}
+
+static int c3_sched_normalize_priority(int policy,int prio){
+    if(!c3_sched_policy_realtime(policy))return 0;
+    if(prio<1)prio=1;
+    if(prio>99)prio=99;
+    return prio;
+}
+
 static bool c3_affinity_has_any(const uint64_t *m,size_t words){
     size_t i;
     if(!m)return false;
@@ -14330,14 +24773,63 @@ int64_t real_sys_sched_setaffinity(int pid,size_t len,const void *mask){
     return 0;
 }
 
+int64_t real_sys_sched_setparam(int pid,const void *param){
+    task_t *cur=task_current();
+    int tidx=c3_sched_affinity_target(cur,pid);
+    c3_sched_param_t sp;
+    int policy;
+    if(tidx<0)return tidx;
+    if(!param)return -EFAULT;
+    c3_memcpy(&sp,param,sizeof(sp));
+    policy=g_c3_sched_policy[tidx];
+    if(!c3_sched_policy_supported(policy))policy=C3_SCHED_OTHER;
+    g_c3_sched_priority[tidx]=c3_sched_normalize_priority(policy,sp.sched_priority);
+    return 0;
+}
+
+int64_t real_sys_sched_getparam(int pid,void *param){
+    task_t *cur=task_current();
+    int tidx=c3_sched_affinity_target(cur,pid);
+    c3_sched_param_t sp;
+    if(tidx<0)return tidx;
+    if(!param)return -EFAULT;
+    sp.sched_priority=g_c3_sched_priority[tidx];
+    return c3_user_copy_out(cur,param,&sp,sizeof(sp),"sched-getparam");
+}
+
+int64_t real_sys_sched_setscheduler(int pid,int policy,const void *param){
+    task_t *cur=task_current();
+    int tidx=c3_sched_affinity_target(cur,pid);
+    c3_sched_param_t sp;
+    int base;
+    if(tidx<0)return tidx;
+    if(!c3_sched_policy_supported(policy))return -EINVAL;
+    if(!param)return -EFAULT;
+    c3_memcpy(&sp,param,sizeof(sp));
+    base=c3_sched_base_policy(policy);
+    g_c3_sched_policy[tidx]=base;
+    g_c3_sched_priority[tidx]=c3_sched_normalize_priority(base,sp.sched_priority);
+    return 0;
+}
+
+int64_t real_sys_sched_getscheduler(int pid){
+    task_t *cur=task_current();
+    int tidx=c3_sched_affinity_target(cur,pid);
+    int policy;
+    if(tidx<0)return tidx;
+    policy=g_c3_sched_policy[tidx];
+    if(!c3_sched_policy_supported(policy))policy=C3_SCHED_OTHER;
+    return policy;
+}
+
 int64_t real_sys_sched_get_priority_max(int policy){
-    switch(policy){
-        case 1: /* SCHED_FIFO */
-        case 2: /* SCHED_RR */
+    switch(c3_sched_base_policy(policy)){
+        case C3_SCHED_FIFO:
+        case C3_SCHED_RR:
             return 99;
-        case 0: /* SCHED_OTHER */
-        case 3: /* SCHED_BATCH */
-        case 5: /* SCHED_IDLE */
+        case C3_SCHED_OTHER:
+        case C3_SCHED_BATCH:
+        case C3_SCHED_IDLE:
             return 0;
         default:
             return -EINVAL;
@@ -14345,33 +24837,62 @@ int64_t real_sys_sched_get_priority_max(int policy){
 }
 
 int64_t real_sys_sched_get_priority_min(int policy){
-    switch(policy){
-        case 1: /* SCHED_FIFO */
-        case 2: /* SCHED_RR */
+    switch(c3_sched_base_policy(policy)){
+        case C3_SCHED_FIFO:
+        case C3_SCHED_RR:
             return 1;
-        case 0: /* SCHED_OTHER */
-        case 3: /* SCHED_BATCH */
-        case 5: /* SCHED_IDLE */
+        case C3_SCHED_OTHER:
+        case C3_SCHED_BATCH:
+        case C3_SCHED_IDLE:
             return 0;
         default:
             return -EINVAL;
     }
 }
 
+int64_t real_sys_sched_rr_get_interval(int pid,void *tp){
+    task_t *cur=task_current();
+    int tidx=c3_sched_affinity_target(cur,pid);
+    c3_linux_timespec_t ts;
+    if(tidx<0)return tidx;
+    if(!tp)return -EFAULT;
+    ts.tv_sec=0;
+    ts.tv_nsec=10000000;
+    return c3_user_copy_out(cur,tp,&ts,sizeof(ts),"sched-rr-interval");
+}
+
 int64_t real_sys_memfd_create(const char *name,unsigned int flags){
     task_t *cur=task_current();
     char path[VFS_PATH_MAX];
+    char name_buf[128];
+    const char *safe_name="anon";
     size_t l=0;
     int slot;
     int fd;
     uint32_t seq;
     if(flags&~(C3_MFD_CLOEXEC|C3_MFD_ALLOW_SEALING))return -EINVAL;
+    name_buf[0]=0;
+    if(name){
+        uint64_t nva=(uint64_t)(uintptr_t)name;
+        if(nva&&nva<C3_USER_TOP){
+            if(c3_copy_user_cstr_current(cur,name,name_buf,sizeof(name_buf),
+                                         "memfd-name")==0&&name_buf[0])
+                safe_name=name_buf;
+        }else if(nva>=DMAP_BASE){
+            size_t i=0;
+            while(i+1<sizeof(name_buf)&&name[i]){
+                name_buf[i]=name[i];
+                ++i;
+            }
+            name_buf[i]=0;
+            if(name_buf[0])safe_name=name_buf;
+        }
+    }
     seq=g_c3_memfd_seq++;
     if(seq==0)seq=g_c3_memfd_seq++;
     path[0]=0;
     c3_append_str(path,&l,sizeof(path),C3_MEMFD_PREFIX);
-    if(name&&name[0])c3_append_str(path,&l,sizeof(path),name);
-    else c3_append_str(path,&l,sizeof(path),"anon");
+    c3_append_str(path,&l,sizeof(path),safe_name);
     c3_append_ch(path,&l,sizeof(path),'-');
     c3_append_u32(path,&l,sizeof(path),seq);
     kvfs_write(path,"");
@@ -14381,6 +24902,24 @@ int64_t real_sys_memfd_create(const char *name,unsigned int flags){
     fd=c3_fd_alloc_for_task(cur,FDKIND_VFSFILE,slot,
                             FDFL_READABLE|FDFL_WRITABLE|
                             ((flags&C3_MFD_CLOEXEC)?FDFL_CLOEXEC:0));
+    if(cur&&c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        static uint32_t wf_memfd_trace;
+        if(wf_memfd_trace<80u){
+            ++wf_memfd_trace;
+            __boot_serial_force_puts("[wf-memfd!] #");
+            __boot_serial_force_putu32(wf_memfd_trace);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            c3_force_task_name(cur);
+            __boot_serial_force_puts(" fd=");
+            __boot_serial_force_putu32((uint32_t)(fd>=0?fd:0xFFFFFFFFu));
+            __boot_serial_force_puts(" flags=");
+            __boot_serial_force_puthex64((uint64_t)(uint32_t)flags);
+            __boot_serial_force_puts(" path=");
+            __boot_serial_force_puts(path);
+            __boot_serial_force_puts("\n");
+        }
+    }
     return fd<0?-EMFILE:(int64_t)fd;
 }
 int64_t real_sys_mlock(uint64_t a,size_t l){(void)a;(void)l;return 0;}
@@ -14422,7 +24961,27 @@ WRAP1(w_pipe,real_sys_pipe,int*)
 WRAP1(w_dup,real_sys_dup,int)
 WRAP2(w_dup2,real_sys_dup2,int,int)
 WRAP0(w_fork,real_sys_fork)
-WRAP3(w_execve,real_sys_execve,const char*,char*const*,char*const*)
+static int64_t w_execve(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f){
+    int64_t rc;
+    task_t *cur=task_current();
+    (void)d;(void)e;(void)f;
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        __boot_serial_force_puts("[wayfire-execve-call] path_ptr=");
+        __boot_serial_force_puthex64(a);
+        __boot_serial_force_puts(" argv_ptr=");
+        __boot_serial_force_puthex64(b);
+        __boot_serial_force_puts(" env_ptr=");
+        __boot_serial_force_puthex64(c);
+        __boot_serial_force_puts("\n");
+    }
+    rc=real_sys_execve((const char*)a,(char*const*)b,(char*const*)c);
+    if(c3_wayfire_debug_trace_enabled()&&c3_task_is_wayfire_runtime(cur)){
+        __boot_serial_force_puts("[wayfire-execve-ret] rc=");
+        c3_force_rc(rc);
+        __boot_serial_force_puts("\n");
+    }
+    return rc;
+}
 WRAP1(w_exit,real_sys_exit,int)
 WRAP4(w_wait4,real_sys_wait4,int,int*,int,void*)
 WRAP5(w_waitid,real_sys_waitid,int,int,void*,int,void*)
@@ -14435,6 +24994,7 @@ WRAP1(w_fdatasync,real_sys_fdatasync,int)
 WRAP3(w_getdents64,real_sys_getdents64,int,void*,size_t)
 WRAP2(w_getcwd,real_sys_getcwd,char*,size_t)
 WRAP1(w_chdir,real_sys_chdir,const char*)
+WRAP5(w_mount,real_sys_mount,const char*,const char*,const char*,unsigned long,const void*)
 WRAP2(w_mkdir,real_sys_mkdir,const char*,int)
 WRAP3(w_mkdirat,real_sys_mkdirat,int,const char*,int)
 WRAP1(w_unlink,real_sys_unlink,const char*)
@@ -14456,6 +25016,12 @@ WRAP0(w_geteuid,real_sys_geteuid)
 WRAP0(w_getegid,real_sys_getegid)
 WRAP1(w_setuid,real_sys_setuid,int)
 WRAP1(w_setgid,real_sys_setgid,int)
+WRAP2(w_setreuid,real_sys_setreuid,int,int)
+WRAP2(w_setregid,real_sys_setregid,int,int)
+WRAP3(w_getresuid,real_sys_getresuid,uint32_t*,uint32_t*,uint32_t*)
+WRAP3(w_getresgid,real_sys_getresgid,uint32_t*,uint32_t*,uint32_t*)
+WRAP3(w_setresuid,real_sys_setresuid,uint32_t,uint32_t,uint32_t)
+WRAP3(w_setresgid,real_sys_setresgid,uint32_t,uint32_t,uint32_t)
 WRAP2(w_setpgid,real_sys_setpgid,int,int)
 WRAP1(w_getpgid,real_sys_getpgid,int)
 WRAP0(w_setsid,real_sys_setsid)
@@ -14463,6 +25029,9 @@ WRAP1(w_getsid,real_sys_getsid,int)
 WRAP4(w_rt_sigaction,real_sys_rt_sigaction,int,const void*,void*,size_t)
 WRAP4(w_rt_sigprocmask,real_sys_rt_sigprocmask,int,const void*,void*,size_t)
 WRAP0(w_rt_sigreturn,real_sys_rt_sigreturn)
+WRAP2(w_rt_sigpending,real_sys_rt_sigpending,void*,size_t)
+WRAP4(w_rt_sigtimedwait,real_sys_rt_sigtimedwait,const void*,void*,const timespec_t*,size_t)
+WRAP2(w_rt_sigsuspend,real_sys_rt_sigsuspend,const void*,size_t)
 WRAP2(w_sigaltstack,real_sys_sigaltstack,const void*,void*)
 WRAP2(w_clock_gettime,real_sys_clock_gettime,int,timespec_t*)
 WRAP2(w_clock_getres,real_sys_clock_getres,int,timespec_t*)
@@ -14481,6 +25050,9 @@ WRAP5(w_prctl,real_sys_prctl,int,uint64_t,uint64_t,uint64_t,uint64_t)
 WRAP2(w_arch_prctl,real_sys_arch_prctl,int,uint64_t)
 WRAP1(w_set_tid_address,real_sys_set_tid_address,uint64_t)
 WRAP2(w_set_robust_list,real_sys_set_robust_list,uint64_t,size_t)
+WRAP3(w_getcpu,real_sys_getcpu,uint32_t*,uint32_t*,void*)
+WRAP4(w_rseq,real_sys_rseq,void*,uint32_t,int,uint32_t)
+WRAP3(w_membarrier,real_sys_membarrier,int,int,int)
 WRAP6(w_futex,real_sys_futex,uint32_t*,int,uint32_t,const timespec_t*,uint32_t*,uint32_t)
 WRAP3(w_socket,real_sys_socket,int,int,int)
 WRAP3(w_bind,real_sys_bind,int,const void*,uint32_t)
@@ -14497,9 +25069,12 @@ WRAP5(w_setsockopt,real_sys_setsockopt,int,int,int,const void*,uint32_t)
 WRAP5(w_getsockopt,real_sys_getsockopt,int,int,int,void*,uint32_t*)
 WRAP3(w_getsockname,real_sys_getsockname,int,void*,uint32_t*)
 WRAP3(w_getpeername,real_sys_getpeername,int,void*,uint32_t*)
+WRAP1(w_epoll_create,real_sys_epoll_create,int)
 WRAP1(w_epoll_create1,real_sys_epoll_create1,int)
 WRAP4(w_epoll_ctl,real_sys_epoll_ctl,int,int,int,void*)
 WRAP4(w_epoll_wait,real_sys_epoll_wait,int,void*,int,int)
+WRAP6(w_epoll_pwait,real_sys_epoll_pwait,int,void*,int,int,const void*,size_t)
+WRAP6(w_epoll_pwait2,real_sys_epoll_pwait2,int,void*,int,const timespec_t*,const void*,size_t)
 WRAP3(w_poll,real_sys_poll,void*,uint64_t,int)
 WRAP6(w_pselect6,real_sys_pselect6,int,void*,void*,void*,const timespec_t*,const void*)
 WRAP5(w_ppoll,real_sys_ppoll,void*,uint64_t,const timespec_t*,const void*,size_t)
@@ -14536,6 +25111,18 @@ WRAP5(w_linkat,real_sys_linkat,int,const char*,int,const char*,int)
 WRAP5(w_fchownat,real_sys_fchownat,int,const char*,int,int,int)
 WRAP4(w_fchmodat,real_sys_fchmodat,int,const char*,int,int)
 WRAP5(w_renameat2,real_sys_renameat2,int,const char*,int,const char*,unsigned int)
+WRAP5(w_setxattr,real_sys_setxattr,const char*,const char*,const void*,size_t,int)
+WRAP5(w_lsetxattr,real_sys_lsetxattr,const char*,const char*,const void*,size_t,int)
+WRAP5(w_fsetxattr,real_sys_fsetxattr,int,const char*,const void*,size_t,int)
+WRAP4(w_getxattr,real_sys_getxattr,const char*,const char*,void*,size_t)
+WRAP4(w_lgetxattr,real_sys_lgetxattr,const char*,const char*,void*,size_t)
+WRAP4(w_fgetxattr,real_sys_fgetxattr,int,const char*,void*,size_t)
+WRAP3(w_listxattr,real_sys_listxattr,const char*,char*,size_t)
+WRAP3(w_llistxattr,real_sys_llistxattr,const char*,char*,size_t)
+WRAP3(w_flistxattr,real_sys_flistxattr,int,char*,size_t)
+WRAP2(w_removexattr,real_sys_removexattr,const char*,const char*)
+WRAP2(w_lremovexattr,real_sys_lremovexattr,const char*,const char*)
+WRAP2(w_fremovexattr,real_sys_fremovexattr,int,const char*)
 WRAP3(w_tgkill,real_sys_tgkill,int,int,int)
 WRAP2(w_tkill,real_sys_tkill,int,int)
 WRAP2(w_ftruncate,real_sys_ftruncate,int,int64_t)
@@ -14546,10 +25133,15 @@ WRAP2(w_shutdown,real_sys_shutdown,int,int)
 WRAP2(w_mlock,real_sys_mlock,uint64_t,size_t)
 WRAP2(w_munlock,real_sys_munlock,uint64_t,size_t)
 WRAP3(w_madvise,real_sys_madvise,uint64_t,uint64_t,int)
+WRAP2(w_sched_setparam,real_sys_sched_setparam,int,const void*)
+WRAP2(w_sched_getparam,real_sys_sched_getparam,int,void*)
+WRAP3(w_sched_setscheduler,real_sys_sched_setscheduler,int,int,const void*)
+WRAP1(w_sched_getscheduler,real_sys_sched_getscheduler,int)
 WRAP3(w_sched_setaffinity,real_sys_sched_setaffinity,int,size_t,const void*)
 WRAP3(w_sched_getaffinity,real_sys_sched_getaffinity,int,size_t,void*)
 WRAP1(w_sched_get_priority_max,real_sys_sched_get_priority_max,int)
 WRAP1(w_sched_get_priority_min,real_sys_sched_get_priority_min,int)
+WRAP2(w_sched_rr_get_interval,real_sys_sched_rr_get_interval,int,void*)
 WRAP1(w_syncfs,real_sys_syncfs,int)
 WRAP3(w_get_robust_list,real_sys_get_robust_list,int,uint64_t*,size_t*)
 WRAP3(w_seccomp,real_sys_seccomp,unsigned int,unsigned int,void*)
@@ -14663,25 +25255,53 @@ void compat3_rewire_syscalls(void){
     g_syscall_table[109]=w_setpgid;
     g_syscall_table[110]=w_getppid;
     g_syscall_table[112]=w_setsid;
+    g_syscall_table[113]=w_setreuid;
+    g_syscall_table[114]=w_setregid;
+    g_syscall_table[117]=w_setresuid;
+    g_syscall_table[118]=w_getresuid;
+    g_syscall_table[119]=w_setresgid;
+    g_syscall_table[120]=w_getresgid;
     g_syscall_table[121]=w_getpgid;
     g_syscall_table[124]=w_getsid;
     g_syscall_table[125]=w_capget;
     g_syscall_table[126]=w_capset;
+    g_syscall_table[127]=w_rt_sigpending;
+    g_syscall_table[128]=w_rt_sigtimedwait;
+    g_syscall_table[130]=w_rt_sigsuspend;
     g_syscall_table[131]=w_sigaltstack;
     g_syscall_table[137]=w_statfs;
     g_syscall_table[138]=w_fstatfs;
     g_syscall_table[140]=w_getpriority;
     g_syscall_table[141]=w_setpriority;
+    g_syscall_table[142]=w_sched_setparam;
+    g_syscall_table[143]=w_sched_getparam;
+    g_syscall_table[144]=w_sched_setscheduler;
+    g_syscall_table[145]=w_sched_getscheduler;
     g_syscall_table[146]=w_sched_get_priority_max;
     g_syscall_table[147]=w_sched_get_priority_min;
+    g_syscall_table[148]=w_sched_rr_get_interval;
     g_syscall_table[149]=w_mlock;
     g_syscall_table[150]=w_munlock;
     g_syscall_table[158]=w_arch_prctl;
+    g_syscall_table[165]=w_mount;
     g_syscall_table[186]=w_gettid;
     g_syscall_table[187]=w_readahead;
+    g_syscall_table[188]=w_setxattr;
+    g_syscall_table[189]=w_lsetxattr;
+    g_syscall_table[190]=w_fsetxattr;
+    g_syscall_table[191]=w_getxattr;
+    g_syscall_table[192]=w_lgetxattr;
+    g_syscall_table[193]=w_fgetxattr;
+    g_syscall_table[194]=w_listxattr;
+    g_syscall_table[195]=w_llistxattr;
+    g_syscall_table[196]=w_flistxattr;
+    g_syscall_table[197]=w_removexattr;
+    g_syscall_table[198]=w_lremovexattr;
+    g_syscall_table[199]=w_fremovexattr;
     g_syscall_table[200]=w_tkill;
     g_syscall_table[201]=w_time;
     g_syscall_table[202]=w_futex;
+    g_syscall_table[213]=w_epoll_create;
     g_syscall_table[203]=w_sched_setaffinity;
     g_syscall_table[204]=w_sched_getaffinity;
     g_syscall_table[217]=w_getdents64;
@@ -14710,6 +25330,7 @@ void compat3_rewire_syscalls(void){
     g_syscall_table[270]=w_pselect6;
     g_syscall_table[271]=w_ppoll;
     g_syscall_table[272]=w_unshare;
+    g_syscall_table[281]=w_epoll_pwait;
     g_syscall_table[288]=w_accept4;
     g_syscall_table[289]=w_signalfd4;
     g_syscall_table[290]=w_eventfd2;
@@ -14727,13 +25348,17 @@ void compat3_rewire_syscalls(void){
     g_syscall_table[306]=w_syncfs;
     g_syscall_table[307]=w_sendmmsg;
     g_syscall_table[308]=w_setns;
+    g_syscall_table[309]=w_getcpu;
     g_syscall_table[310]=w_process_vm_readv;
     g_syscall_table[311]=w_process_vm_writev;
     g_syscall_table[316]=w_renameat2;
     g_syscall_table[317]=w_seccomp;
     g_syscall_table[318]=w_getrandom;
     g_syscall_table[319]=w_memfd_create;
+    g_syscall_table[441]=w_epoll_pwait2;
     g_syscall_table[323]=w_userfaultfd;
+    g_syscall_table[324]=w_membarrier;
+    g_syscall_table[334]=w_rseq;
     g_syscall_table[273]=w_set_robust_list;
     g_syscall_table[274]=w_get_robust_list;
     g_syscall_table[157]=w_prctl;
@@ -14960,16 +25585,404 @@ void compat3_register_shell_cmds(void){
 void compat3_init_all(void){
     int i;
     g_boot_tsc=c3_rdtsc();
+    c3_calibrate_tsc_from_kernel_timer();
     c3_memset(g_mmap_table,0,sizeof(g_mmap_table));
     c3_memset(g_proc_bufs,0,sizeof(g_proc_bufs));
     c3_memset(g_c3_path_modes,0,sizeof(g_c3_path_modes));
     c3_ensure_dir_abs("/tmp",01777);
     c3_ensure_dir_abs("/tmp/.X11-unix",01777);
+    c3_ensure_dir_abs("/run",0755);
+    c3_ensure_dir_abs("/run/user",0755);
+    c3_ensure_dir_abs("/run/user/0",0700);
+    c3_ensure_dir_abs("/run/user/1000",0700);
+    c3_ensure_dir_abs("/run/user/1000/doc",0700);
+    c3_ensure_dir_abs("/run/user/1000/hypr",0700);
+    c3_ensure_dir_abs("/run/dbus",0755);
+    c3_ensure_dir_abs("/run/udev",0755);
+    c3_ensure_dir_abs("/run/udev/data",0755);
+    c3_ensure_dir_abs("/run/udev/tags",0755);
+    c3_ensure_dir_abs("/run/udev/tags/seat",0755);
+    c3_ensure_dir_abs("/usr/share/libinput",0755);
+    kvfs_write("/usr/share/libinput/50-ridux.quirks",
+        "# RiduxOS virtual evdev devices.\n"
+        "\n"
+        "[RiduxOS Keyboard]\n"
+        "MatchUdevType=keyboard\n"
+        "MatchName=RiduxOS Keyboard\n"
+        "AttrKeyboardIntegration=internal\n"
+        "\n"
+        "[RiduxOS Mouse]\n"
+        "MatchUdevType=mouse\n"
+        "MatchName=RiduxOS Mouse\n"
+        "ModelBouncingKeys=1\n");
     c3_ensure_dir_abs("/tmp/firefox-profile",0700);
     c3_ensure_dir_abs("/tmp/firefox-profile/cache2",0700);
     c3_ensure_dir_abs("/tmp/firefox-profile/startupCache",0700);
     c3_ensure_dir_abs("/tmp/firefox-profile/storage",0700);
     c3_ensure_dir_abs("/home",0755);
+    c3_ensure_dir_abs("/home/.config",0700);
+    c3_ensure_dir_abs("/home/.cache",0700);
+    c3_ensure_dir_abs("/home/.local",0700);
+    c3_ensure_dir_abs("/home/.local/share",0700);
+    c3_ensure_dir_abs("/var",0755);
+    c3_ensure_dir_abs("/var/lib",0755);
+    c3_ensure_dir_abs("/var/lib/dbus",0755);
+    c3_ensure_dir_abs("/tmp/hypr",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/config",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/config/hypr",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/config/waybar",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/config/nwg-dock-hyprland",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/config/xdg-desktop-portal",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/cache",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/share",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/share/xdg-desktop-portal",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/share/xdg-desktop-portal/portals",0700);
+    c3_ensure_dir_abs("/tmp/hyprland-home/state",0700);
+    c3_ensure_dir_abs("/tmp/wayfire-home",0700);
+    c3_ensure_dir_abs("/tmp/wayfire-home/config",0700);
+    c3_ensure_dir_abs("/tmp/wayfire-home/cache",0700);
+    c3_ensure_dir_abs("/tmp/wayfire-home/share",0700);
+    c3_ensure_dir_abs("/tmp/wayfire-home/state",0700);
+    c3_ensure_dir_abs("/tmp/kde-home",0700);
+    c3_ensure_dir_abs("/tmp/kde-home/config",0700);
+    c3_ensure_dir_abs("/tmp/kde-home/cache",0700);
+    c3_ensure_dir_abs("/tmp/kde-home/share",0700);
+    c3_ensure_dir_abs("/tmp/kde-home/share/config",0700);
+    c3_ensure_dir_abs("/tmp/kde-home/share/apps",0700);
+    c3_ensure_dir_abs("/tmp/kde-home/state",0700);
+    c3_ensure_dir_abs("/tmp/kde-tmp",0700);
+    c3_ensure_dir_abs("/tmp/kde-var-tmp",0700);
+    kvfs_write("/etc/machine-id","7f32c1d83e1e4a5db42b8c3d0f55a9c1\n");
+    kvfs_write("/var/lib/dbus/machine-id","7f32c1d83e1e4a5db42b8c3d0f55a9c1\n");
+    kvfs_write("/run/udev/data/c13:64",
+        "I:1000\n"
+        "E:DEVNAME=/dev/input/event0\n"
+        "E:DEVPATH=/devices/virtual/input/input0/event0\n"
+        "E:SUBSYSTEM=input\n"
+        "E:DEVTYPE=input_event\n"
+        "E:MAJOR=13\n"
+        "E:MINOR=64\n"
+        "E:ID_INPUT=1\n"
+        "E:ID_INPUT_KEY=1\n"
+        "E:ID_INPUT_KEYBOARD=1\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/+input:event0",
+        "I:1000\n"
+        "E:DEVNAME=/dev/input/event0\n"
+        "E:DEVPATH=/devices/virtual/input/input0/event0\n"
+        "E:SUBSYSTEM=input\n"
+        "E:DEVTYPE=input_event\n"
+        "E:MAJOR=13\n"
+        "E:MINOR=64\n"
+        "E:ID_INPUT=1\n"
+        "E:ID_INPUT_KEY=1\n"
+        "E:ID_INPUT_KEYBOARD=1\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/+input:input",
+        "I:1000\n"
+        "E:DEVPATH=/devices/virtual/input\n"
+        "E:SUBSYSTEM=input\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/+input:input0",
+        "I:1000\n"
+        "E:DEVNAME=/dev/input/event0\n"
+        "E:DEVPATH=/devices/virtual/input/input0/event0\n"
+        "E:SUBSYSTEM=input\n"
+        "E:DEVTYPE=input\n"
+        "E:MAJOR=13\n"
+        "E:MINOR=64\n"
+        "E:ID_INPUT=1\n"
+        "E:ID_INPUT_KEY=1\n"
+        "E:ID_INPUT_KEYBOARD=1\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/c13:65",
+        "I:1000\n"
+        "E:DEVNAME=/dev/input/event1\n"
+        "E:DEVPATH=/devices/virtual/input/input1/event1\n"
+        "E:SUBSYSTEM=input\n"
+        "E:DEVTYPE=input_event\n"
+        "E:MAJOR=13\n"
+        "E:MINOR=65\n"
+        "E:ID_INPUT=1\n"
+        "E:ID_INPUT_MOUSE=1\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/+input:event1",
+        "I:1000\n"
+        "E:DEVNAME=/dev/input/event1\n"
+        "E:DEVPATH=/devices/virtual/input/input1/event1\n"
+        "E:SUBSYSTEM=input\n"
+        "E:DEVTYPE=input_event\n"
+        "E:MAJOR=13\n"
+        "E:MINOR=65\n"
+        "E:ID_INPUT=1\n"
+        "E:ID_INPUT_MOUSE=1\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/+input:input1",
+        "I:1000\n"
+        "E:DEVNAME=/dev/input/event1\n"
+        "E:DEVPATH=/devices/virtual/input/input1/event1\n"
+        "E:SUBSYSTEM=input\n"
+        "E:DEVTYPE=input\n"
+        "E:MAJOR=13\n"
+        "E:MINOR=65\n"
+        "E:ID_INPUT=1\n"
+        "E:ID_INPUT_MOUSE=1\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/c226:0",
+        "I:1000\n"
+        "E:DEVNAME=/dev/dri/card0\n"
+        "E:SUBSYSTEM=drm\n"
+        "E:DEVTYPE=drm_minor\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:uaccess:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/c226:128",
+        "I:1000\n"
+        "E:DEVNAME=/dev/dri/renderD128\n"
+        "E:SUBSYSTEM=drm\n"
+        "E:DEVTYPE=drm_minor\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:uaccess:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/data/c10:229",
+        "I:1000\n"
+        "E:DEVNAME=/dev/fuse\n"
+        "E:SUBSYSTEM=misc\n"
+        "E:MAJOR=10\n"
+        "E:MINOR=229\n"
+        "E:ID_SEAT=seat0\n"
+        "E:TAGS=:seat:uaccess:\n"
+        "G:seat\n"
+        "Q:seat\n");
+    kvfs_write("/run/udev/tags/seat/c13:64","\n");
+    kvfs_write("/run/udev/tags/seat/c13:65","\n");
+    kvfs_write("/run/udev/tags/seat/c10:229","\n");
+    kvfs_write("/run/udev/tags/seat/c226:0","\n");
+    kvfs_write("/run/udev/tags/seat/c226:128","\n");
+    kvfs_write("/tmp/wayfire-home/config/wayfire.ini",
+        "[core]\n"
+        "plugins = alpha animate autostart blur command cube decoration expo foreign-toplevel grid gtk-shell move place resize scale switcher vswitch wayfire-shell window-rules wm-actions wobbly wsets xdg-activation\n"
+        "xwayland = false\n"
+        "preferred_decoration_mode = server\n"
+        "background_color = 0.030 0.036 0.048 1.0\n"
+        "\n"
+        "[autostart]\n"
+        "autostart_wf_shell = false\n"
+        "session = /opt/wayfire/bin/ridux-session\n"
+        "\n"
+        "[output:*]\n"
+        "mode = auto\n"
+        "position = 0,0\n"
+        "transform = normal\n"
+        "scale = 1.000000\n"
+        "\n"
+        "[input]\n"
+        "xkb_layout = us\n"
+        "cursor_theme = Adwaita\n"
+        "cursor_size = 28\n"
+        "mouse_cursor_speed = 0.000000\n"
+        "touchpad_cursor_speed = 0.000000\n"
+        "\n"
+        "[workarounds]\n"
+        "enable_input_method_v2 = false\n"
+        "\n"
+        "[animate]\n"
+        "open_animation = zoom\n"
+        "close_animation = zoom\n"
+        "duration = 220\n"
+        "startup_duration = 260\n"
+        "enabled_for = all\n"
+        "\n"
+        "[blur]\n"
+        "method = kawase\n"
+        "kawase_iterations = 4\n"
+        "kawase_offset = 4\n"
+        "toggle = none\n"
+        "\n"
+        "[alpha]\n"
+        "min_value = 0.72\n"
+        "modifier = <alt> <super>\n"
+        "\n"
+        "[decoration]\n"
+        "border_size = 1\n"
+        "title_height = 30\n"
+        "active_color = \\#172033d8\n"
+        "inactive_color = \\#101722a8\n"
+        "font = Cantarell\n"
+        "\n"
+        "[scale]\n"
+        "toggle = <super> KEY_TAB\n"
+        "duration = 190\n"
+        "spacing = 24\n"
+        "\n"
+        "[expo]\n"
+        "toggle = <super> KEY_E\n"
+        "duration = 220\n"
+        "\n"
+        "[cube]\n"
+        "activate = <super> <ctrl> BTN_LEFT\n"
+        "background_mode = skydome\n"
+        "initial_animation = 350\n"
+        "\n"
+        "[wobbly]\n"
+        "friction = 5.5\n"
+        "spring_k = 7.5\n"
+        "grid_resolution = 8\n"
+        "\n"
+        "[grid]\n"
+        "slot_l = <super> KEY_LEFT\n"
+        "slot_r = <super> KEY_RIGHT\n"
+        "slot_t = <super> KEY_UP\n"
+        "slot_b = <super> KEY_DOWN\n"
+        "\n"
+        "[vswitch]\n"
+        "binding_left = <ctrl> <super> KEY_LEFT\n"
+        "binding_right = <ctrl> <super> KEY_RIGHT\n"
+        "binding_up = <ctrl> <super> KEY_UP\n"
+        "binding_down = <ctrl> <super> KEY_DOWN\n"
+        "duration = 180\n"
+        "\n"
+        "[command]\n"
+        "binding_terminal = <super> KEY_ENTER\n"
+        "command_terminal = /usr/bin/ridux-terminal\n"
+        "repeatable_binding_terminal = none\n"
+        "always_binding_terminal = none\n"
+        "release_binding_terminal = none\n"
+        "binding_launcher = <super> KEY_SPACE\n"
+        "command_launcher = /usr/bin/ridux-open-launcher\n"
+        "repeatable_binding_launcher = none\n"
+        "always_binding_launcher = none\n"
+        "release_binding_launcher = none\n"
+        "binding_lock = <super> KEY_ESC\n"
+        "command_lock = /usr/bin/ridux-lock\n"
+        "repeatable_binding_lock = none\n"
+        "always_binding_lock = none\n"
+        "release_binding_lock = none\n"
+        "binding_screenshot = KEY_PRINT\n"
+        "command_screenshot = /usr/bin/ridux-screenshot\n"
+        "repeatable_binding_screenshot = none\n"
+        "always_binding_screenshot = none\n"
+        "release_binding_screenshot = none\n"
+        "binding_screenshot_interactive = <shift> KEY_PRINT\n"
+        "command_screenshot_interactive = /usr/bin/ridux-screenshot\n"
+        "repeatable_binding_screenshot_interactive = none\n"
+        "always_binding_screenshot_interactive = none\n"
+        "release_binding_screenshot_interactive = none\n"
+        "\n");
+    kvfs_write("/tmp/wayfire-home/config/wf-shell.ini",
+        "[panel]\n"
+        "position = top\n"
+        "autohide = false\n"
+        "minimal_height = 36\n"
+        "layer = top\n"
+        "background_color = 0.018 0.024 0.036 0.86\n"
+        "css_path = /tmp/wayfire-home/config/wf-shell/css/ridux-shell.css\n"
+        "widgets_left = menu spacing8 launchers window-list\n"
+        "widgets_center = none\n"
+        "widgets_right = clock\n"
+        "launcher_cmd_1 = /opt/wayfire/bin/ridux-qt-files\n"
+        "launcher_icon_1 = /opt/wayfire/share/wayfire/icons/ridux-files.png\n"
+        "launcher_label_1 = Qt Files\n"
+        "launcher_cmd_2 = /opt/wayfire/bin/ridux-qt-dashboard\n"
+        "launcher_icon_2 = /opt/wayfire/share/wayfire/icons/ridux-settings.png\n"
+        "launcher_label_2 = Qt GPU\n"
+        "launcher_cmd_3 = /opt/wayfire/bin/ridux-terminal\n"
+        "launcher_icon_3 = /opt/wayfire/share/wayfire/icons/ridux-terminal.png\n"
+        "launcher_label_3 = Terminal\n"
+        "launcher_cmd_4 = /opt/wayfire/bin/ridux-about\n"
+        "launcher_icon_4 = /opt/wayfire/share/wayfire/icons/ridux-about.png\n"
+        "launcher_label_4 = About\n"
+        "launcher_cmd_5 = /usr/bin/ridux-open-launcher\n"
+        "launcher_icon_5 = /opt/wayfire/share/wayfire/icons/ridux-logo.png\n"
+        "launcher_label_5 = Apps\n"
+        "launcher_cmd_6 = /usr/bin/ridux-screenshot\n"
+        "launcher_icon_6 = /opt/wayfire/share/wayfire/icons/ridux-monitor.png\n"
+        "launcher_label_6 = Shot\n"
+        "launcher_cmd_7 = /usr/bin/ridux-lock\n"
+        "launcher_icon_7 = /opt/wayfire/share/wayfire/icons/ridux-settings.png\n"
+        "launcher_label_7 = Lock\n"
+        "launchers_size = 24\n"
+        "launchers_spacing = 6\n"
+        "clock_format = %H:%M\n"
+        "clock_font = DejaVu Sans 11\n"
+        "menu_icon = /opt/wayfire/share/wayfire/icons/ridux-logo.png\n"
+        "menu_show_categories = false\n"
+        "menu_list = false\n"
+        "menu_min_content_width = 560\n"
+        "menu_min_content_height = 460\n"
+        "\n"
+        "[dock]\n"
+        "position = bottom\n"
+        "autohide = false\n"
+        "dock_height = 72\n"
+        "icon_height = 48\n"
+        "css_path = /tmp/wayfire-home/config/wf-shell/css/ridux-shell.css\n"
+        "icon_mapping_org.xfce.thunar = /opt/wayfire/share/wayfire/icons/ridux-files.png\n"
+        "icon_mapping_thunar = /opt/wayfire/share/wayfire/icons/ridux-files.png\n"
+        "icon_mapping_ridux-terminal = /opt/wayfire/share/wayfire/icons/ridux-terminal.png\n"
+        "icon_mapping_ridux-settings = /opt/wayfire/share/wayfire/icons/ridux-settings.png\n"
+        "icon_mapping_ridux-launcher = /opt/wayfire/share/wayfire/icons/ridux-logo.png\n"
+        "icon_mapping_ridux-qt-dashboard = /opt/wayfire/share/wayfire/icons/ridux-settings.png\n"
+        "icon_mapping_ridux-qt-files = /opt/wayfire/share/wayfire/icons/ridux-files.png\n"
+        "icon_mapping_ridux-qt-monitor = /opt/wayfire/share/wayfire/icons/ridux-monitor.png\n"
+        "\n"
+        "[background]\n"
+        "cycle_timeout = 0\n"
+        "image = /opt/wayfire/share/wayfire/ridux-wallpaper.png\n"
+        "fill_mode = fill_and_crop\n"
+        "randomize = 0\n"
+        "\n"
+        "[launcher]\n"
+        "terminal = /opt/wayfire/bin/ridux-terminal\n");
+    kvfs_write("/tmp/kde-home/config/kdeglobals",
+        "[General]\n"
+        "ColorScheme=BreezeLight\n"
+        "Name=RiduxOS Plasma\n"
+        "\n"
+        "[Icons]\n"
+        "Theme=breeze\n"
+        "\n"
+        "[KDE]\n"
+        "SingleClick=false\n");
+    kvfs_write("/tmp/kde-home/config/kwinrc",
+        "[Compositing]\n"
+        "Enabled=false\n"
+        "OpenGLIsUnsafe=true\n"
+        "Backend=XRender\n"
+        "\n"
+        "[Plugins]\n"
+        "desktopchangeosdEnabled=false\n"
+        "screenshotEnabled=false\n");
+    kvfs_write("/tmp/kde-home/config/plasmashellrc",
+        "[PlasmaViews][Panel 1]\n"
+        "panelVisibility=0\n"
+        "\n"
+        "[Updates]\n"
+        "performed=/usr/share/plasma/shells/org.kde.plasma.desktop/contents/updates\n");
     c3_ensure_dir_abs("/home/.mozilla",0700);
     c3_ensure_dir_abs("/home/.mozilla/firefox",0700);
     kvfs_write("/home/ridux-firefox-test.html",
@@ -14991,6 +26004,16 @@ void compat3_init_all(void){
         "user_pref(\"app.update.enabled\", false);\n"
         "user_pref(\"browser.aboutwelcome.enabled\", false);\n"
         "user_pref(\"browser.cache.disk.enable\", false);\n"
+        "user_pref(\"browser.cache.disk.capacity\", 0);\n"
+        "user_pref(\"browser.cache.memory.enable\", true);\n"
+        "user_pref(\"browser.cache.memory.capacity\", 16384);\n"
+        "user_pref(\"browser.cache.offline.enable\", false);\n"
+        "user_pref(\"browser.safebrowsing.blockedURIs.enabled\", false);\n"
+        "user_pref(\"browser.safebrowsing.downloads.enabled\", false);\n"
+        "user_pref(\"browser.safebrowsing.malware.enabled\", false);\n"
+        "user_pref(\"browser.safebrowsing.phishing.enabled\", false);\n"
+        "user_pref(\"browser.urlbar.speculativeConnect.enabled\", false);\n"
+        "user_pref(\"browser.sessionhistory.max_total_viewers\", 0);\n"
         "user_pref(\"browser.startup.blankWindow\", false);\n"
         "user_pref(\"browser.newtabpage.enabled\", false);\n"
         "user_pref(\"browser.newtabpage.activity-stream.enabled\", false);\n"
@@ -14999,6 +26022,7 @@ void compat3_init_all(void){
         "user_pref(\"browser.safebrowsing.phishing.enabled\", false);\n"
         "user_pref(\"browser.search.suggest.enabled\", false);\n"
         "user_pref(\"browser.search.update\", false);\n"
+        "user_pref(\"browser.fixup.fallback-to-https\", false);\n"
         "user_pref(\"browser.sessionstore.resume_from_crash\", false);\n"
         "user_pref(\"browser.sessionstore.resume_session_once\", false);\n"
         "user_pref(\"browser.sessionstore.restore_on_demand\", false);\n"
@@ -15027,6 +26051,8 @@ void compat3_init_all(void){
         "user_pref(\"dom.ipc.processCount.privilegedmozilla\", 1);\n"
         "user_pref(\"dom.ipc.processCount.web\", 1);\n"
         "user_pref(\"dom.ipc.processCount.webIsolated\", 1);\n"
+        "user_pref(\"dom.push.enabled\", false);\n"
+        "user_pref(\"dom.webnotifications.enabled\", false);\n"
         "user_pref(\"extensions.getAddons.cache.enabled\", false);\n"
         "user_pref(\"extensions.systemAddon.update.enabled\", false);\n"
         "user_pref(\"extensions.update.enabled\", false);\n"
@@ -15036,21 +26062,41 @@ void compat3_init_all(void){
         "user_pref(\"gfx.canvas.azure.accelerated\", false);\n"
         "user_pref(\"gfx.x11-egl.force-disabled\", true);\n"
         "user_pref(\"gfx.webrender.force-disabled\", true);\n"
+        "user_pref(\"image.cache.size\", 5242880);\n"
         "user_pref(\"layers.acceleration.disabled\", true);\n"
         "user_pref(\"layers.gpu-process.enabled\", false);\n"
         "user_pref(\"layers.omtp.enabled\", false);\n"
+        "user_pref(\"media.av1.enabled\", false);\n"
+        "user_pref(\"media.cache_size\", 4096);\n"
         "user_pref(\"media.cubeb.sandbox\", false);\n"
+        "user_pref(\"media.ffmpeg.vaapi.enabled\", false);\n"
         "user_pref(\"media.hardware-video-decoding.enabled\", false);\n"
+        "user_pref(\"media.memory_cache_max_size\", 8192);\n"
         "user_pref(\"media.rdd-process.enabled\", false);\n"
         "user_pref(\"network.captive-portal-service.enabled\", false);\n"
         "user_pref(\"network.connectivity-service.enabled\", false);\n"
+        "user_pref(\"network.dns.disableIPv6\", true);\n"
         "user_pref(\"network.dns.disablePrefetch\", true);\n"
+        "user_pref(\"network.dns.skipTRR-when-parental-control-enabled\", false);\n"
+        "user_pref(\"network.http.max-connections\", 8);\n"
+        "user_pref(\"network.http.max-persistent-connections-per-server\", 2);\n"
+        "user_pref(\"network.http.redirection-limit\", 3);\n"
+        "user_pref(\"network.http.http2.enabled\", false);\n"
+        "user_pref(\"network.http.http3.enabled\", false);\n"
+        "user_pref(\"network.http.spdy.enabled\", false);\n"
+        "user_pref(\"network.http.spdy.enabled.http2\", false);\n"
         "user_pref(\"network.http.speculative-parallel-limit\", 0);\n"
+        "user_pref(\"network.process.enabled\", false);\n"
         "user_pref(\"network.predictor.enabled\", false);\n"
         "user_pref(\"network.prefetch-next\", false);\n"
         "user_pref(\"network.proxy.type\", 0);\n"
         "user_pref(\"network.stricttransportsecurity.preloadlist\", false);\n"
+        "user_pref(\"security.cert_pinning.enforcement_level\", 0);\n"
+        "user_pref(\"network.trr.mode\", 5);\n"
+        "user_pref(\"security.OCSP.enabled\", 0);\n"
+        "user_pref(\"security.OCSP.require\", false);\n"
         "user_pref(\"services.settings.server\", \"\");\n"
+        "user_pref(\"dom.serviceWorkers.enabled\", false);\n"
         "user_pref(\"dom.security.https_first\", false);\n"
         "user_pref(\"dom.security.https_only_mode\", false);\n"
         "user_pref(\"dom.security.https_only_mode_ever_enabled\", false);\n"
@@ -15066,9 +26112,21 @@ void compat3_init_all(void){
         "user_pref(\"webgl.disabled\", true);\n");
     kvfs_write("/tmp/firefox-profile/user.js",
         "user_pref(\"browser.aboutwelcome.enabled\", false);\n"
+        "user_pref(\"browser.cache.disk.enable\", false);\n"
+        "user_pref(\"browser.cache.disk.capacity\", 0);\n"
+        "user_pref(\"browser.cache.memory.enable\", true);\n"
+        "user_pref(\"browser.cache.memory.capacity\", 16384);\n"
+        "user_pref(\"browser.cache.offline.enable\", false);\n"
+        "user_pref(\"browser.safebrowsing.blockedURIs.enabled\", false);\n"
+        "user_pref(\"browser.safebrowsing.downloads.enabled\", false);\n"
+        "user_pref(\"browser.safebrowsing.malware.enabled\", false);\n"
+        "user_pref(\"browser.safebrowsing.phishing.enabled\", false);\n"
+        "user_pref(\"browser.urlbar.speculativeConnect.enabled\", false);\n"
+        "user_pref(\"browser.sessionhistory.max_total_viewers\", 0);\n"
         "user_pref(\"browser.startup.blankWindow\", false);\n"
         "user_pref(\"browser.newtabpage.enabled\", false);\n"
         "user_pref(\"browser.newtabpage.activity-stream.enabled\", false);\n"
+        "user_pref(\"browser.fixup.fallback-to-https\", false);\n"
         "user_pref(\"browser.sessionstore.resume_from_crash\", false);\n"
         "user_pref(\"browser.sessionstore.resume_session_once\", false);\n"
         "user_pref(\"browser.sessionstore.restore_on_demand\", false);\n"
@@ -15095,13 +26153,40 @@ void compat3_init_all(void){
         "user_pref(\"dom.ipc.processCount.privilegedmozilla\", 1);\n"
         "user_pref(\"dom.ipc.processCount.web\", 1);\n"
         "user_pref(\"dom.ipc.processCount.webIsolated\", 1);\n"
+        "user_pref(\"dom.push.enabled\", false);\n"
+        "user_pref(\"dom.webnotifications.enabled\", false);\n"
         "user_pref(\"fission.autostart\", false);\n"
         "user_pref(\"fission.autostart.session\", false);\n"
         "user_pref(\"gfx.webrender.force-disabled\", true);\n"
+        "user_pref(\"image.cache.size\", 5242880);\n"
         "user_pref(\"layers.acceleration.disabled\", true);\n"
+        "user_pref(\"media.av1.enabled\", false);\n"
+        "user_pref(\"media.cache_size\", 4096);\n"
+        "user_pref(\"media.ffmpeg.vaapi.enabled\", false);\n"
+        "user_pref(\"media.hardware-video-decoding.enabled\", false);\n"
+        "user_pref(\"media.memory_cache_max_size\", 8192);\n"
         "user_pref(\"network.captive-portal-service.enabled\", false);\n"
         "user_pref(\"network.connectivity-service.enabled\", false);\n"
+        "user_pref(\"network.dns.disableIPv6\", true);\n"
+        "user_pref(\"network.dns.disablePrefetch\", true);\n"
+        "user_pref(\"network.dns.skipTRR-when-parental-control-enabled\", false);\n"
+        "user_pref(\"network.http.max-connections\", 8);\n"
+        "user_pref(\"network.http.max-persistent-connections-per-server\", 2);\n"
+        "user_pref(\"network.http.redirection-limit\", 3);\n"
+        "user_pref(\"network.http.http2.enabled\", false);\n"
+        "user_pref(\"network.http.http3.enabled\", false);\n"
+        "user_pref(\"network.http.spdy.enabled\", false);\n"
+        "user_pref(\"network.http.spdy.enabled.http2\", false);\n"
+        "user_pref(\"network.http.speculative-parallel-limit\", 0);\n"
+        "user_pref(\"network.process.enabled\", false);\n"
+        "user_pref(\"network.predictor.enabled\", false);\n"
+        "user_pref(\"network.prefetch-next\", false);\n"
         "user_pref(\"network.stricttransportsecurity.preloadlist\", false);\n"
+        "user_pref(\"security.cert_pinning.enforcement_level\", 0);\n"
+        "user_pref(\"network.trr.mode\", 5);\n"
+        "user_pref(\"security.OCSP.enabled\", 0);\n"
+        "user_pref(\"security.OCSP.require\", false);\n"
+        "user_pref(\"dom.serviceWorkers.enabled\", false);\n"
         "user_pref(\"dom.security.https_first\", false);\n"
         "user_pref(\"dom.security.https_only_mode\", false);\n"
         "user_pref(\"dom.security.https_only_mode_ever_enabled\", false);\n"
@@ -15194,7 +26279,7 @@ void compat3_init_all(void){
     kvfs_write("/tmp/chromium/Default/Secure Preferences","{}");
     kvfs_write("/tmp/chromium/Default/README","");
     kvfs_write("/tmp/chromium/Default/Managed Mode Settings","{}");
-    kvfs_write("/tmp/chromium/Default/Policy/User Policy","");
+    /* Si dejamos un policy vacio, Chromium intenta validarlo y se cierra antes de pintar. */
     kvfs_write("/tmp/chromium/WidevineCdm/latest-component-updated-widevine-cdm","");
     c3_ensure_dir_abs("/home/.config",0700);
     c3_ensure_dir_abs("/home/.config/chromium",0700);
@@ -15252,7 +26337,7 @@ void compat3_init_all(void){
     g_c3_dyn_needed_missing=0;
     g_c3_dyn_objects=0;
     g_c3_dyn_load_depth=0;
-    g_c3_dyn_timeout_ms=4000;
+    g_c3_dyn_timeout_ms=20000;
     g_c3_dyn_timeout_hits=0;
     g_c3_dyn_last_timeout_tsc=0;
     g_c3_dyn_last_timeout_obj[0]=0;
@@ -15274,8 +26359,12 @@ void compat3_init_all(void){
     c3_memset(g_c3_ns_mask,0,sizeof(g_c3_ns_mask));
     c3_memset(g_c3_no_new_privs,0,sizeof(g_c3_no_new_privs));
     c3_memset(g_c3_sched_affinity,0,sizeof(g_c3_sched_affinity));
+    c3_memset(g_c3_sched_policy,0,sizeof(g_c3_sched_policy));
+    c3_memset(g_c3_sched_priority,0,sizeof(g_c3_sched_priority));
     c3_memset(g_c3_rlimits,0,sizeof(g_c3_rlimits));
     c3_memset(g_c3_rlimits_inited,0,sizeof(g_c3_rlimits_inited));
+    c3_memset(g_c3_rseq_state,0,sizeof(g_c3_rseq_state));
+    c3_memset(g_c3_membarrier_reg,0,sizeof(g_c3_membarrier_reg));
     for(i=0;i<TASK_MAX;++i)g_c3_rlimits_pid[i]=-1;
     for(i=0;i<TASK_MAX;++i){
         g_c3_sched_affinity[i][0]=1ULL;
@@ -15283,6 +26372,7 @@ void compat3_init_all(void){
     }
     c3_memset(g_c3_phys_refcnt,0,sizeof(g_c3_phys_refcnt));
     c3_memset(g_c3_file_pages,0,sizeof(g_c3_file_pages));
+    c3_memset(g_c3_file_page_lookup,0,sizeof(g_c3_file_page_lookup));
     /* Rewire syscall table from stubs to real implementations */
     compat3_rewire_syscalls();
     /* Register shell commands */
@@ -15299,7 +26389,7 @@ void compat3_init_all(void){
     {
         extern int bsd_to_linux_errno(int error);
         /* The mapping returns NEGATIVE Linux errnos (e.g. -11 for
-         * EAGAIN). We print as 32-bit unsigned for readability — a
+         * EAGAIN). We print as 32-bit unsigned for readability â€” a
          * "good" run shows 0xFFFFFFF5 (-11), 0xFFFFFFEA (-22),
          * 0xFFFFFFDA (-38), 0xFFFFFFE0 (-32). */
         __boot_serial_puts("[linuxulator] M1A bsd_to_linux_errno smoke test:\n");

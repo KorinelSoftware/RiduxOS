@@ -1,12 +1,20 @@
 param(
-    [string]$IsoPath = ".\build\RiduxOS-Unix.iso",
-    [string]$VmName = "RiduxOS_Unix_Demo",
+    # Default to the canonical repo-root ISO produced by the native Ridux shell build.
+    # Older parallel ISOs in build_*\*.iso are still picked up via the
+    # auto-detection block below if the canonical one is missing, so existing
+    # workflows keep working.
+    [string]$IsoPath = ".\RiduxOS.iso",
+    [string]$VmName = "RiduxOS_Native_Desktop",
     [int]$MemoryMB = 2048,
     [int]$CpuCount = 2,
     [int]$CpuExecutionCap = 65,
     [int]$VramMB = 128,
     [int]$BootSeconds = 30,
     [string]$SerialLogPath = ".\build\vbox-serial.log",
+    [string]$GraphicsController = "vmsvga",
+    [ValidateSet("usbtablet", "ps2", "usb")]
+    [string]$Mouse = "ps2",
+    [switch]$Accelerate3D = $true,
     [switch]$SkipScreenshot,
     [switch]$KeepRunning,
     [switch]$Interactive
@@ -19,7 +27,30 @@ if (-not (Test-Path $VBoxManage)) {
     throw "VBoxManage no encontrado en '$VBoxManage'."
 }
 if (-not (Test-Path $IsoPath)) {
-    throw "ISO no encontrada en '$IsoPath'."
+    # Auto-detect the most recently built ISO if the requested path is missing.
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $candidates = @(
+        (Join-Path $repoRoot "RiduxOS.iso"),
+        (Join-Path $repoRoot "build_wayfire_safe\RiduxOS-Wayfire-Full-Desktop.iso"),
+        (Join-Path $repoRoot "build_wsl_firefox\RiduxOS-Unix.iso"),
+        (Join-Path $repoRoot "build_codex_check\RiduxOS-Unix-firefox-exec-repair-20260505.iso")
+    )
+    $resolved = $null
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) { $resolved = $cand; break }
+    }
+    if (-not $resolved) {
+        $resolved = Get-ChildItem -Path $repoRoot -Recurse -Filter "*.iso" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 100MB } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if ($resolved) {
+        Write-Output "ISO '$IsoPath' no encontrada; usando '$resolved'."
+        $IsoPath = $resolved
+    } else {
+        throw "ISO no encontrada en '$IsoPath' (ni en build_*\*.iso). Genera una con make all o con .\scripts\ridux-ui-safe.ps1 -Iso -AllowHeavy."
+    }
 }
 
 $IsoFullPath = (Resolve-Path $IsoPath).Path
@@ -66,9 +97,13 @@ Invoke-VBox @(
     "--cpus", "$CpuCount",
     "--cpuexecutioncap", "$CpuExecutionCap",
     "--vram", "$VramMB",
-    "--graphicscontroller", "vboxsvga",
-    "--mouse", "ps2",
+    "--graphicscontroller", $GraphicsController,
+    "--accelerate3d", $(if ($Accelerate3D) { "on" } else { "off" }),
+    "--mouse", $Mouse,
     "--keyboard", "ps2",
+    "--nic1", "nat",
+    "--nictype1", "82540EM",
+    "--cableconnected1", "on",
     "--boot1", "dvd",
     "--audio-enabled", "off"
 ) | Out-Null

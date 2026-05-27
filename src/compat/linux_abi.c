@@ -133,6 +133,8 @@ static const char *c6_skip_ws(const char *s) {
 #define C6_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED (1 << 4)
 #define C6_MEMBARRIER_CMD_PRIVATE_EXPEDITED   (1 << 3)
 #define C6_MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE (1 << 5)
+#define C6_RSEQ_FLAG_UNREGISTER              1u
+#define C6_RSEQ_UNREGISTERED_CPU             0xFFFFFFFFu
 
 #define C6_OPEN_HOW_SIZE_VER0   ((size_t)(sizeof(c6_open_how_t)))
 #define C6_RESOLVE_NO_XDEV      0x01u
@@ -188,6 +190,7 @@ static const char *c6_skip_ws(const char *s) {
 #define C6_STATX_SIZE        0x00000200U
 #define C6_STATX_BLOCKS      0x00000400U
 #define C6_STATX_BASIC_STATS 0x000007FFU
+#define C6_STATX_MNT_ID      0x00001000U
 
 typedef struct {
     uint64_t flags;
@@ -303,8 +306,8 @@ static void c6_rseq_mark_unregistered(int tidx) {
     st = &g_c6_rseq_state[tidx];
     if (st->user_ptr && st->user_len >= sizeof(uint32_t) * 2) {
         usr = (c6_rseq_user_t*)(uintptr_t)st->user_ptr;
-        usr->cpu_id_start = 0xFFFFFFFFu;
-        usr->cpu_id = 0xFFFFFFFFu;
+        usr->cpu_id_start = C6_RSEQ_UNREGISTERED_CPU;
+        usr->cpu_id = C6_RSEQ_UNREGISTERED_CPU;
     }
     c6_memset(st, 0, sizeof(*st));
 }
@@ -363,13 +366,21 @@ static bool c6_pid_exists(int pid) {
 static int c6_alloc_pidfd_for_pid(int pid) {
     task_t *cur = task_current();
     if (!cur) return -ESRCH;
-    return fd_alloc(&cur->fdt, FDKIND_PROC, pid, FDFL_READABLE);
+    return fd_alloc(&cur->fdt, FDKIND_PIDFD, pid, FDFL_READABLE);
+}
+
+static uint32_t c6_linux_dev_major(uint64_t dev) {
+    return (uint32_t)(((dev >> 8) & 0xFFFu) | ((dev >> 32) & ~0xFFFu));
+}
+
+static uint32_t c6_linux_dev_minor(uint64_t dev) {
+    return (uint32_t)((dev & 0xFFu) | ((dev >> 12) & ~0xFFu));
 }
 
 static void c6_fill_statx_from_kstat(c6_statx_t *dst, const kstat_t *st) {
     if (!dst || !st) return;
     c6_memset(dst, 0, sizeof(*dst));
-    dst->stx_mask = C6_STATX_BASIC_STATS;
+    dst->stx_mask = C6_STATX_BASIC_STATS | C6_STATX_MNT_ID;
     dst->stx_blksize = (uint32_t)st->st_blksize;
     dst->stx_nlink = st->st_nlink;
     dst->stx_uid = st->st_uid;
@@ -384,6 +395,11 @@ static void c6_fill_statx_from_kstat(c6_statx_t *dst, const kstat_t *st) {
     dst->stx_mtime.tv_nsec = (uint32_t)st->st_mtime_nsec;
     dst->stx_ctime.tv_sec = st->st_ctime_sec;
     dst->stx_ctime.tv_nsec = (uint32_t)st->st_ctime_nsec;
+    dst->stx_rdev_major = c6_linux_dev_major(st->st_rdev);
+    dst->stx_rdev_minor = c6_linux_dev_minor(st->st_rdev);
+    dst->stx_dev_major = c6_linux_dev_major(st->st_dev);
+    dst->stx_dev_minor = c6_linux_dev_minor(st->st_dev);
+    dst->stx_mnt_id = 1;
 }
 
 /* syscall handlers (6-arg ABI) */
@@ -429,13 +445,37 @@ static int64_t c6_sys_statx(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 }
 
 static int64_t c6_sys_rseq(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
-    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    /*
-     * rseq is only safe once task switching can inspect the user rseq_cs and
-     * redirect interrupted critical sections to their abort IP. Until then,
-     * make userland fall back to its non-rseq synchronization paths.
-     */
-    return -ENOSYS;
+    c6_rseq_user_t *usr = (c6_rseq_user_t*)(uintptr_t)a0;
+    uint32_t len = (uint32_t)a1;
+    int flags = (int)a2;
+    uint32_t sig = (uint32_t)a3;
+    int tidx = c6_current_task_index();
+    c6_rseq_state_t *st;
+    (void)a4; (void)a5;
+    if (tidx < 0) return -ESRCH;
+    if (!usr) return -EFAULT;
+    if (len < sizeof(c6_rseq_user_t)) return -EINVAL;
+    if (flags != 0 && flags != (int)C6_RSEQ_FLAG_UNREGISTER) return -EINVAL;
+    st = &g_c6_rseq_state[tidx];
+    if (flags & (int)C6_RSEQ_FLAG_UNREGISTER) {
+        if (!st->registered) return -EINVAL;
+        if (st->user_ptr != (uint64_t)(uintptr_t)usr) return -EINVAL;
+        c6_rseq_mark_unregistered(tidx);
+        return 0;
+    }
+    if (st->registered) {
+        if (st->user_ptr == (uint64_t)(uintptr_t)usr) return 0;
+        return -EBUSY;
+    }
+    st->registered = true;
+    st->user_ptr = (uint64_t)(uintptr_t)usr;
+    st->user_len = len;
+    st->signature = sig;
+    usr->cpu_id_start = 0;
+    usr->cpu_id = 0;
+    usr->rseq_cs = 0;
+    usr->flags = 0;
+    return 0;
 }
 
 static int64_t c6_sys_pidfd_send_signal(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -447,7 +487,7 @@ static int64_t c6_sys_pidfd_send_signal(uint64_t a0, uint64_t a1, uint64_t a2, u
 
     if (!cur) return -ESRCH;
     if (!fd_valid(&cur->fdt, pidfd)) return -EBADF;
-    if (cur->fdt.fds[pidfd].kind != FDKIND_PROC) return -EINVAL;
+    if (cur->fdt.fds[pidfd].kind != FDKIND_PIDFD) return -EINVAL;
 
     target_pid = cur->fdt.fds[pidfd].ref;
     return real_sys_kill(target_pid, sig);
@@ -680,6 +720,7 @@ static int64_t c6_sys_close_range(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
         if (!fd_valid(&cur->fdt, ifd)) continue;
         if (flags & C6_CLOSE_RANGE_CLOEXEC) {
             cur->fdt.fds[ifd].flags |= FDFL_CLOEXEC;
+            compat3_fd_flags_changed(ifd);
         } else {
             real_sys_close(ifd);
         }
@@ -744,7 +785,7 @@ static int64_t c6_sys_pidfd_getfd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     if (!cur) return -ESRCH;
     if (flags != 0) return -EINVAL;
     if (!fd_valid(&cur->fdt, pidfd)) return -EBADF;
-    if (cur->fdt.fds[pidfd].kind != FDKIND_PROC) return -EINVAL;
+    if (cur->fdt.fds[pidfd].kind != FDKIND_PIDFD) return -EINVAL;
 
     target_pid = cur->fdt.fds[pidfd].ref;
     if (target_pid != cur->pid) return -ENOSYS;
@@ -998,7 +1039,7 @@ static void cmd6_pidfd(const char *args, char *out, int out_max) {
 
     c6_append_str(out, &l, (size_t)out_max, "FD  TARGET_PID\n");
     for (i = 0; i < TASK_FD_MAX; ++i) {
-        if (cur->fdt.fds[i].kind != FDKIND_PROC) continue;
+        if (cur->fdt.fds[i].kind != FDKIND_PIDFD) continue;
         c6_append_u32(out, &l, (size_t)out_max, (uint32_t)i);
         c6_append_str(out, &l, (size_t)out_max, "   ");
         c6_append_u32(out, &l, (size_t)out_max, (uint32_t)cur->fdt.fds[i].ref);

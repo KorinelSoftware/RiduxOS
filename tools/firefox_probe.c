@@ -1,36 +1,31 @@
-// Tiny Firefox preload probe for Ridux browser bring-up.
-// Logs dependentlibs parsing and dlopen/dlsym decisions without libc stdio.
+// Shim chico para Firefox en Ridux.
+// En la VM glibc abre dependentlibs.list, pero fgets() nos estaba devolviendo una linea vacia.
+// Le damos la lista a mano y dejamos el resto tal cual.
 #define _GNU_SOURCE
 #include <dlfcn.h>
-#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 
-static long rp_sys3(long nr, long a0, long a1, long a2) {
-    long ret;
-    __asm__ volatile("syscall"
-                     : "=a"(ret)
-                     : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
-                     : "rcx", "r11", "memory");
-    return ret;
-}
+static FILE *g_dep_file;
+static unsigned g_dep_line;
 
-static size_t rp_len(const char *s) {
-    size_t n = 0;
-    if (!s) return 0;
-    while (s[n]) ++n;
-    return n;
-}
-
-static int rp_eq(const char *a, const char *b) {
-    size_t i = 0;
-    if (!a || !b) return 0;
-    for (;;) {
-        if (a[i] != b[i]) return 0;
-        if (!a[i]) return 1;
-        ++i;
-    }
-}
+static const char *const g_dep_lines[] = {
+    "libnspr4.so\n",
+    "libplc4.so\n",
+    "libplds4.so\n",
+    "libmozsandbox.so\n",
+    "libgkcodecs.so\n",
+    "liblgpllibs.so\n",
+    "libnssutil3.so\n",
+    "libnss3.so\n",
+    "libsmime3.so\n",
+    "libmozsqlite3.so\n",
+    "libssl3.so\n",
+    "libmozgtk.so\n",
+    "libmozwayland.so\n",
+    "libxul.so\n",
+    0
+};
 
 static int rp_has(const char *s, const char *needle) {
     size_t i, j;
@@ -42,110 +37,57 @@ static int rp_has(const char *s, const char *needle) {
     return 0;
 }
 
-static void rp_write(const char *s, size_t n) {
-    if (s && n) (void)rp_sys3(1, 2, (long)s, (long)n);
+static void *rp_next_symbol(const char *name) {
+    return dlsym(RTLD_NEXT, name);
 }
 
-static void rp_puts(const char *s) {
-    rp_write(s, rp_len(s));
-}
-
-static void rp_hex(uint64_t v) {
-    char out[18];
-    static const char h[] = "0123456789abcdef";
-    out[0] = '0';
-    out[1] = 'x';
-    for (int i = 0; i < 16; ++i) out[2 + i] = h[(v >> (60 - 4 * i)) & 15];
-    rp_write(out, sizeof(out));
-}
-
-static void rp_line_sample(const char *s) {
-    char out[181];
-    size_t n = 0;
-    if (!s) {
-        rp_puts("(null)");
-        return;
+static char *rp_copy_fgets_line(char *dst, int size, const char *line) {
+    int i = 0;
+    if (!dst || size <= 0 || !line) return 0;
+    while (i + 1 < size && line[i]) {
+        dst[i] = line[i];
+        ++i;
     }
-    while (s[n] && n < sizeof(out)) {
-        char ch = s[n];
-        if (ch == '\n') ch = '|';
-        if (ch == '\r' || ch == '\t') ch = ' ';
-        if (ch < ' ' || ch > '~') ch = '.';
-        out[n++] = ch;
-    }
-    rp_write(out, n);
+    dst[i] = 0;
+    return dst;
 }
 
-static void *rp_dlvsym_next(const char *name, const char *ver) {
-    typedef void *(*dlvsym_fn)(void *, const char *, const char *);
-    static dlvsym_fn real_dlvsym;
-    if (!real_dlvsym) {
-        real_dlvsym = (dlvsym_fn)dlvsym(RTLD_NEXT, "dlvsym", "GLIBC_2.2.5");
-    }
-    return real_dlvsym ? real_dlvsym(RTLD_NEXT, name, ver) : 0;
-}
+FILE *fopen(const char *pathname, const char *mode) {
+    typedef FILE *(*real_fopen_t)(const char *, const char *);
+    static real_fopen_t real_fopen;
+    FILE *ret;
 
-static void *rp_resolve(const char *name) {
-    void *p = rp_dlvsym_next(name, "GLIBC_2.34");
-    if (!p) p = rp_dlvsym_next(name, "GLIBC_2.2.5");
-    return p;
+    if (!real_fopen) real_fopen = (real_fopen_t)rp_next_symbol("fopen");
+    ret = real_fopen ? real_fopen(pathname, mode) : 0;
+    if (ret && pathname && rp_has(pathname, "dependentlibs.list")) {
+        g_dep_file = ret;
+        g_dep_line = 0;
+    }
+    return ret;
 }
 
 char *fgets(char *s, int size, FILE *stream) {
     typedef char *(*real_fgets_t)(char *, int, FILE *);
     static real_fgets_t real_fgets;
-    static unsigned seen;
-    char *ret;
-    if (!real_fgets) real_fgets = (real_fgets_t)rp_resolve("fgets");
-    ret = real_fgets ? real_fgets(s, size, stream) : 0;
-    if (seen < 16 && ret && (rp_has(ret, ".so") || rp_has(ret, "lib"))) {
-        ++seen;
-        rp_puts("[ffprobe] fgets ");
-        rp_line_sample(ret);
-        rp_puts("\n");
+
+    if (stream == g_dep_file) {
+        const char *line = g_dep_lines[g_dep_line];
+        if (line) ++g_dep_line;
+        return rp_copy_fgets_line(s, size, line);
     }
-    return ret;
+
+    if (!real_fgets) real_fgets = (real_fgets_t)rp_next_symbol("fgets");
+    return real_fgets ? real_fgets(s, size, stream) : 0;
 }
 
-void *dlopen(const char *filename, int flags) {
-    typedef void *(*real_dlopen_t)(const char *, int);
-    static real_dlopen_t real_dlopen;
-    static unsigned seen;
-    void *ret;
-    if (!real_dlopen) real_dlopen = (real_dlopen_t)rp_resolve("dlopen");
-    if (seen < 48 && filename && (rp_has(filename, "/opt/firefox/") || rp_has(filename, "libxul") || rp_has(filename, "libnspr"))) {
-        ++seen;
-        rp_puts("[ffprobe] dlopen enter file=");
-        rp_line_sample(filename);
-        rp_puts(" flags=");
-        rp_hex((uint64_t)(uint32_t)flags);
-        rp_puts("\n");
-    }
-    ret = real_dlopen ? real_dlopen(filename, flags) : 0;
-    if (seen < 48 && filename && (rp_has(filename, "/opt/firefox/") || rp_has(filename, "libxul") || rp_has(filename, "libnspr"))) {
-        rp_puts("[ffprobe] dlopen exit file=");
-        rp_line_sample(filename);
-        rp_puts(" handle=");
-        rp_hex((uint64_t)(uintptr_t)ret);
-        rp_puts("\n");
-    }
-    return ret;
-}
+int fclose(FILE *stream) {
+    typedef int (*real_fclose_t)(FILE *);
+    static real_fclose_t real_fclose;
 
-void *dlsym(void *handle, const char *symbol) {
-    typedef void *(*real_dlsym_t)(void *, const char *);
-    static real_dlsym_t real_dlsym;
-    void *ret;
-    if (!real_dlsym) real_dlsym = (real_dlsym_t)rp_resolve("dlsym");
-    ret = real_dlsym ? real_dlsym(handle, symbol) : 0;
-    if (symbol && (rp_eq(symbol, "XRE_GetBootstrap") || rp_has(symbol, "Bootstrap"))) {
-        rp_puts("[ffprobe] dlsym symbol=");
-        rp_line_sample(symbol);
-        rp_puts(" handle=");
-        rp_hex((uint64_t)(uintptr_t)handle);
-        rp_puts(" result=");
-        rp_hex((uint64_t)(uintptr_t)ret);
-        rp_puts("\n");
+    if (stream == g_dep_file) {
+        g_dep_file = 0;
+        g_dep_line = 0;
     }
-    return ret;
+    if (!real_fclose) real_fclose = (real_fclose_t)rp_next_symbol("fclose");
+    return real_fclose ? real_fclose(stream) : -1;
 }

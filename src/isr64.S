@@ -181,6 +181,7 @@ irq_common_stub64:
 1:
     movq 120(%rsp), %rdi
     subq $32, %rdi         /* vector -> irq number */
+    movq 144(%rsp), %rsi   /* saved CS */
     call irq_dispatch
     movq 144(%rsp), %rax
     testq $3, %rax
@@ -292,6 +293,8 @@ syscall_entry:
 
     /* Overwrite saved rax (at +112) with syscall return value. */
     movq %rax, 112(%rsp)
+    movq %rsp, %rdi
+    call task_repair_syscall_return_frame
 
     /* Some deeper syscall paths have been observed to scribble over
      * the iret frame while leaving the saved GPR block intact.
@@ -321,6 +324,7 @@ syscall_entry:
     movq  96(%rsp), %rax        /* saved rcx -> user RIP */
     movq %rax, 136(%rsp)
     movq  32(%rsp), %rax        /* saved r11 -> user RFLAGS */
+    orq $0x202, %rax             /* ring3 must resume with IF set */
     movq %rax, 152(%rsp)
     movq $0x2B, 144(%rsp)       /* user CS */
     movq $0x33, 168(%rsp)       /* user SS */

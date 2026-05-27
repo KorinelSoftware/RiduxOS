@@ -91,6 +91,90 @@ void abort(void) {
     for (;;) {}
 }
 
+typedef unsigned int pthread_key_t;
+
+#define RIDUX_TSD_KEYS 1024
+#define RIDUX_TSD_THREADS 160
+
+static volatile int ridux_tsd_lock;
+static unsigned ridux_tsd_next_key;
+static long ridux_tsd_tid[RIDUX_TSD_THREADS];
+static void *ridux_tsd_values[RIDUX_TSD_THREADS][RIDUX_TSD_KEYS];
+
+static void ridux_lock(volatile int *lock) {
+    while (__sync_lock_test_and_set(lock, 1)) {
+        __asm__ volatile("pause");
+    }
+}
+
+static void ridux_unlock(volatile int *lock) {
+    __sync_lock_release(lock);
+}
+
+static long ridux_gettid(void) {
+    return ridux_sys3(186, 0, 0, 0);
+}
+
+static int ridux_tsd_slot_locked(long tid) {
+    int free_slot = -1;
+    for (int i = 0; i < RIDUX_TSD_THREADS; ++i) {
+        if (ridux_tsd_tid[i] == tid) return i;
+        if (ridux_tsd_tid[i] == 0 && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) {
+        ridux_tsd_tid[free_slot] = tid;
+        return free_slot;
+    }
+    return 0;
+}
+
+__attribute__((no_stack_protector))
+int pthread_key_create(pthread_key_t *key, void (*destructor)(void *)) {
+    unsigned k;
+    (void)destructor;
+    if (!key) return 22;
+    ridux_lock(&ridux_tsd_lock);
+    k = ridux_tsd_next_key++;
+    ridux_unlock(&ridux_tsd_lock);
+    if (k >= RIDUX_TSD_KEYS) return 11;
+    *key = (pthread_key_t)k;
+    return 0;
+}
+
+__attribute__((no_stack_protector))
+int pthread_key_delete(pthread_key_t key) {
+    if (key >= RIDUX_TSD_KEYS) return 22;
+    ridux_lock(&ridux_tsd_lock);
+    for (int i = 0; i < RIDUX_TSD_THREADS; ++i) {
+        ridux_tsd_values[i][key] = 0;
+    }
+    ridux_unlock(&ridux_tsd_lock);
+    return 0;
+}
+
+__attribute__((no_stack_protector))
+void *pthread_getspecific(pthread_key_t key) {
+    void *value;
+    int slot;
+    if (key >= RIDUX_TSD_KEYS) return 0;
+    ridux_lock(&ridux_tsd_lock);
+    slot = ridux_tsd_slot_locked(ridux_gettid());
+    value = ridux_tsd_values[slot][key];
+    ridux_unlock(&ridux_tsd_lock);
+    return value;
+}
+
+__attribute__((no_stack_protector))
+int pthread_setspecific(pthread_key_t key, const void *value) {
+    int slot;
+    if (key >= RIDUX_TSD_KEYS) return 22;
+    ridux_lock(&ridux_tsd_lock);
+    slot = ridux_tsd_slot_locked(ridux_gettid());
+    ridux_tsd_values[slot][key] = (void *)value;
+    ridux_unlock(&ridux_tsd_lock);
+    return 0;
+}
+
 __attribute__((no_stack_protector))
 const char *g_strerror(int errnum) {
     /*

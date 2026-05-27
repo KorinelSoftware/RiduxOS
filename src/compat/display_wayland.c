@@ -18,10 +18,12 @@ extern size_t ulibc_strlen(const char*);extern char*ulibc_strcpy(char*,const cha
 extern int ulibc_strcmp(const char*,const char*);extern int ulibc_strncmp(const char*,const char*,size_t);
 extern int ulibc_memcmp(const void*,const void*,size_t);
 extern int ulibc_snprintf(char*,size_t,const char*,...);
+extern int drm_resolve_prime_fd(int32_t fd,uint64_t offset,uint64_t len,uint64_t *kernel_ptr,uint64_t *avail);
 extern uint32_t ulibc_arc4random(void);
 extern void ulibc_arc4random_buf(void*,size_t);
 extern int64_t real_sys_lseek(int fd,int64_t offset,int whence);
 extern int64_t real_sys_read(int fd,void *buf,size_t count);
+extern bool kvfs_exists(const char *path);
 extern bool g_use_backbuffer;
 extern uint32_t g_backbuffer[];
 extern void fb_present(void);
@@ -42,6 +44,16 @@ static int c7_strcasecmp(const char *a,const char *b){
         ++b;
     }
     return (int)((unsigned char)c7_ascii_tolower(*a)-(unsigned char)c7_ascii_tolower(*b));
+}
+
+static bool c7_x11_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0){
+        cached=(kvfs_exists("/etc/ridux-x11-debug.enable")||
+                kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    }
+    return cached!=0;
 }
 
 static size_t c7_strnlen_u8(const uint8_t *s,size_t maxn){
@@ -263,6 +275,14 @@ static tcp7_tcb_t*tcp7_find(int fd){int i;for(i=0;i<TCP7_MAX_CONNECTIONS;++i)if(
 
 static uint32_t tcp7_isn(void){return ulibc_arc4random();}
 
+static uint64_t tcp7_now_ms(void){
+    uint32_t lo,hi;
+    uint64_t tsc;
+    __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));
+    tsc=((uint64_t)hi<<32)|lo;
+    return tsc/3000000ull;
+}
+
 static void tcp7_release_tcb(tcp7_tcb_t*tcb){
     if(!tcb)return;
     tcb->sock_fd=-1;
@@ -270,6 +290,14 @@ static void tcp7_release_tcb(tcp7_tcb_t*tcb){
     tcb->delack_pending=false;
     tcb->time_wait_expire=0;
     tcb->delack_expire=0;
+}
+
+void tcp7_drop_socket(int sock_fd){
+    int i;
+    for(i=0;i<TCP7_MAX_CONNECTIONS;++i){
+        tcp7_tcb_t*tcb=&g_tcp7_tcbs[i];
+        if(tcb->sock_fd==sock_fd)tcp7_release_tcb(tcb);
+    }
 }
 
 static void tcp7_rtt_update(tcp7_tcb_t*tcb,uint32_t rtt_ms){
@@ -284,28 +312,34 @@ static void tcp7_rtt_update(tcp7_tcb_t*tcb,uint32_t rtt_ms){
 static void tcp7_send_syn(int fd,tcp7_tcb_t*tcb){
     socket_t*s=&g_sockets[fd];
     uint8_t pkt[60];int h=net_build_tcp(pkt,s->local_port,s->remote_port,tcb->iss,0,TCP_SYN,tcb->rcv_wnd);
-    sock_send(fd,pkt,(size_t)h,0);
+    pkt[12]=0x60;pkt[20]=2;pkt[21]=4;pkt[22]=(uint8_t)(tcb->mss>>8);pkt[23]=(uint8_t)tcb->mss;h=24;
+    if(net_is_real_external(s->remote_ip))net_send_tcp_frame(fd,pkt,(size_t)h);
+    else sock_send(fd,pkt,(size_t)h,0);
     tcb->snd_nxt=tcb->iss+1;tcb->snd_una=tcb->iss;
 }
 
 static void tcp7_send_synack(int fd,tcp7_tcb_t*tcb){
     socket_t*s=&g_sockets[fd];
     uint8_t pkt[60];int h=net_build_tcp(pkt,s->local_port,s->remote_port,tcb->iss,tcb->irs+1,TCP_SYN|TCP_ACK,tcb->rcv_wnd);
-    sock_send(fd,pkt,(size_t)h,0);
+    pkt[12]=0x60;pkt[20]=2;pkt[21]=4;pkt[22]=(uint8_t)(tcb->mss>>8);pkt[23]=(uint8_t)tcb->mss;h=24;
+    if(net_is_real_external(s->remote_ip))net_send_tcp_frame(fd,pkt,(size_t)h);
+    else sock_send(fd,pkt,(size_t)h,0);
     tcb->snd_nxt=tcb->iss+1;tcb->snd_una=tcb->iss;
 }
 
 static void tcp7_send_ack(int fd,tcp7_tcb_t*tcb){
     socket_t*s=&g_sockets[fd];
     uint8_t pkt[60];int h=net_build_tcp(pkt,s->local_port,s->remote_port,tcb->snd_nxt,tcb->rcv_nxt,TCP_ACK,tcb->rcv_wnd);
-    sock_send(fd,pkt,(size_t)h,0);
+    if(net_is_real_external(s->remote_ip))net_send_tcp_frame(fd,pkt,(size_t)h);
+    else sock_send(fd,pkt,(size_t)h,0);
     tcb->delack_pending=false;
 }
 
 static void tcp7_send_fin(int fd,tcp7_tcb_t*tcb){
     socket_t*s=&g_sockets[fd];
     uint8_t pkt[60];int h=net_build_tcp(pkt,s->local_port,s->remote_port,tcb->snd_nxt,tcb->rcv_nxt,TCP_FIN|TCP_ACK,tcb->rcv_wnd);
-    sock_send(fd,pkt,(size_t)h,0);
+    if(net_is_real_external(s->remote_ip))net_send_tcp_frame(fd,pkt,(size_t)h);
+    else sock_send(fd,pkt,(size_t)h,0);
     tcb->snd_nxt++;
 }
 
@@ -332,6 +366,7 @@ int tcp7_connect(int sock_fd,uint32_t dst_ip,uint16_t dst_port){
     s->tcp_state=TCP_SYN_SENT;
     s->tcp_seq=tcb->iss;s->tcp_ack=0;
     tcp7_send_syn(sock_fd,tcb);
+    tcb->rto_expire=tcp7_now_ms()+tcb->rto;
     return 0;
 }
 
@@ -374,7 +409,13 @@ int tcp7_send(int sock_fd,const void*buf,size_t len){
         uint8_t pkt[1500];
         int h=net_build_tcp(pkt,s->local_port,s->remote_port,tcb->snd_nxt,tcb->rcv_nxt,TCP_ACK|TCP_PSH,tcb->rcv_wnd);
         ulibc_memcpy(pkt+h,p+sent,seg);
-        sock_send(sock_fd,pkt,(size_t)(h+seg),0);
+        if(net_is_real_external(s->remote_ip)){
+            int rc=net_send_tcp_frame(sock_fd,pkt,(size_t)(h+seg));
+            if(rc<0)return sent?(int)sent:-EAGAIN;
+        }else{
+            int rc=sock_send(sock_fd,pkt,(size_t)(h+seg),0);
+            if(rc<0)return rc;
+        }
         tcb->snd_nxt+=(uint32_t)seg;
         sent+=seg;
     }
@@ -388,14 +429,7 @@ int tcp7_recv(int sock_fd,void*buf,size_t len){
     tcp7_tcb_t*tcb=tcp7_find(sock_fd);if(!tcb)return-ENOTCONN;
     if(tcb->state!=TCP7_ESTABLISHED&&tcb->state!=TCP7_FIN_WAIT_1&&tcb->state!=TCP7_FIN_WAIT_2&&tcb->state!=TCP7_CLOSE_WAIT){
         if(tcb->state==TCP7_TIME_WAIT||tcb->state==TCP7_CLOSED)return 0;return-ENOTCONN;}
-    /* Use existing socket rx buffer */
-    int rc=sock_recv(sock_fd,buf,len,0);
-    if(rc>0){
-        tcb->rcv_nxt+=(uint32_t)rc;
-        tcb->delack_pending=true;
-        tcb->delack_expire=2;
-    }
-    return rc;
+    return sock_recv(sock_fd,buf,len,0);
 }
 
 int tcp7_close(int sock_fd){
@@ -411,23 +445,53 @@ int tcp7_close(int sock_fd){
     return 0;
 }
 
-void tcp7_incoming_segment(int sock_fd,const uint8_t*ip_pkt,size_t len){
-    (void)ip_pkt;(void)len;
-    tcp7_tcb_t*tcb=tcp7_find(sock_fd);if(!tcb)return;
-    /* Parse TCP flags from packet */
-    uint8_t flags=0;if(len>33)flags=ip_pkt[33];
+int tcp7_incoming_segment(int sock_fd,const uint8_t*tcp_seg,size_t len){
+    tcp7_tcb_t*tcb=tcp7_find(sock_fd);if(!tcb)return 0;
+    int accept_payload=0;
+    if(!tcp_seg||len<20)return 0;
+    /* Aca recibimos el segmento TCP pelado, no el paquete IP entero. */
+    uint8_t flags=tcp_seg[13];
     uint32_t seq=0,ack=0;
     uint16_t wnd=0;
-    if(len>24){seq=((uint32_t)ip_pkt[24]<<24)|((uint32_t)ip_pkt[25]<<16)|((uint32_t)ip_pkt[26]<<8)|ip_pkt[27];}
-    if(len>28){ack=((uint32_t)ip_pkt[28]<<24)|((uint32_t)ip_pkt[29]<<16)|((uint32_t)ip_pkt[30]<<8)|ip_pkt[31];}
-    if(len>35){wnd=(uint16_t)(((uint16_t)ip_pkt[34]<<8)|ip_pkt[35]);}
+    size_t hdr_len=(size_t)(((tcp_seg[12]>>4)&0xFu)*4u);
+    size_t payload_len=0;
+    if(hdr_len<20||hdr_len>len)return 0;
+    seq=((uint32_t)tcp_seg[4]<<24)|((uint32_t)tcp_seg[5]<<16)|((uint32_t)tcp_seg[6]<<8)|tcp_seg[7];
+    ack=((uint32_t)tcp_seg[8]<<24)|((uint32_t)tcp_seg[9]<<16)|((uint32_t)tcp_seg[10]<<8)|tcp_seg[11];
+    wnd=(uint16_t)(((uint16_t)tcp_seg[14]<<8)|tcp_seg[15]);
+    payload_len=len-hdr_len;
     if(wnd)tcb->snd_wnd=wnd;
+    if((flags&TCP_SYN)&&hdr_len>20){
+        size_t off=20;
+        while(off<hdr_len){
+            uint8_t kind=tcp_seg[off];
+            uint8_t olen;
+            if(kind==0)break;
+            if(kind==1){++off;continue;}
+            if(off+1>=hdr_len)break;
+            olen=tcp_seg[off+1];
+            if(olen<2||off+olen>hdr_len)break;
+            if(kind==2&&olen==4){
+                uint32_t m=((uint32_t)tcp_seg[off+2]<<8)|tcp_seg[off+3];
+                if(m>=536&&m<tcb->mss)tcb->mss=m;
+            }
+            off+=olen;
+        }
+    }
+    if(flags&TCP_RST){
+        tcb->state=TCP7_CLOSED;
+        g_sockets[sock_fd].tcp_state=TCP_CLOSED;
+        g_sockets[sock_fd].error=ECONNREFUSED;
+        tcp7_release_tcb(tcb);
+        return 0;
+    }
 
     switch(tcb->state){
     case TCP7_SYN_SENT:
         if(flags&TCP_SYN&&flags&TCP_ACK){
             tcb->irs=seq;tcb->rcv_nxt=seq+1;
             tcb->snd_una=ack;tcb->state=TCP7_ESTABLISHED;
+            tcb->rto_expire=0;
             tcp7_rtt_update(tcb,100);/* estimate */
             tcb->cc_state=CC_SLOW_START;
             g_sockets[sock_fd].tcp_state=TCP_ESTABLISHED;
@@ -439,8 +503,15 @@ void tcp7_incoming_segment(int sock_fd,const uint8_t*ip_pkt,size_t len){
         if(flags&TCP_ACK){tcb->snd_una=ack;tcb->state=TCP7_ESTABLISHED;g_sockets[sock_fd].tcp_state=TCP_ESTABLISHED;}
         break;
     case TCP7_ESTABLISHED:
-        if(flags&TCP_FIN){tcb->rcv_nxt++;tcb->state=TCP7_CLOSE_WAIT;g_sockets[sock_fd].tcp_state=TCP_CLOSE_WAIT;tcp7_send_ack(sock_fd,tcb);}
-        else if(flags&TCP_ACK){
+        if(payload_len>0){
+            if(seq==tcb->rcv_nxt){
+                tcb->rcv_nxt+=(uint32_t)payload_len;
+                accept_payload=1;
+            }
+            tcp7_send_ack(sock_fd,tcb);
+        }
+        if((flags&TCP_FIN)&&seq+(uint32_t)payload_len==tcb->rcv_nxt){tcb->rcv_nxt++;tcb->state=TCP7_CLOSE_WAIT;g_sockets[sock_fd].tcp_state=TCP_CLOSE_WAIT;tcp7_send_ack(sock_fd,tcb);}
+        if(flags&TCP_ACK){
             if(ack>tcb->snd_una){uint32_t nacked=ack-tcb->snd_una;tcb->snd_una=ack;tcb->dup_acks=0;
                 /* CC: new ACK, grow window */
                 if(tcb->cc_state==CC_SLOW_START){tcb->cwnd+=nacked;if(tcb->cwnd>=tcb->ssthresh)tcb->cc_state=CC_AVOIDANCE;}
@@ -469,16 +540,23 @@ void tcp7_incoming_segment(int sock_fd,const uint8_t*ip_pkt,size_t len){
         break;
     default:break;
     }
+    return accept_payload;
 }
 
 void tcp7_tick(void){
-    int i;for(i=0;i<TCP7_MAX_CONNECTIONS;++i){
+    uint64_t now;
+    int i;
+    e1000_poll_rx();
+    now=tcp7_now_ms();
+    for(i=0;i<TCP7_MAX_CONNECTIONS;++i){
         tcp7_tcb_t*tcb=&g_tcp7_tcbs[i];if(tcb->sock_fd<0)continue;
         /* RTO check for SYN_SENT/SYN_RCVD */
         if(tcb->state==TCP7_SYN_SENT||tcb->state==TCP7_SYN_RCVD){
+            if(tcb->rto_expire&&now<tcb->rto_expire)continue;
             tcb->rto_count++;if(tcb->rto_count>=tcb->rto_max){tcb->state=TCP7_CLOSED;g_sockets[tcb->sock_fd].tcp_state=TCP_CLOSED;g_sockets[tcb->sock_fd].error=ETIMEDOUT;tcp7_release_tcb(tcb);continue;}
             if(tcb->state==TCP7_SYN_SENT)tcp7_send_syn(tcb->sock_fd,tcb);
             else tcp7_send_synack(tcb->sock_fd,tcb);
+            tcb->rto_expire=now+tcb->rto;
             tcb->rto*=2;if(tcb->rto>TCP7_RTO_MAX)tcb->rto=TCP7_RTO_MAX;
         }
         /* TIME_WAIT expiry */
@@ -510,21 +588,51 @@ static tls7_session_t*tls7_find(int fd){int i;for(i=0;i<TLS7_MAX_SESSIONS;++i)if
 /* TLS record header: 1 byte type, 2 bytes version, 2 bytes length */
 static int tls7_send_record(tls7_session_t*s,uint8_t type,const uint8_t*payload,uint16_t len){
     uint8_t hdr[5];hdr[0]=type;hdr[1]=0x03;hdr[2]=0x03;hdr[3]=(uint8_t)(len>>8);hdr[4]=(uint8_t)len;
-    sock_send(s->sock_fd,hdr,5,0);
-    sock_send(s->sock_fd,payload,len,0);
+    if(s->sock_fd>=0&&s->sock_fd<SOCK_MAX&&net_is_real_external(g_sockets[s->sock_fd].remote_ip)){
+        tcp7_send(s->sock_fd,hdr,5);
+        tcp7_send(s->sock_fd,payload,len);
+    }else{
+        sock_send(s->sock_fd,hdr,5,0);
+        sock_send(s->sock_fd,payload,len,0);
+    }
     return 0;
 }
 
 /* TLS record read: returns record type, payload in s->recv_buf */
 static int tls7_recv_record(tls7_session_t*s){
-    uint8_t hdr[5];int rc=sock_recv(s->sock_fd,hdr,5,0);
+    uint8_t hdr[5];int rc;
+    bool real_ext=(s->sock_fd>=0&&s->sock_fd<SOCK_MAX&&net_is_real_external(g_sockets[s->sock_fd].remote_ip));
+    if(real_ext){
+        /* Poll E1000 to get incoming data */
+        int tries;
+        for(tries=0;tries<500;++tries){
+            e1000_poll_rx();
+            rc=sock_recv(s->sock_fd,hdr,5,0);
+            if(rc>=5)break;
+            {volatile int spin;for(spin=0;spin<20000;++spin)__asm__ volatile("pause");}
+        }
+    }else{
+        rc=sock_recv(s->sock_fd,hdr,5,0);
+    }
     if(rc<5)return-1;
-    uint16_t len=((uint16_t)hdr[3]<<8)|hdr[4];
+    {uint16_t len=((uint16_t)hdr[3]<<8)|hdr[4];
     if(len>TLS7_MAX_FRAG)return-1;
-    rc=sock_recv(s->sock_fd,s->recv_buf,len,0);
-    if(rc<0)return-1;
-    s->recv_len=(uint32_t)rc;
-    return hdr[0];
+    if(real_ext){
+        uint32_t got=0;
+        int tries;
+        for(tries=0;tries<1000&&got<len;++tries){
+            e1000_poll_rx();
+            rc=sock_recv(s->sock_fd,s->recv_buf+got,(size_t)(len-got),0);
+            if(rc>0)got+=(uint32_t)rc;
+            else{volatile int spin;for(spin=0;spin<20000;++spin)__asm__ volatile("pause");}
+        }
+        s->recv_len=got;
+    }else{
+        rc=sock_recv(s->sock_fd,s->recv_buf,len,0);
+        if(rc<0)return-1;
+        s->recv_len=(uint32_t)rc;
+    }
+    return hdr[0];}
 }
 
 /* Build ClientHello */
@@ -1269,7 +1377,11 @@ static uint32_t g_x11_trace_win_count;
 static uint32_t g_x11_trace_event_count;
 static uint32_t g_x11_trace_atom_count;
 static uint32_t g_x11_trace_render_count;
+static uint32_t g_x11_trace_draw_count;
+static uint32_t g_x11_trace_wm_count;
+static uint32_t g_x11_trace_late_req_count;
 static uint32_t g_x11_server_time;
+static uint32_t g_x11_repaint_nudge_budget=240;
 static uint32_t g_wl7_trace_count;
 static uint32_t g_wl7_req_trace_count;
 #define WL7_TRACE_ATTACH_LIMIT 16u
@@ -1278,12 +1390,39 @@ static uint32_t g_wl7_req_trace_count;
 static int g_x11_focus_conn=-1;
 static uint32_t g_x11_focus_window=0;
 static uint16_t g_x11_key_state_mask;
+static uint8_t g_x11_key_down_map[32];
+static uint16_t g_x11_pointer_button_mask;
+static int g_x11_pointer_conn=-1;
+static uint32_t g_x11_pointer_window=0;
+static int g_x11_drag_conn=-1;
+static uint32_t g_x11_drag_window=0;
+static int g_x11_drag_off_x=0;
+static int g_x11_drag_off_y=0;
+static int g_x11_button_grab_conn=-1;
+static uint32_t g_x11_button_grab_window=0;
 
 extern void ridux_request_cursor_redraw(void);
 extern void ridux_present_cursor_after_external_blit(int x,int y,int w,int h);
+extern bool ridux_scene_needs_redraw(void);
+
+static uint32_t x11_rd32(const x11_connection_t *c,const uint8_t *p);
 
 #define X11_MAX_REQUEST_BYTES (32u*1024u*1024u)
 #define X11_EVENT_MASK_PROPERTY_CHANGE (1u<<22)
+#define X11_EVENT_MASK_FOCUS_CHANGE    (1u<<21)
+#define X11_EVENT_MASK_VISIBILITY      (1u<<16)
+#define X11_EVENT_MASK_KEY_PRESS       (1u<<0)
+#define X11_EVENT_MASK_KEY_RELEASE     (1u<<1)
+#define X11_EVENT_MASK_KEY             (X11_EVENT_MASK_KEY_PRESS|X11_EVENT_MASK_KEY_RELEASE)
+#define X11_XKB_KEY_TYPES_MASK         (1u<<0)
+#define X11_XKB_KEY_SYMS_MASK          (1u<<1)
+#define X11_XKB_MODIFIER_MAP_MASK      (1u<<2)
+#define X11_XKB_EXPLICIT_MASK          (1u<<3)
+#define X11_XKB_KEY_ACTIONS_MASK       (1u<<4)
+#define X11_XKB_KEY_BEHAVIORS_MASK     (1u<<5)
+#define X11_XKB_VIRTUAL_MODS_MASK      (1u<<6)
+#define X11_XKB_VIRTUAL_MOD_MAP_MASK   (1u<<7)
+#define X11_XKB_ALL_MAP_MASK           0x00FFu
 
 typedef struct {
     uint32_t id;
@@ -1375,6 +1514,16 @@ static uint32_t x11_intern_atom(x11_connection_t *c,const char *name,bool create
     return id;
 }
 
+static bool x11_name_starts_with(const char *s,const char *prefix){
+    if(!s||!prefix)return false;
+    while(*prefix){
+        if(*s!=*prefix)return false;
+        ++s;
+        ++prefix;
+    }
+    return true;
+}
+
 static void x11_init_atoms(x11_connection_t *c){
     size_t i;
     if(!c)return;
@@ -1383,6 +1532,7 @@ static void x11_init_atoms(x11_connection_t *c){
     }
     x11_intern_atom(c,"WM_PROTOCOLS",true);
     x11_intern_atom(c,"WM_DELETE_WINDOW",true);
+    x11_intern_atom(c,"WM_TAKE_FOCUS",true);
     x11_intern_atom(c,"UTF8_STRING",true);
     x11_intern_atom(c,"_NET_SUPPORTED",true);
     x11_intern_atom(c,"_NET_SUPPORTING_WM_CHECK",true);
@@ -1403,6 +1553,14 @@ static void x11_init_atoms(x11_connection_t *c){
     x11_intern_atom(c,"_NET_WM_ACTION_MAXIMIZE_HORZ",true);
     x11_intern_atom(c,"_NET_FRAME_EXTENTS",true);
     x11_intern_atom(c,"_NET_WORKAREA",true);
+    x11_intern_atom(c,"_NET_CURRENT_DESKTOP",true);
+    x11_intern_atom(c,"_NET_NUMBER_OF_DESKTOPS",true);
+    x11_intern_atom(c,"_NET_DESKTOP_VIEWPORT",true);
+    x11_intern_atom(c,"_NET_CLIENT_LIST",true);
+    x11_intern_atom(c,"_NET_CLIENT_LIST_STACKING",true);
+    x11_intern_atom(c,"_GTK_WORKAREAS",true);
+    x11_intern_atom(c,"_GTK_WORKAREAS_D0",true);
+    x11_intern_atom(c,"_GTK_EDGE_CONSTRAINTS",true);
     x11_intern_atom(c,"_SCREENSAVER_STATUS",true);
     x11_intern_atom(c,"_MOTIF_WM_HINTS",true);
     x11_intern_atom(c,"WM_S0",true);
@@ -1437,8 +1595,17 @@ static const char *x11_opcode_name(uint8_t opcode){
         case X11_GrabServer:return "GrabServer";
         case X11_UngrabServer:return "UngrabServer";
         case X11_GrabPointer:return "GrabPointer";
+        case X11_UngrabPointer:return "UngrabPointer";
+        case X11_GrabButton:return "GrabButton";
+        case X11_UngrabButton:return "UngrabButton";
+        case X11_ChangeActivePointerGrab:return "ChangeActivePointerGrab";
         case X11_GrabKeyboard:return "GrabKeyboard";
+        case X11_UngrabKeyboard:return "UngrabKeyboard";
+        case X11_GrabKey:return "GrabKey";
+        case X11_UngrabKey:return "UngrabKey";
+        case X11_AllowEvents:return "AllowEvents";
         case X11_QueryPointer:return "QueryPointer";
+        case X11_QueryKeymap:return "QueryKeymap";
         case X11_TranslateCoordinates:return "TranslateCoordinates";
         case X11_WarpPointer:return "WarpPointer";
         case X11_SetInputFocus:return "SetInputFocus";
@@ -1486,6 +1653,7 @@ static const char *x11_ext_opcode_name(x11_connection_t *c,uint8_t opcode){
 
 static void x11_trace_setup(x11_connection_t *c){
     if(!c)return;
+    if(!c7_x11_trace_enabled())return;
     __boot_serial_force_puts("[x11-setup!] fd=");
     __boot_serial_force_putu32((uint32_t)c->sock_fd);
     __boot_serial_force_puts(" proto=");
@@ -1503,13 +1671,66 @@ static void x11_trace_setup(x11_connection_t *c){
     __boot_serial_force_puts("\n");
 }
 
-static void x11_trace_request(x11_connection_t *c,uint8_t opcode,uint8_t extra,uint16_t req_len,size_t body_len){
+static bool x11_trace_request_interesting(x11_connection_t *c,uint8_t opcode){
+    if(opcode==X11_GetKeyboardMapping||
+       opcode==X11_GetModifierMapping||
+       opcode==X11_CreateWindow||
+       opcode==X11_ChangeWindowAttributes||
+       opcode==X11_GetWindowAttributes||
+       opcode==X11_MapWindow||
+       opcode==X11_UnmapWindow||
+       opcode==X11_MapSubwindows||
+       opcode==X11_ConfigureWindow||
+       opcode==X11_GetGeometry||
+       opcode==X11_QueryTree||
+       opcode==X11_ChangeProperty||
+       opcode==X11_GetProperty||
+       opcode==X11_SendEvent||
+       opcode==X11_SetInputFocus||
+       opcode==X11_GetInputFocus||
+       opcode==X11_QueryPointer||
+       opcode==X11_QueryKeymap||
+       opcode==X11_GrabPointer||
+       opcode==X11_UngrabPointer||
+       opcode==X11_GrabButton||
+       opcode==X11_UngrabButton||
+       opcode==X11_ChangeActivePointerGrab||
+       opcode==X11_GrabKeyboard||
+       opcode==X11_UngrabKeyboard||
+       opcode==X11_GrabKey||
+       opcode==X11_UngrabKey||
+       opcode==X11_AllowEvents||
+       opcode==X11_CreatePixmap||
+       opcode==X11_CreateGC||
+       opcode==X11_ChangeGC||
+       opcode==X11_CopyArea||
+       opcode==X11_PolyFillRectangle||
+       opcode==X11_PutImage||
+       opcode==X11_GetImage)return true;
+    if(!c)return false;
+    return opcode==c->ext_opcode_shm||
+           opcode==c->ext_opcode_render||
+           opcode==c->ext_opcode_xfixes||
+           opcode==c->ext_opcode_shape||
+           opcode==c->ext_opcode_xkeyboard||
+           opcode==c->ext_opcode_sync||
+           opcode==c->ext_opcode_bigreq;
+}
+
+static void x11_trace_request(x11_connection_t *c,uint8_t opcode,uint8_t extra,
+                              uint16_t req_len,size_t body_len,const uint8_t *body){
     const char *ext_name;
-    if(g_x11_trace_req_count>=1400)return;
+    bool interesting;
+    if(!c7_x11_trace_enabled())return;
     ++g_x11_trace_req_count;
     ext_name=x11_ext_opcode_name(c,opcode);
-    if(opcode==X11_GetKeyboardMapping||opcode==X11_GetModifierMapping||
-       opcode==X11_CreateWindow||opcode==X11_MapWindow){
+    interesting=x11_trace_request_interesting(c,opcode);
+    if(!interesting)return;
+    if(g_x11_trace_req_count>96){
+        if(g_x11_trace_late_req_count>=240)return;
+        ++g_x11_trace_late_req_count;
+    }
+    if(interesting){
         __boot_serial_force_puts("[x11-req!] #");
         __boot_serial_force_putu32(g_x11_trace_req_count);
         __boot_serial_force_puts(" fd=");
@@ -1528,12 +1749,21 @@ static void x11_trace_request(x11_connection_t *c,uint8_t opcode,uint8_t extra,u
         __boot_serial_force_putu32((uint32_t)body_len);
         __boot_serial_force_puts(" pending=");
         __boot_serial_force_putu32(c?(uint32_t)c->req_len:0);
+        if(body&&body_len>=4){
+            __boot_serial_force_puts(" arg0=");
+            __boot_serial_force_puthex64((uint64_t)x11_rd32(c,body));
+        }
+        if(body&&body_len>=8){
+            __boot_serial_force_puts(" arg1=");
+            __boot_serial_force_puthex64((uint64_t)x11_rd32(c,body+4));
+        }
         __boot_serial_force_puts("\n");
     }
 }
 
 static void x11_trace_extension(x11_connection_t *c,const char *name,uint8_t minor,size_t body_len,const char *action){
-    if(g_x11_trace_ext_count>=40)return;
+    if(!c7_x11_trace_enabled())return;
+    if(g_x11_trace_ext_count>=160)return;
     ++g_x11_trace_ext_count;
     __boot_serial_force_puts("[x11-ext!] #");
     __boot_serial_force_putu32(g_x11_trace_ext_count);
@@ -1551,8 +1781,17 @@ static void x11_trace_extension(x11_connection_t *c,const char *name,uint8_t min
 }
 
 static void x11_trace_window_op(x11_connection_t *c,const char *op,uint32_t id,int w,int h){
-    if(g_x11_trace_win_count>=320)return;
-    ++g_x11_trace_win_count;
+    if(!c7_x11_trace_enabled())return;
+    if(op&&(ulibc_strcmp(op,"putimage")==0||
+            ulibc_strcmp(op,"shm-putimage")==0||
+            ulibc_strcmp(op,"render-fillrect")==0||
+            ulibc_strcmp(op,"render-composite")==0)){
+        if(g_x11_trace_draw_count>=80)return;
+        ++g_x11_trace_draw_count;
+    }else{
+        if(g_x11_trace_win_count>=80)return;
+        ++g_x11_trace_win_count;
+    }
     __boot_serial_force_puts("[x11-win!] ");
     __boot_serial_force_puts(op?op:"?");
     __boot_serial_force_puts(" fd=");
@@ -1569,23 +1808,24 @@ static void x11_trace_window_op(x11_connection_t *c,const char *op,uint32_t id,i
 }
 
 static void x11_trace_atom(x11_connection_t *c,const char *op,uint32_t id,const char *name,uint32_t aux){
-    if(g_x11_trace_atom_count>=320)return;
+    if(!c7_x11_trace_enabled())return;
+    if(g_x11_trace_atom_count>=80)return;
     ++g_x11_trace_atom_count;
-    __boot_serial_puts("[x11-atom] #");
-    __boot_serial_putu32(g_x11_trace_atom_count);
-    __boot_serial_puts(" fd=");
-    __boot_serial_putu32(c?(uint32_t)c->sock_fd:0);
-    __boot_serial_puts(" ");
-    __boot_serial_puts(op?op:"?");
-    __boot_serial_puts(" id=");
-    __boot_serial_putu32(id);
-    __boot_serial_puts(" name=");
-    __boot_serial_puts((name&&*name)?name:"?");
+    __boot_serial_force_puts("[x11-atom] #");
+    __boot_serial_force_putu32(g_x11_trace_atom_count);
+    __boot_serial_force_puts(" fd=");
+    __boot_serial_force_putu32(c?(uint32_t)c->sock_fd:0);
+    __boot_serial_force_puts(" ");
+    __boot_serial_force_puts(op?op:"?");
+    __boot_serial_force_puts(" id=");
+    __boot_serial_force_putu32(id);
+    __boot_serial_force_puts(" name=");
+    __boot_serial_force_puts((name&&*name)?name:"?");
     if(aux){
-        __boot_serial_puts(" aux=");
-        __boot_serial_puthex64((uint64_t)aux);
+        __boot_serial_force_puts(" aux=");
+        __boot_serial_force_puthex64((uint64_t)aux);
     }
-    __boot_serial_puts("\n");
+    __boot_serial_force_puts("\n");
 }
 
 static uint32_t x11_selection_owner_for_name(x11_connection_t *c,const char *name){
@@ -1596,8 +1836,8 @@ static uint32_t x11_selection_owner_for_name(x11_connection_t *c,const char *nam
      * unmanaged 1x1/10x10 setup path, while root SendEvent is still dropped
      * below so client messages do not echo back into the app.
      */
-    if(ulibc_strcmp(name,"WM_S0")==0)return c->root_window;
-    if(ulibc_strcmp(name,"_XSETTINGS_S0")==0)return 0;
+    if(ulibc_strcmp(name,"WM_S0")==0)return c->wm_check_window?c->wm_check_window:c->root_window;
+    if(ulibc_strcmp(name,"_XSETTINGS_S0")==0)return c->xsettings_window?c->xsettings_window:c->root_window;
     /* Do not claim a full compositing manager yet. Chromium switches into a
      * heavier XComposite path when this selection has an owner; our fast path
      * is the simpler X11 backing-store + MIT-SHM/software paint route. */
@@ -1606,13 +1846,30 @@ static uint32_t x11_selection_owner_for_name(x11_connection_t *c,const char *nam
 }
 
 static bool x11_advertise_wm(const x11_connection_t *c){
-    return c&&c->root_window;
+    return c&&c->root_window&&c->wm_check_window;
 }
 
 static void x11_wr16(const x11_connection_t *c,uint8_t *p,uint16_t v);
 static void x11_wr32(const x11_connection_t *c,uint8_t *p,uint32_t v);
+static void x11_send_property32_values_reply(x11_connection_t *c,uint32_t type,
+                                             const uint32_t *vals,uint32_t count,
+                                             uint32_t long_off,uint32_t long_len);
 static void x11_push_event(x11_connection_t*c,const x11_event_t*ev);
+static x11_window_t*x11_find_window(x11_connection_t*c,uint32_t id);
+static x11_window_t*x11_top_window(x11_connection_t *c,x11_window_t *w);
+static x11_window_t*x11_active_top_window(x11_connection_t *c);
+static uint32_t x11_collect_client_windows(x11_connection_t *c,uint32_t *out,uint32_t max);
+static bool x11_window_is_keyboard_target(x11_connection_t *c,x11_window_t *w);
+static x11_window_t *x11_find_keyboard_window(int *conn_idx);
+static x11_window_t *x11_keyboard_target_from_window(x11_connection_t *c,x11_window_t *w);
+static uint32_t x11_next_server_time(void);
+static bool x11_set_property32_values(x11_connection_t *c,uint32_t window,uint32_t atom,
+                                      uint32_t type,const uint32_t *vals,uint32_t count);
+static void x11_activate_window(x11_connection_t *c,uint32_t focus_wid,bool send_take_focus);
+static bool x11_handle_root_client_message(x11_connection_t *c,const uint8_t *raw);
+void x11_render_now(void);
 static bool x11_window_content_origin(x11_connection_t *c,x11_window_t *w,int *x,int *y);
+static x11_window_t *x11_find_screen_window(int screen_x,int screen_y,int *conn_idx,int *win_x,int *win_y);
 
 static void x11_push_xfixes_selection_event(x11_connection_t *c,uint32_t window,uint32_t selection,uint32_t owner){
     uint8_t raw[32];
@@ -1686,6 +1943,345 @@ static void x11_push_expose_event(x11_connection_t *c,uint32_t wid,int x,int y,i
     x11_push_raw32_event(c,raw);
 }
 
+static void x11_push_focus_in_event(x11_connection_t *c,uint32_t wid){
+    uint8_t raw[32];
+    if(!c||!wid)return;
+    ulibc_memset(raw,0,sizeof(raw));
+    raw[0]=X11_FocusIn;
+    raw[1]=3;                    /* NotifyNonlinear: "esta ventana queda activa" */
+    x11_wr16(c,raw+2,c->sequence);
+    x11_wr32(c,raw+4,wid);
+    raw[8]=0;                    /* NotifyNormal */
+    x11_push_raw32_event(c,raw);
+}
+
+static void x11_push_focus_out_event(x11_connection_t *c,uint32_t wid){
+    uint8_t raw[32];
+    if(!c||!wid)return;
+    ulibc_memset(raw,0,sizeof(raw));
+    raw[0]=X11_FocusOut;
+    raw[1]=3;
+    x11_wr16(c,raw+2,c->sequence);
+    x11_wr32(c,raw+4,wid);
+    raw[8]=0;
+    x11_push_raw32_event(c,raw);
+}
+
+static void x11_push_client_message32(x11_connection_t *c,uint32_t wid,uint32_t type_atom,
+                                      uint32_t d0,uint32_t d1,uint32_t d2,uint32_t d3,uint32_t d4){
+    uint8_t raw[32];
+    x11_event_t ev;
+    if(!c||!wid||!type_atom)return;
+    ulibc_memset(raw,0,sizeof(raw));
+    raw[0]=(uint8_t)(X11_ClientMessage|0x80u);
+    raw[1]=32;
+    x11_wr16(c,raw+2,c->sequence);
+    x11_wr32(c,raw+4,wid);
+    x11_wr32(c,raw+8,type_atom);
+    x11_wr32(c,raw+12,d0);
+    x11_wr32(c,raw+16,d1);
+    x11_wr32(c,raw+20,d2);
+    x11_wr32(c,raw+24,d3);
+    x11_wr32(c,raw+28,d4);
+    ulibc_memcpy(&ev,raw,sizeof(ev));
+    x11_push_event(c,&ev);
+}
+
+static void x11_push_crossing_event(x11_connection_t *c,uint32_t wid,uint8_t type,
+                                    int root_x,int root_y,int win_x,int win_y){
+    uint8_t raw[32];
+    if(!c||!wid)return;
+    ulibc_memset(raw,0,sizeof(raw));
+    raw[0]=type;
+    raw[1]=0;                    /* NotifyAncestor: enough for GTK focus */
+    x11_wr16(c,raw+2,c->sequence);
+    x11_wr32(c,raw+4,x11_next_server_time());
+    x11_wr32(c,raw+8,c->root_window);
+    x11_wr32(c,raw+12,wid);
+    x11_wr32(c,raw+16,0);
+    x11_wr16(c,raw+20,(uint16_t)(int16_t)root_x);
+    x11_wr16(c,raw+22,(uint16_t)(int16_t)root_y);
+    x11_wr16(c,raw+24,(uint16_t)(int16_t)win_x);
+    x11_wr16(c,raw+26,(uint16_t)(int16_t)win_y);
+    x11_wr16(c,raw+28,(uint16_t)(g_x11_key_state_mask|g_x11_pointer_button_mask));
+    raw[30]=0;                   /* NotifyNormal */
+    raw[31]=3;                   /* misma pantalla y con foco */
+    x11_push_raw32_event(c,raw);
+}
+
+static void x11_push_visibility_event(x11_connection_t *c,uint32_t wid,uint8_t state){
+    uint8_t raw[32];
+    if(!c||!wid)return;
+    ulibc_memset(raw,0,sizeof(raw));
+    raw[0]=X11_VisibilityNotify;
+    x11_wr16(c,raw+2,c->sequence);
+    x11_wr32(c,raw+4,wid);
+    raw[8]=state;                /* 0 = sin tapar */
+    x11_push_raw32_event(c,raw);
+}
+
+static bool x11_window_is_tiny_focus_proxy(x11_connection_t *c,x11_window_t *w){
+    (void)c;
+    return w&&w->used&&w->width<32&&w->height<24;
+}
+
+static bool x11_window_is_keyboard_target(x11_connection_t *c,x11_window_t *w){
+    if(!c||!w||!w->used)return false;
+    if(w->id==c->root_window)return false;
+    if(!w->mapped||!w->visible)return false;
+    if(x11_window_is_tiny_focus_proxy(c,w))return false;
+    if(w->event_mask&X11_EVENT_MASK_KEY)return true;
+    return true;
+}
+
+static bool x11_window_wants_key_events(x11_connection_t *c,x11_window_t *w){
+    if(!c||!w||!w->used)return false;
+    if(w->id==c->root_window)return false;
+    if(!w->mapped||!w->visible)return false;
+    if(x11_window_is_tiny_focus_proxy(c,w))return false;
+    return (w->event_mask&X11_EVENT_MASK_KEY)!=0;
+}
+
+static bool x11_window_selects_key_event(x11_connection_t *c,x11_window_t *w,bool press){
+    uint32_t need=press?X11_EVENT_MASK_KEY_PRESS:X11_EVENT_MASK_KEY_RELEASE;
+    return w&&w->used&&!x11_window_is_tiny_focus_proxy(c,w)&&
+           ((w->event_mask&need)!=0);
+}
+
+static bool x11_window_is_descendant_of(x11_connection_t *c,x11_window_t *w,uint32_t ancestor){
+    int guard=0;
+    if(!c||!w||!ancestor)return false;
+    while(w&&guard++<X11_MAX_WINDOWS){
+        if(w->id==ancestor)return true;
+        if(!w->parent||w->parent==w->id||w->parent==c->root_window)break;
+        w=x11_find_window(c,w->parent);
+    }
+    return false;
+}
+
+static x11_window_t *x11_find_keyboard_window(int *conn_idx){
+    int ci,wi;
+    uint64_t best_area=0;
+    x11_window_t *best=0;
+    int best_ci=-1;
+    for(ci=X11_MAX_CONN-1;ci>=0;--ci){
+        x11_connection_t *c=&g_x11_conns[ci];
+        if(!c->used)continue;
+        for(wi=X11_MAX_WINDOWS-1;wi>=0;--wi){
+            x11_window_t *w=&c->windows[wi];
+            uint64_t area;
+            if(!x11_window_is_keyboard_target(c,w))continue;
+            area=(uint64_t)(uint32_t)w->width*(uint64_t)(uint32_t)w->height;
+            if(area>=best_area){
+                best=w;
+                best_ci=ci;
+                best_area=area;
+            }
+        }
+    }
+    if(conn_idx)*conn_idx=best_ci;
+    return best;
+}
+
+static x11_window_t *x11_keyboard_target_from_window(x11_connection_t *c,x11_window_t *w){
+    int guard=0;
+    x11_window_t *cur=w;
+    x11_window_t *best=0;
+    uint64_t best_area=0;
+    int i;
+    if(!c)return 0;
+    while(cur&&guard++<X11_MAX_WINDOWS){
+        if(x11_window_is_keyboard_target(c,cur))return cur;
+        if(!cur->parent||cur->parent==cur->id||cur->parent==c->root_window)break;
+        cur=x11_find_window(c,cur->parent);
+    }
+    for(i=0;i<X11_MAX_WINDOWS;++i){
+        x11_window_t *cand=&c->windows[i];
+        uint64_t area;
+        if(!x11_window_is_keyboard_target(c,cand))continue;
+        area=(uint64_t)(uint32_t)cand->width*(uint64_t)(uint32_t)cand->height;
+        if(area>=best_area){
+            best=cand;
+            best_area=area;
+        }
+    }
+    return best;
+}
+
+static x11_window_t *x11_key_event_target_from_focus(x11_connection_t *c,uint32_t focus_wid){
+    x11_window_t *focus;
+    x11_window_t *focus_top;
+    x11_window_t *best=0;
+    uint64_t best_area=0;
+    int i;
+    if(!c)return 0;
+    focus=x11_find_window(c,focus_wid);
+    if(x11_window_is_tiny_focus_proxy(c,focus)){
+        focus_top=x11_top_window(c,focus);
+        for(i=0;i<X11_MAX_WINDOWS;++i){
+            x11_window_t *cand=&c->windows[i];
+            uint64_t area;
+            if(!cand->used||cand->id==c->root_window)continue;
+            if(!cand->mapped||!cand->visible)continue;
+            if(x11_window_is_tiny_focus_proxy(c,cand))continue;
+            if(focus_top&&x11_top_window(c,cand)!=focus_top)continue;
+            area=(uint64_t)(uint32_t)cand->width*(uint64_t)(uint32_t)cand->height;
+            if(area>=best_area){
+                best=cand;
+                best_area=area;
+            }
+        }
+        if(best)return best;
+    }
+    if(x11_window_wants_key_events(c,focus))return focus;
+    focus_top=x11_top_window(c,focus);
+    for(i=0;i<X11_MAX_WINDOWS;++i){
+        x11_window_t *cand=&c->windows[i];
+        x11_window_t *cand_top;
+        uint64_t area;
+        if(!x11_window_wants_key_events(c,cand))continue;
+        cand_top=x11_top_window(c,cand);
+        if(focus&&focus->id!=c->root_window){
+            bool same_tree=(focus_top&&cand_top&&focus_top==cand_top);
+            if(!same_tree&&!x11_window_is_descendant_of(c,cand,focus->id)&&
+               !x11_window_is_descendant_of(c,focus,cand->id))continue;
+        }
+        area=(uint64_t)(uint32_t)cand->width*(uint64_t)(uint32_t)cand->height;
+        if(area>=best_area){
+            best=cand;
+            best_area=area;
+        }
+    }
+    if(best)return best;
+    return x11_keyboard_target_from_window(c,focus);
+}
+
+static x11_window_t *x11_key_delivery_target(x11_connection_t *c,uint32_t focus_wid,bool press){
+    x11_window_t *cur;
+    x11_window_t *fallback;
+    int guard=0;
+    if(!c)return 0;
+    cur=x11_find_window(c,focus_wid);
+    if(x11_window_is_tiny_focus_proxy(c,cur)){
+        fallback=x11_key_event_target_from_focus(c,focus_wid);
+        if(fallback)return fallback;
+        return cur;
+    }
+    while(cur&&guard++<X11_MAX_WINDOWS){
+        if(x11_window_selects_key_event(c,cur,press))return cur;
+        if(!cur->parent||cur->parent==cur->id||cur->parent==c->root_window)break;
+        cur=x11_find_window(c,cur->parent);
+    }
+    fallback=x11_key_event_target_from_focus(c,focus_wid);
+    if(fallback)return fallback;
+    return x11_find_window(c,focus_wid);
+}
+
+static bool x11_window_is_paint_surface(x11_connection_t *c,x11_window_t *w){
+    if(!c||!w||!w->used)return false;
+    if(w->id==c->root_window)return false;
+    if(!w->mapped||!w->visible)return false;
+    if(w->width<96||w->height<72)return false;
+    if(x11_window_is_tiny_focus_proxy(c,w))return false;
+    return true;
+}
+
+static int x11_push_expose_family(x11_connection_t *c,x11_window_t *anchor,int max_events){
+    x11_window_t *top;
+    int i,count=0;
+    if(!c||!anchor||max_events<=0)return 0;
+    top=x11_top_window(c,anchor);
+    if(!top)top=anchor;
+    if(x11_window_is_paint_surface(c,top)){
+        x11_push_expose_event(c,top->id,0,0,top->width,top->height);
+        ++count;
+    }
+    for(i=0;i<X11_MAX_WINDOWS&&count<max_events;++i){
+        x11_window_t *w=&c->windows[i];
+        if(!x11_window_is_paint_surface(c,w))continue;
+        if(top&&w->id==top->id)continue;
+        if(top&&!x11_window_is_descendant_of(c,w,top->id))continue;
+        x11_push_expose_event(c,w->id,0,0,w->width,w->height);
+        ++count;
+    }
+    return count;
+}
+
+static void x11_request_input_repaint(x11_connection_t *c,x11_window_t *w){
+    g_x11_repaint_nudge_budget=120;
+    (void)x11_push_expose_family(c,w,3);
+}
+
+static void x11_nudge_browser_repaint(void){
+    static uint32_t trace_count;
+    int ci,total=0;
+    if(!g_x11_repaint_nudge_budget)return;
+    for(ci=0;ci<X11_MAX_CONN&&!total;++ci){
+        x11_connection_t *c=&g_x11_conns[ci];
+        int wi;
+        x11_window_t *best=0;
+        uint64_t best_score=0;
+        if(!c->used)continue;
+        for(wi=0;wi<X11_MAX_WINDOWS;++wi){
+            x11_window_t *w=&c->windows[wi];
+            uint64_t score;
+            if(!x11_window_is_paint_surface(c,w))continue;
+            if(w->width<300||w->height<180)continue;
+            score=(uint64_t)(uint32_t)w->width*(uint64_t)(uint32_t)w->height;
+            if(w->parent&&w->parent!=c->root_window)score+=(1ull<<40);
+            if(score>=best_score){
+                best=w;
+                best_score=score;
+            }
+        }
+        if(best)total=x11_push_expose_family(c,best,1);
+    }
+    if(total>0&&g_x11_repaint_nudge_budget>0){
+        --g_x11_repaint_nudge_budget;
+    }
+    if(total>0&&c7_x11_trace_enabled()&&trace_count<8){
+        ++trace_count;
+        __boot_serial_puts("[x11-repaint-nudge] expose=");
+        __boot_serial_putu32((uint32_t)total);
+        __boot_serial_puts(" budget=");
+        __boot_serial_putu32(g_x11_repaint_nudge_budget);
+        __boot_serial_puts("\n");
+    }
+}
+
+static void x11_focus_window_common(x11_connection_t *c,uint32_t wid,bool send_take_focus){
+    int ci;
+    x11_window_t *w;
+    int old_conn=g_x11_focus_conn;
+    uint32_t old_wid=g_x11_focus_window;
+    if(!c||!wid)return;
+    w=x11_find_window(c,wid);
+    if(!w||!w->used)return;
+    if(w->id==c->root_window||!w->mapped||!w->visible)return;
+    if(old_conn>=0&&old_conn<X11_MAX_CONN&&old_wid==wid&&
+       &g_x11_conns[old_conn]==c&&g_x11_conns[old_conn].used)return;
+    if(old_conn>=0&&old_conn<X11_MAX_CONN&&old_wid&&
+       (&g_x11_conns[old_conn]!=c||old_wid!=wid)&&g_x11_conns[old_conn].used){
+        x11_push_focus_out_event(&g_x11_conns[old_conn],old_wid);
+    }
+    for(ci=0;ci<X11_MAX_CONN;++ci){
+        if(&g_x11_conns[ci]==c){
+            g_x11_focus_conn=ci;
+            g_x11_focus_window=wid;
+            break;
+        }
+    }
+    x11_activate_window(c,wid,send_take_focus);
+}
+
+static void x11_focus_window_now(x11_connection_t *c,uint32_t wid){
+    x11_focus_window_common(c,wid,true);
+}
+
+static void x11_focus_window_from_client(x11_connection_t *c,uint32_t wid){
+    x11_focus_window_common(c,wid,false);
+}
+
 static x11_connection_t*x11_alloc(void){int i;for(i=0;i<X11_MAX_CONN;++i)if(!g_x11_conns[i].used){ulibc_memset(&g_x11_conns[i],0,sizeof(x11_connection_t));g_x11_conns[i].used=true;return&g_x11_conns[i];}return 0;}
 
 static x11_window_t*x11_find_window(x11_connection_t*c,uint32_t id){
@@ -1698,6 +2294,52 @@ static x11_shmseg_t*x11_find_shmseg(x11_connection_t*c,uint32_t id){
     int i;for(i=0;i<X11_MAX_SHMSEG;++i)if(c->shmsegs[i].used&&c->shmsegs[i].id==id)return&c->shmsegs[i];return 0;}
 static x11_picture_t*x11_find_picture(x11_connection_t*c,uint32_t id){
     int i;for(i=0;i<X11_MAX_PICTURE;++i)if(c->pictures[i].used&&c->pictures[i].id==id)return&c->pictures[i];return 0;}
+
+static bool x11_window_is_viewable(x11_connection_t *c,x11_window_t *w){
+    int guard=0;
+    if(!c||!w||!w->used)return false;
+    if(w->id==c->root_window)return true;
+    while(w&&guard++<X11_MAX_WINDOWS){
+        if(!w->used||!w->mapped)return false;
+        if(w->parent==c->root_window)return true;
+        if(!w->parent||w->parent==w->id)return false;
+        w=x11_find_window(c,w->parent);
+    }
+    return false;
+}
+
+static bool x11_update_one_visibility(x11_connection_t *c,x11_window_t *w,bool focus_on_show){
+    bool was_visible,now_visible;
+    if(!c||!w||!w->used||w->id==c->root_window)return false;
+    was_visible=w->visible;
+    now_visible=x11_window_is_viewable(c,w);
+    w->visible=now_visible;
+    if(now_visible&&!was_visible){
+        x11_push_configure_notify(c,w->id,w->x,w->y,w->width,w->height,w->border_width);
+        x11_push_visibility_event(c,w->id,0);
+        if(w->width>0&&w->height>0)x11_push_expose_event(c,w->id,0,0,w->width,w->height);
+        if(focus_on_show&&w->width>=32&&w->height>=24)x11_focus_window_now(c,w->id);
+        g_x11_render_dirty=true;
+        return true;
+    }
+    if(!now_visible&&was_visible)g_x11_render_dirty=true;
+    return false;
+}
+
+static void x11_update_visibility_family(x11_connection_t *c,x11_window_t *anchor,bool focus_on_show){
+    x11_window_t *top;
+    int i;
+    if(!c||!anchor)return;
+    top=x11_top_window(c,anchor);
+    if(!top)top=anchor;
+    (void)x11_update_one_visibility(c,top,focus_on_show);
+    for(i=0;i<X11_MAX_WINDOWS;++i){
+        x11_window_t *w=&c->windows[i];
+        if(!w->used||w==top||w->id==c->root_window)continue;
+        if(x11_top_window(c,w)!=top)continue;
+        (void)x11_update_one_visibility(c,w,focus_on_show);
+    }
+}
 
 static uint32_t x11_next_server_time(void){
     ++g_x11_server_time;
@@ -1770,6 +2412,359 @@ static void x11_reply_init(x11_connection_t *c,uint8_t *reply,size_t sz,uint8_t 
 static void x11_reply_set_length(x11_connection_t *c,uint8_t *reply,uint32_t words){
     if(!c||!reply)return;
     x11_wr32(c,reply+4,words);
+}
+
+static void x11_send_property32_values_reply(x11_connection_t *c,uint32_t type,
+                                             const uint32_t *vals,uint32_t count,
+                                             uint32_t long_off,uint32_t long_len){
+    uint8_t reply[32];
+    uint8_t data[X11_MAX_WINDOWS*4u];
+    size_t total,start,send_bytes=0,available=0;
+    uint32_t bytes_after=0,nitems=0;
+    uint32_t i;
+    if(!c)return;
+    if(count>X11_MAX_WINDOWS)count=X11_MAX_WINDOWS;
+    for(i=0;i<count;++i)x11_wr32(c,data+i*4u,vals?vals[i]:0);
+    total=(size_t)count*4u;
+    start=(size_t)long_off*4u;
+    if(start<total){
+        available=total-start;
+        send_bytes=(size_t)long_len*4u;
+        if(send_bytes>available)send_bytes=available;
+        bytes_after=(uint32_t)(available-send_bytes);
+        nitems=(uint32_t)(send_bytes/4u);
+    }
+    x11_reply_init(c,reply,sizeof(reply),32);
+    x11_reply_set_length(c,reply,(uint32_t)((send_bytes+3u)/4u));
+    x11_wr32(c,reply+8,type);
+    x11_wr32(c,reply+12,bytes_after);
+    x11_wr32(c,reply+16,nitems);
+    sock_send(c->sock_fd,reply,sizeof(reply),0);
+    if(send_bytes)sock_send(c->sock_fd,data+start,send_bytes,0);
+}
+
+static void x11_keysyms_for_keycode(uint8_t kc,uint32_t *sym,uint32_t *shift){
+    uint32_t a=0,b=0;
+    switch(kc){
+        case 9:a=0xFF1Bu;break;  /* Escape */
+        case 10:a='1';b='!';break;case 11:a='2';b='@';break;case 12:a='3';b='#';break;
+        case 13:a='4';b='$';break;case 14:a='5';b='%';break;case 15:a='6';b='^';break;
+        case 16:a='7';b='&';break;case 17:a='8';b='*';break;case 18:a='9';b='(';break;
+        case 19:a='0';b=')';break;case 20:a='-';b='_';break;case 21:a='=';b='+';break;
+        case 22:a=0xFF08u;break; /* BackSpace */
+        case 23:a=0xFF09u;break; /* Tab */
+        case 24:a='q';b='Q';break;case 25:a='w';b='W';break;case 26:a='e';b='E';break;
+        case 27:a='r';b='R';break;case 28:a='t';b='T';break;case 29:a='y';b='Y';break;
+        case 30:a='u';b='U';break;case 31:a='i';b='I';break;case 32:a='o';b='O';break;
+        case 33:a='p';b='P';break;case 34:a='[';b='{';break;case 35:a=']';b='}';break;
+        case 36:a=0xFF0Du;break; /* Return */
+        case 37:a=0xFFE3u;break; /* Control_L */
+        case 38:a='a';b='A';break;case 39:a='s';b='S';break;case 40:a='d';b='D';break;
+        case 41:a='f';b='F';break;case 42:a='g';b='G';break;case 43:a='h';b='H';break;
+        case 44:a='j';b='J';break;case 45:a='k';b='K';break;case 46:a='l';b='L';break;
+        case 47:a=';';b=':';break;case 48:a='\'';b='"';break;case 49:a='`';b='~';break;
+        case 50:a=0xFFE1u;break; /* Shift_L */
+        case 51:a='\\';b='|';break;
+        case 52:a='z';b='Z';break;case 53:a='x';b='X';break;case 54:a='c';b='C';break;
+        case 55:a='v';b='V';break;case 56:a='b';b='B';break;case 57:a='n';b='N';break;
+        case 58:a='m';b='M';break;case 59:a=',';b='<';break;case 60:a='.';b='>';break;
+        case 61:a='/';b='?';break;
+        case 62:a=0xFFE2u;break; /* Shift_R */
+        case 64:a=0xFFE9u;break; /* Alt_L */
+        case 65:a=' ';break;
+        case 105:a=0xFFE4u;break; /* Control_R */
+        case 108:a=0xFFEAu;break; /* Alt_R */
+        case 111:a=0xFF52u;break; /* Up */
+        case 113:a=0xFF51u;break; /* Left */
+        case 114:a=0xFF53u;break; /* Right */
+        case 116:a=0xFF54u;break; /* Down */
+        case 118:a=0xFF63u;break; /* Insert */
+        case 119:a=0xFFFFu;break; /* Delete */
+        case 110:a=0xFF50u;break; /* Home */
+        case 115:a=0xFF57u;break; /* End */
+        case 112:a=0xFF55u;break; /* Page_Up */
+        case 117:a=0xFF56u;break; /* Page_Down */
+        default:a=0;break;
+    }
+    if(sym)*sym=a;
+    if(shift)*shift=b;
+}
+
+static uint8_t x11_xkb_mods_for_keycode(uint8_t kc){
+    switch(kc){
+    case 50:case 62:return 0x01u; /* Shift */
+    case 37:case 105:return 0x04u; /* Control */
+    case 64:case 108:return 0x08u; /* Alt */
+    default:return 0;
+    }
+}
+
+static size_t x11_xkb_write_type(uint8_t *p,uint8_t mask,uint8_t levels){
+    if(!p)return 0;
+    p[0]=mask;
+    p[1]=mask;
+    p[2]=0;p[3]=0;
+    p[4]=levels;
+    p[5]=(levels>1)?1u:0u;
+    p[6]=0;
+    p[7]=0;
+    if(levels>1){
+        p[8]=1;      /* active */
+        p[9]=mask;
+        p[10]=1;     /* shifted level */
+        p[11]=mask;
+        p[12]=0;p[13]=0;p[14]=0;p[15]=0;
+        return 16;
+    }
+    return 8;
+}
+
+static void x11_send_xkb_get_state_reply(x11_connection_t *c){
+    uint8_t reply[32];
+    uint8_t mods=(uint8_t)(g_x11_key_state_mask&0xFFu);
+    x11_reply_init(c,reply,sizeof(reply),0);
+    reply[8]=mods;
+    reply[9]=mods;
+    reply[18]=mods;
+    reply[19]=mods;
+    reply[20]=mods;
+    reply[21]=mods;
+    reply[22]=mods;
+    x11_wr16(c,reply+24,g_x11_pointer_button_mask);
+    sock_send(c->sock_fd,reply,sizeof(reply),0);
+}
+
+static void x11_send_xkb_get_controls_reply(x11_connection_t *c){
+    uint8_t reply[92];
+    x11_reply_init(c,reply,sizeof(reply),0);
+    x11_reply_set_length(c,reply,15);
+    reply[8]=1;  /* mouseKeysDfltBtn */
+    reply[9]=1;  /* one keyboard group */
+    x11_wr16(c,reply+30,500); /* repeatDelay */
+    x11_wr16(c,reply+32,30);  /* repeatInterval */
+    sock_send(c->sock_fd,reply,sizeof(reply),0);
+}
+
+static void x11_send_xkb_get_device_info_reply(x11_connection_t *c){
+    uint8_t reply[40];
+    x11_reply_init(c,reply,sizeof(reply),0);
+    x11_reply_set_length(c,reply,2);
+    x11_wr16(c,reply+10,0); /* supported device features */
+    reply[21]=3;            /* buttons */
+    x11_wr16(c,reply+34,0); /* empty device name */
+    sock_send(c->sock_fd,reply,sizeof(reply),0);
+}
+
+static void x11_send_xkb_get_map_reply(x11_connection_t *c,const uint8_t *body,size_t body_len){
+    uint16_t full=body_len>=4?x11_rd16(c,body+2):0;
+    uint16_t partial=body_len>=6?x11_rd16(c,body+4):0;
+    uint16_t present=(uint16_t)((full|partial)&X11_XKB_ALL_MAP_MASK);
+    uint8_t first_type=0,n_types=4;
+    uint8_t first_sym=8,n_syms=248;
+    uint8_t first_act=8,n_act_range=248;
+    uint8_t first_behavior=8,n_behavior_range=248;
+    uint8_t first_explicit=8,n_explicit_range=248;
+    uint8_t first_mod=8,n_mod_range=248;
+    uint8_t first_vmod=8,n_vmod_range=248;
+    uint16_t virtual_mods=0;
+    uint8_t virtual_mod_count=0;
+    uint16_t total_syms=0;
+    uint8_t total_mods=0;
+    size_t type_bytes=0,symdesc_bytes=0,sym_bytes=0,action_count_bytes=0,action_pad=0;
+    size_t mod_bytes=0,mod_pad=0,explicit_pad=0,virtual_mod_bytes=0,vmod_bytes=0,data_bytes,total_bytes;
+    uint8_t *reply,*p;
+    int i;
+    if(!present)present=(uint16_t)(X11_XKB_KEY_TYPES_MASK|X11_XKB_KEY_SYMS_MASK|X11_XKB_MODIFIER_MAP_MASK);
+    if((partial&X11_XKB_KEY_TYPES_MASK)&&!(full&X11_XKB_KEY_TYPES_MASK)&&body_len>=8&&body[7]){
+        first_type=body[6];
+        n_types=body[7];
+        if(first_type>3)n_types=0;
+        else if((int)first_type+(int)n_types>4)n_types=(uint8_t)(4-first_type);
+    }
+    if((partial&X11_XKB_KEY_SYMS_MASK)&&!(full&X11_XKB_KEY_SYMS_MASK)&&body_len>=10&&body[9]){
+        first_sym=body[8];
+        n_syms=body[9];
+        if(first_sym<8)first_sym=8;
+        if((uint16_t)first_sym+(uint16_t)n_syms>256u)n_syms=(uint8_t)(256u-(uint16_t)first_sym);
+    }
+    if((partial&X11_XKB_KEY_ACTIONS_MASK)&&!(full&X11_XKB_KEY_ACTIONS_MASK)&&body_len>=12&&body[11]){
+        first_act=body[10];
+        n_act_range=body[11];
+        if(first_act<8)first_act=8;
+        if((uint16_t)first_act+(uint16_t)n_act_range>256u)n_act_range=(uint8_t)(256u-(uint16_t)first_act);
+    }
+    if((partial&X11_XKB_KEY_BEHAVIORS_MASK)&&!(full&X11_XKB_KEY_BEHAVIORS_MASK)&&body_len>=14&&body[13]){
+        first_behavior=body[12];
+        n_behavior_range=body[13];
+        if(first_behavior<8)first_behavior=8;
+        if((uint16_t)first_behavior+(uint16_t)n_behavior_range>256u)n_behavior_range=(uint8_t)(256u-(uint16_t)first_behavior);
+    }
+    if(full&X11_XKB_VIRTUAL_MODS_MASK){
+        virtual_mods=0xFFFFu;
+    }else if((partial&X11_XKB_VIRTUAL_MODS_MASK)&&body_len>=16){
+        virtual_mods=x11_rd16(c,body+14);
+    }
+    if((partial&X11_XKB_EXPLICIT_MASK)&&!(full&X11_XKB_EXPLICIT_MASK)&&body_len>=18&&body[17]){
+        first_explicit=body[16];
+        n_explicit_range=body[17];
+        if(first_explicit<8)first_explicit=8;
+        if((uint16_t)first_explicit+(uint16_t)n_explicit_range>256u)n_explicit_range=(uint8_t)(256u-(uint16_t)first_explicit);
+    }
+    if((partial&X11_XKB_MODIFIER_MAP_MASK)&&!(full&X11_XKB_MODIFIER_MAP_MASK)&&body_len>=20&&body[19]){
+        first_mod=body[18];
+        n_mod_range=body[19];
+        if(first_mod<8)first_mod=8;
+        if((uint16_t)first_mod+(uint16_t)n_mod_range>256u)n_mod_range=(uint8_t)(256u-(uint16_t)first_mod);
+    }
+    if((partial&X11_XKB_VIRTUAL_MOD_MAP_MASK)&&!(full&X11_XKB_VIRTUAL_MOD_MAP_MASK)&&body_len>=22&&body[21]){
+        first_vmod=body[20];
+        n_vmod_range=body[21];
+        if(first_vmod<8)first_vmod=8;
+        if((uint16_t)first_vmod+(uint16_t)n_vmod_range>256u)n_vmod_range=(uint8_t)(256u-(uint16_t)first_vmod);
+    }
+    if(present&X11_XKB_KEY_TYPES_MASK){
+        int t;
+        type_bytes=0;
+        for(t=0;t<n_types;++t){
+            int idx=(int)first_type+t;
+            type_bytes+=(idx==0)?8u:16u;
+        }
+    }
+    if(present&X11_XKB_KEY_SYMS_MASK){
+        for(i=0;i<n_syms;++i){
+            uint32_t sym=0,shift=0;
+            x11_keysyms_for_keycode((uint8_t)(first_sym+i),&sym,&shift);
+            if(sym)total_syms=(uint16_t)(total_syms+(shift?2u:1u));
+        }
+        symdesc_bytes=(size_t)n_syms*8u;
+        sym_bytes=(size_t)total_syms*4u;
+    }
+    if(present&X11_XKB_MODIFIER_MAP_MASK){
+        for(i=0;i<n_mod_range;++i){
+            if(x11_xkb_mods_for_keycode((uint8_t)(first_mod+i)))++total_mods;
+        }
+        mod_bytes=(size_t)total_mods*2u;
+        mod_pad=(4u-(mod_bytes&3u))&3u;
+    }
+    if(present&X11_XKB_KEY_ACTIONS_MASK){
+        action_count_bytes=(size_t)n_act_range;
+        action_pad=(4u-(action_count_bytes&3u))&3u;
+    }
+    if(present&X11_XKB_EXPLICIT_MASK){
+        explicit_pad=0; /* no explicit entries yet */
+    }
+    if(present&X11_XKB_VIRTUAL_MODS_MASK){
+        int bit;
+        for(bit=0;bit<16;++bit)if(virtual_mods&(1u<<bit))++virtual_mod_count;
+        if(!virtual_mod_count){
+            present=(uint16_t)(present&~X11_XKB_VIRTUAL_MODS_MASK);
+        }else{
+            virtual_mod_bytes=(size_t)((virtual_mod_count+3u)&~3u);
+        }
+    }
+    if(present&X11_XKB_VIRTUAL_MOD_MAP_MASK){
+        vmod_bytes=0; /* no virtual mod map entries yet */
+    }
+    data_bytes=type_bytes+symdesc_bytes+sym_bytes+
+               action_count_bytes+action_pad+
+               virtual_mod_bytes+explicit_pad+mod_bytes+mod_pad+vmod_bytes;
+    total_bytes=40u+data_bytes;
+    reply=(uint8_t*)ulibc_malloc(total_bytes?total_bytes:40u);
+    if(!reply){
+        uint8_t tiny[40];
+        x11_reply_init(c,tiny,sizeof(tiny),0);
+        x11_reply_set_length(c,tiny,2);
+        tiny[10]=8;tiny[11]=255;
+        sock_send(c->sock_fd,tiny,sizeof(tiny),0);
+        return;
+    }
+    ulibc_memset(reply,0,total_bytes);
+    x11_reply_init(c,reply,total_bytes,0);
+    x11_reply_set_length(c,reply,(uint32_t)((8u+data_bytes)/4u));
+    reply[10]=8;reply[11]=255;
+    x11_wr16(c,reply+12,present);
+    if(present&X11_XKB_KEY_TYPES_MASK){
+        reply[14]=first_type;
+        reply[15]=n_types;
+        reply[16]=4;
+    }
+    if(present&X11_XKB_KEY_SYMS_MASK){
+        reply[17]=first_sym;
+        x11_wr16(c,reply+18,total_syms);
+        reply[20]=n_syms;
+    }
+    if(present&X11_XKB_KEY_ACTIONS_MASK){
+        reply[21]=first_act;
+        x11_wr16(c,reply+22,0);
+        reply[24]=n_act_range;
+    }
+    if(present&X11_XKB_KEY_BEHAVIORS_MASK){
+        reply[25]=first_behavior;
+        reply[26]=n_behavior_range;
+        reply[27]=0;
+    }
+    if(present&X11_XKB_EXPLICIT_MASK){
+        reply[28]=first_explicit;
+        reply[29]=n_explicit_range;
+        reply[30]=0;
+    }
+    if(present&X11_XKB_MODIFIER_MAP_MASK){
+        reply[31]=first_mod;
+        reply[32]=n_mod_range;
+        reply[33]=total_mods;
+    }
+    if(present&X11_XKB_VIRTUAL_MOD_MAP_MASK){
+        reply[34]=first_vmod;
+        reply[35]=n_vmod_range;
+        reply[36]=0;
+    }
+    if(present&X11_XKB_VIRTUAL_MODS_MASK)x11_wr16(c,reply+38,virtual_mods);
+    p=reply+40;
+    if(present&X11_XKB_KEY_TYPES_MASK){
+        for(i=0;i<n_types;++i){
+            int idx=(int)first_type+i;
+            size_t wrote=x11_xkb_write_type(p,(idx==0)?0u:1u,(idx==0)?1u:2u);
+            p+=wrote;
+        }
+    }
+    if(present&X11_XKB_KEY_SYMS_MASK){
+        for(i=0;i<n_syms;++i){
+            uint8_t *d=p;
+            uint32_t sym=0,shift=0;
+            x11_keysyms_for_keycode((uint8_t)(first_sym+i),&sym,&shift);
+            ulibc_memset(d,0,8);
+            if(sym){
+                d[0]=shift?1u:0u;
+                d[4]=1; /* group count */
+                d[5]=shift?2u:1u;
+                x11_wr16(c,d+6,shift?2u:1u);
+            }
+            p+=8;
+            if(sym){
+                x11_wr32(c,p,sym);p+=4;
+                if(shift){x11_wr32(c,p,shift);p+=4;}
+            }
+        }
+    }
+    if(present&X11_XKB_KEY_ACTIONS_MASK){
+        if(action_count_bytes){ulibc_memset(p,0,action_count_bytes);p+=action_count_bytes;}
+        if(action_pad){ulibc_memset(p,0,action_pad);p+=action_pad;}
+    }
+    if(present&X11_XKB_VIRTUAL_MODS_MASK){
+        if(virtual_mod_bytes){ulibc_memset(p,0,virtual_mod_bytes);p+=virtual_mod_bytes;}
+    }
+    if(present&X11_XKB_MODIFIER_MAP_MASK){
+        for(i=0;i<n_mod_range;++i){
+            uint8_t kc=(uint8_t)(first_mod+i);
+            uint8_t mods=x11_xkb_mods_for_keycode(kc);
+            if(!mods)continue;
+            p[0]=kc;p[1]=mods;p+=2;
+        }
+        if(mod_pad){ulibc_memset(p,0,mod_pad);p+=mod_pad;}
+    }
+    (void)p;
+    sock_send(c->sock_fd,reply,total_bytes,0);
+    ulibc_free(reply);
 }
 
 static void x11_send_glx_string_reply(x11_connection_t *c,const char *s){
@@ -1871,6 +2866,139 @@ static void x11_free_window_props(x11_connection_t *c,uint32_t window){
     }
 }
 
+static bool x11_set_property32_values(x11_connection_t *c,uint32_t window,uint32_t atom,
+                                      uint32_t type,const uint32_t *vals,uint32_t count){
+    x11_property_t *prop;
+    uint8_t *data=0;
+    uint32_t i;
+    if(!c||!window||!atom||!type)return false;
+    if(count){
+        data=(uint8_t*)ulibc_malloc((size_t)count*4u);
+        if(!data)return false;
+        for(i=0;i<count;++i)x11_wr32(c,data+i*4u,vals[i]);
+    }
+    prop=x11_find_prop(c,window,atom);
+    if(!prop)prop=x11_alloc_prop(c);
+    if(!prop){
+        if(data)ulibc_free(data);
+        return false;
+    }
+    if(prop->data)ulibc_free(prop->data);
+    prop->used=true;
+    prop->window=window;
+    prop->atom=atom;
+    prop->type=type;
+    prop->format=32;
+    prop->data=data;
+    prop->data_bytes=count*4u;
+    x11_push_property_notify_event(c,window,atom,0);
+    return true;
+}
+
+static bool x11_property_has_atom32(x11_connection_t *c,uint32_t window,
+                                    const char *prop_name,const char *atom_name){
+    x11_property_t *prop;
+    uint32_t prop_atom,needle;
+    uint32_t i,count;
+    if(!c||!window||!prop_name||!atom_name)return false;
+    prop_atom=x11_atom_id_by_name(c,prop_name);
+    needle=x11_atom_id_by_name(c,atom_name);
+    if(!prop_atom||!needle)return false;
+    prop=x11_find_prop(c,window,prop_atom);
+    if(!prop||!prop->data||prop->format!=32)return false;
+    count=prop->data_bytes/4u;
+    for(i=0;i<count;++i){
+        if(x11_rd32(c,prop->data+i*4u)==needle)return true;
+    }
+    return false;
+}
+
+static void x11_activate_window(x11_connection_t *c,uint32_t focus_wid,bool send_take_focus){
+    x11_window_t *focus,*top;
+    uint32_t active;
+    uint32_t atom_active,atom_window,atom_state,atom_focused,atom_protocols,atom_take_focus;
+    uint32_t v;
+    static uint32_t active_trace_count;
+    if(!c||!focus_wid)return;
+    focus=x11_find_window(c,focus_wid);
+    if(!focus||!focus->used)return;
+    top=x11_top_window(c,focus);
+    active=(top&&top->id)?top->id:focus_wid;
+    atom_active=x11_intern_atom(c,"_NET_ACTIVE_WINDOW",true);
+    atom_window=x11_intern_atom(c,"WINDOW",true);
+    atom_state=x11_intern_atom(c,"_NET_WM_STATE",true);
+    atom_focused=x11_intern_atom(c,"_NET_WM_STATE_FOCUSED",true);
+    atom_protocols=x11_intern_atom(c,"WM_PROTOCOLS",true);
+    atom_take_focus=x11_intern_atom(c,"WM_TAKE_FOCUS",true);
+    v=active;
+    (void)x11_set_property32_values(c,c->root_window,atom_active,atom_window,&v,1);
+    if(atom_state&&atom_focused){
+        v=atom_focused;
+        (void)x11_set_property32_values(c,active,atom_state,x11_intern_atom(c,"ATOM",true),&v,1);
+    }
+    x11_push_focus_in_event(c,active);
+    if(active!=focus_wid)x11_push_focus_in_event(c,focus_wid);
+    if(send_take_focus&&x11_property_has_atom32(c,active,"WM_PROTOCOLS","WM_TAKE_FOCUS")){
+        x11_push_client_message32(c,active,atom_protocols,atom_take_focus,x11_next_server_time(),0,0,0);
+    }
+    if(c7_x11_trace_enabled()&&active_trace_count<16){
+        ++active_trace_count;
+        __boot_serial_force_puts("[x11-active!] focus=");
+        __boot_serial_force_puthex64((uint64_t)focus_wid);
+        __boot_serial_force_puts(" active=");
+        __boot_serial_force_puthex64((uint64_t)active);
+        __boot_serial_force_puts("\n");
+    }
+}
+
+static bool x11_handle_root_client_message(x11_connection_t *c,const uint8_t *raw){
+    uint32_t msg_window,msg_type;
+    uint32_t d0,d1,d2;
+    const char *name;
+    if(!c||!raw)return false;
+    if((raw[0]&0x7Fu)!=X11_ClientMessage||raw[1]!=32)return false;
+    msg_window=x11_rd32(c,raw+4);
+    msg_type=x11_rd32(c,raw+8);
+    d0=x11_rd32(c,raw+12);
+    d1=x11_rd32(c,raw+16);
+    d2=x11_rd32(c,raw+20);
+    name=x11_atom_name_by_id(c,msg_type);
+    if(c7_x11_trace_enabled()&&g_x11_trace_wm_count<64){
+        ++g_x11_trace_wm_count;
+        __boot_serial_force_puts("[x11-wm!] ");
+        __boot_serial_force_puts(name?name:"?");
+        __boot_serial_force_puts(" win=");
+        __boot_serial_force_puthex64((uint64_t)msg_window);
+        __boot_serial_force_puts(" d0=");
+        __boot_serial_force_puthex64((uint64_t)d0);
+        __boot_serial_force_puts(" d1=");
+        __boot_serial_force_puthex64((uint64_t)d1);
+        __boot_serial_force_puts(" d2=");
+        __boot_serial_force_puthex64((uint64_t)d2);
+        __boot_serial_force_puts("\n");
+    }
+    if(name&&ulibc_strcmp(name,"_NET_ACTIVE_WINDOW")==0){
+        x11_window_t *w=x11_find_window(c,msg_window);
+        if(w&&w->used&&w->mapped&&w->visible)x11_focus_window_now(c,msg_window);
+        return true;
+    }
+    if(name&&ulibc_strcmp(name,"_NET_WM_STATE")==0){
+        uint32_t vals[2];
+        uint32_t count=0;
+        uint32_t atom_state=x11_intern_atom(c,"_NET_WM_STATE",true);
+        uint32_t atom_type=x11_intern_atom(c,"ATOM",true);
+        if(d0!=0u&&d1)vals[count++]=d1;
+        if(d0!=0u&&d2&&d2!=d1)vals[count++]=d2;
+        (void)x11_set_property32_values(c,msg_window,atom_state,atom_type,vals,count);
+        return true;
+    }
+    if(name&&(ulibc_strcmp(name,"_NET_WM_MOVERESIZE")==0||
+              ulibc_strcmp(name,"_NET_MOVERESIZE_WINDOW")==0)){
+        return true;
+    }
+    return false;
+}
+
 static bool x11_drawable_surface(x11_connection_t*c,uint32_t drawable,uint8_t **backing,uint32_t *backing_size,int *width,int *height){
     x11_window_t *w;
     x11_pixmap_t *p;
@@ -1946,6 +3074,18 @@ static void x11_resize_window_backing(x11_window_t *w,int old_w,int old_h){
 static void x11_blit_argb32_buf(uint8_t *dst,size_t dst_size,int dst_w,int dst_h,int dst_x,int dst_y,const uint8_t*src,size_t src_stride,int src_x,int src_y,int w,int h){
     int row;
     if(!dst||!src||w<=0||h<=0||src_stride<4||dst_w<=0||dst_h<=0)return;
+    if(src!=dst&&dst_x>=0&&dst_y>=0&&src_x>=0&&src_y>=0&&
+       dst_x+w<=dst_w&&dst_y+h<=dst_h){
+        size_t bytes=(size_t)w*4u;
+        for(row=0;row<h;++row){
+            size_t so=(size_t)(src_y+row)*src_stride+(size_t)src_x*4u;
+            size_t doff=((size_t)(dst_y+row)*(size_t)dst_w+(size_t)dst_x)*4u;
+            if(doff+bytes>dst_size)break;
+            ulibc_memcpy(dst+doff,src+so,bytes);
+        }
+        g_x11_render_dirty=true;
+        return;
+    }
     for(row=0;row<h;++row){
         int sy=src_y+row;
         int dy=dst_y+row;
@@ -2018,11 +3158,29 @@ static void x11_render_fill_rectangles(x11_connection_t *c,const uint8_t *body,s
 }
 
 static void x11_push_event(x11_connection_t*c,const x11_event_t*ev){
+    static uint32_t event_send_trace_count;
     if(!c||!ev)return;
     if(c->sock_fd>=0){
         int sent=sock_send(c->sock_fd,ev,32,0);
+        if(c7_x11_trace_enabled()&&event_send_trace_count<6){
+            ++event_send_trace_count;
+            __boot_serial_force_puts("[x11-event!] fd=");
+            __boot_serial_force_putu32((uint32_t)c->sock_fd);
+            __boot_serial_force_puts(" type=");
+            __boot_serial_force_putu32((uint32_t)ev->type);
+            __boot_serial_force_puts(" detail=");
+            __boot_serial_force_putu32((uint32_t)ev->detail);
+            __boot_serial_force_puts(" sent=");
+            if(sent<0){
+                __boot_serial_force_puts("-");
+                __boot_serial_force_putu32((uint32_t)(-sent));
+            }else{
+                __boot_serial_force_putu32((uint32_t)sent);
+            }
+            __boot_serial_force_puts("\n");
+        }
         if(sent==32){
-            if(g_x11_trace_event_count<120){
+            if(c7_x11_trace_enabled()&&g_x11_trace_event_count<12){
                 ++g_x11_trace_event_count;
                 __boot_serial_puts("[x11-event] fd=");
                 __boot_serial_putu32((uint32_t)c->sock_fd);
@@ -2039,6 +3197,16 @@ static void x11_push_event(x11_connection_t*c,const x11_event_t*ev){
     c->events[c->event_tail]=*ev;
     c->event_tail=(c->event_tail+1)%X11_MAX_EVENTS;
     c->event_count++;
+    if(c7_x11_trace_enabled()&&event_send_trace_count<8){
+        ++event_send_trace_count;
+        __boot_serial_force_puts("[x11-event!] queued fd=");
+        __boot_serial_force_putu32((uint32_t)c->sock_fd);
+        __boot_serial_force_puts(" type=");
+        __boot_serial_force_putu32((uint32_t)ev->type);
+        __boot_serial_force_puts(" q=");
+        __boot_serial_force_putu32((uint32_t)c->event_count);
+        __boot_serial_force_puts("\n");
+    }
 }
 
 static void x11_force_map_top_levels(x11_connection_t *c){
@@ -2050,12 +3218,11 @@ static void x11_force_map_top_levels(x11_connection_t *c){
         if(w->width<64||w->height<64)continue;
         if(w->mapped&&w->visible)continue;
         w->mapped=true;
-        w->visible=true;
         g_x11_render_dirty=true;
         x11_trace_window_op(c,"auto-map",w->id,w->width,w->height);
-        x11_push_configure_notify(c,w->id,w->x,w->y,w->width,w->height,w->border_width);
         x11_push_map_notify_event(c,w->id);
-        x11_push_expose_event(c,w->id,0,0,w->width,w->height);
+        x11_update_visibility_family(c,w,true);
+        x11_render_now();
     }
 }
 
@@ -2064,12 +3231,162 @@ static void x11_auto_map_if_client_window(x11_connection_t *c,x11_window_t *w){
     if(w->width<64||w->height<64)return;
     if(w->mapped&&w->visible)return;
     w->mapped=true;
-    w->visible=true;
     g_x11_render_dirty=true;
     x11_trace_window_op(c,"auto-map",w->id,w->width,w->height);
-    x11_push_configure_notify(c,w->id,w->x,w->y,w->width,w->height,w->border_width);
     x11_push_map_notify_event(c,w->id);
-    x11_push_expose_event(c,w->id,0,0,w->width,w->height);
+    x11_update_visibility_family(c,w,true);
+    x11_render_now();
+}
+
+static uint8_t x11_ascii_lower(uint8_t c){
+    if(c>='A'&&c<='Z')return(uint8_t)(c+('a'-'A'));
+    return c;
+}
+
+static bool x11_bytes_has_token_ci(const uint8_t *data,size_t len,const char *needle){
+    size_t i,j,nlen;
+    if(!data||!needle)return false;
+    nlen=ulibc_strlen(needle);
+    if(!nlen||len<nlen)return false;
+    for(i=0;i+nlen<=len;++i){
+        for(j=0;j<nlen;++j){
+            if(x11_ascii_lower(data[i+j])!=x11_ascii_lower((uint8_t)needle[j]))break;
+        }
+        if(j==nlen)return true;
+    }
+    return false;
+}
+
+static bool x11_property_looks_like_browser(const x11_property_t *prop){
+    if(!prop||!prop->data||!prop->data_bytes)return false;
+    return x11_bytes_has_token_ci(prop->data,prop->data_bytes,"firefox")||
+           x11_bytes_has_token_ci(prop->data,prop->data_bytes,"navigator")||
+           x11_bytes_has_token_ci(prop->data,prop->data_bytes,"chromium")||
+           x11_bytes_has_token_ci(prop->data,prop->data_bytes,"chrome");
+}
+
+static bool x11_window_has_browser_prop(x11_connection_t *c,uint32_t wid){
+    int i;
+    if(!c||!wid)return false;
+    for(i=0;i<X11_MAX_PROPS;++i){
+        x11_property_t *p=&c->props[i];
+        if(!p->used||p->window!=wid)continue;
+        if(x11_property_looks_like_browser(p))return true;
+    }
+    return false;
+}
+
+static bool x11_connection_has_browser_window(x11_connection_t *c){
+    int i;
+    if(!c)return false;
+    for(i=0;i<X11_MAX_PROPS;++i){
+        x11_property_t *p=&c->props[i];
+        if(!p->used||!p->window)continue;
+        if(x11_property_looks_like_browser(p))return true;
+    }
+    return false;
+}
+
+static bool x11_window_family_looks_like_browser(x11_connection_t *c,x11_window_t *w){
+    x11_window_t *cur;
+    int guard=0;
+    if(!c||!w)return false;
+    if(x11_window_has_browser_prop(c,w->id))return true;
+    cur=w;
+    while(cur&&cur->parent&&cur->parent!=c->root_window&&guard++<X11_MAX_WINDOWS){
+        cur=x11_find_window(c,cur->parent);
+        if(cur&&x11_window_has_browser_prop(c,cur->id))return true;
+    }
+    return cur&&x11_window_has_browser_prop(c,cur->id);
+}
+
+static bool x11_should_force_browser_size(x11_connection_t *c,x11_window_t *w){
+    if(!c||!w||!w->used||w->id==c->root_window)return false;
+    if(w->parent==c->root_window)return true;
+    if(x11_window_has_browser_prop(c,w->id))return true;
+    return w->width>=320&&w->height>=240;
+}
+
+static bool x11_should_force_browser_connection_window(x11_connection_t *c,x11_window_t *w){
+    x11_window_t *top;
+    if(!c||!w||!w->used||w->id==c->root_window)return false;
+    if(!x11_connection_has_browser_window(c))return false;
+    top=x11_top_window(c,w);
+    if(!top||top->id==c->root_window)return false;
+    if(top!=w&&!top->mapped)return false;
+    return top->parent==c->root_window;
+}
+
+static bool x11_large_surface_in_browser_conn(x11_connection_t *c,x11_window_t *w){
+    if(!c||!w||!w->used||w->id==c->root_window)return false;
+    if(w->width<320||w->height<240)return false;
+    return x11_connection_has_browser_window(c);
+}
+
+static void x11_browser_resize_one(x11_connection_t *c,x11_window_t *w,int target_w,int target_h){
+    int old_w,old_h;
+    if(!c||!w||!w->used||w->id==c->root_window)return;
+    old_w=w->width;
+    old_h=w->height;
+    if(w->width>=320&&w->height>=240)return;
+    if(w->parent==c->root_window){
+        w->x=64;
+        w->y=48;
+    }else{
+        w->x=0;
+        w->y=0;
+    }
+    w->width=target_w;
+    w->height=target_h;
+    x11_resize_window_backing(w,old_w,old_h);
+}
+
+static void x11_force_browser_window_real_size(x11_connection_t *c,x11_window_t *w,const char *why){
+    extern c7_framebuffer_t g_fb;
+    x11_window_t *top;
+    int target_w,target_h;
+    int i;
+    if(!c||!w||!w->used||w->id==c->root_window)return;
+    top=x11_top_window(c,w);
+    if(!top||top->id==c->root_window)top=w;
+    target_w=(c->screen_width>180)?(int)c->screen_width-160:800;
+    target_h=(c->screen_height>190)?(int)c->screen_height-140:560;
+    if(target_w<720)target_w=720;
+    if(target_h<480)target_h=480;
+    if(g_fb.ready){
+        if(target_w>(int)g_fb.width-80)target_w=(int)g_fb.width-80;
+        if(target_h>(int)g_fb.height-110)target_h=(int)g_fb.height-110;
+    }
+    if(target_w<320)target_w=320;
+    if(target_h<240)target_h=240;
+
+    x11_browser_resize_one(c,top,target_w,target_h);
+    top->mapped=true;
+
+    for(i=0;i<X11_MAX_WINDOWS;++i){
+        x11_window_t *cw=&c->windows[i];
+        if(!cw->used||cw->id==c->root_window)continue;
+        if(cw!=w&&x11_top_window(c,cw)!=top)continue;
+        if(cw!=w&&!x11_window_has_browser_prop(c,cw->id)&&cw!=top)continue;
+        x11_browser_resize_one(c,cw,target_w,target_h);
+        if(cw==w||cw==top)cw->mapped=true;
+        else if(!cw->mapped)continue;
+    }
+
+    x11_trace_window_op(c,why?why:"browser-map",w->id,w->width,w->height);
+    x11_push_configure_notify(c,top->id,top->x,top->y,top->width,top->height,top->border_width);
+    x11_push_map_notify_event(c,top->id);
+    for(i=0;i<X11_MAX_WINDOWS;++i){
+        x11_window_t *cw=&c->windows[i];
+        if(!cw->used||!cw->mapped||cw->id==c->root_window)continue;
+        if(cw==top)continue;
+        if(x11_top_window(c,cw)!=top)continue;
+        if(cw!=w&&!x11_window_has_browser_prop(c,cw->id))continue;
+        x11_push_configure_notify(c,cw->id,cw->x,cw->y,cw->width,cw->height,cw->border_width);
+    }
+    x11_update_visibility_family(c,top,true);
+    g_x11_render_dirty=true;
+    x11_render_now();
 }
 int x11_process_request(int conn_idx);
 
@@ -2235,11 +3552,25 @@ static int x11_init_stream_connection(x11_connection_t *c,int cfd){
 
         sock_send(cfd,info,sizeof(info),0);
     }
-    /* Create root window */
+    /* Create root + the tiny server-owned windows GTK looks for. */
     x11_window_t*rw=&c->windows[0];rw->used=true;rw->id=c->root_window;rw->parent=0;
     rw->width=c->screen_width;rw->height=c->screen_height;rw->depth=c->depth;
     rw->klass=1;rw->visual=c->visual;rw->mapped=true;rw->visible=true;
-    c->window_count=1;
+    c->wm_check_window=0x00000025u;
+    c->xsettings_window=0x00000026u;
+    {
+        x11_window_t *wm=&c->windows[1];
+        x11_window_t *xs=&c->windows[2];
+        ulibc_memset(wm,0,sizeof(*wm));
+        ulibc_memset(xs,0,sizeof(*xs));
+        wm->used=true;wm->id=c->wm_check_window;wm->parent=c->root_window;
+        wm->width=1;wm->height=1;wm->depth=c->depth;wm->klass=1;wm->visual=c->visual;
+        wm->mapped=true;wm->visible=false;
+        xs->used=true;xs->id=c->xsettings_window;xs->parent=c->root_window;
+        xs->width=1;xs->height=1;xs->depth=c->depth;xs->klass=1;xs->visual=c->visual;
+        xs->mapped=true;xs->visible=false;
+    }
+    c->window_count=3;
     /* Register the real X11 predefined atom IDs before dynamic atoms.
      * GTK/Xlib mix XInternAtom results with XA_* constants, so these
      * IDs must match Xatom.h instead of being allocated sequentially. */
@@ -2305,7 +3636,9 @@ int x11_process_socket(int sock_fd){
 static uint8_t x11_extension_opcode(x11_connection_t *c,const char *name){
     if(!c||!name||!name[0])return 0;
     if(ulibc_strcmp(name,"MIT-SHM")==0)return c->ext_opcode_shm;
-    if(ulibc_strcmp(name,"RENDER")==0)return c->ext_opcode_render;
+    /* RENDER queda escondido hasta bancar glyphs/composite de verdad.
+     * Si lo anunciamos a medias, Firefox pinta UI invisible y hasta se cae. */
+    if(ulibc_strcmp(name,"RENDER")==0)return 0;
     if(ulibc_strcmp(name,"XFIXES")==0)return c->ext_opcode_xfixes;
     if(ulibc_strcmp(name,"RANDR")==0)return c->ext_opcode_randr;
     /* Keep GTK/Firefox on core X11 input until the XI2 event model is complete. */
@@ -2319,11 +3652,7 @@ static uint8_t x11_extension_opcode(x11_connection_t *c,const char *name){
     if(ulibc_strcmp(name,"Composite")==0)return 0;
     if(ulibc_strcmp(name,"DAMAGE")==0)return 0;
     if(ulibc_strcmp(name,"SHAPE")==0)return c->ext_opcode_shape;
-    /*
-     * Chromium can fall back to core X11 keyboard handling. Keep XKEYBOARD
-     * hidden until our XKB GetMap replies are complete enough for xcb's parser.
-     */
-    if(ulibc_strcmp(name,"XKEYBOARD")==0)return 0;
+    if(ulibc_strcmp(name,"XKEYBOARD")==0)return c->ext_opcode_xkeyboard;
     if(ulibc_strcmp(name,"SYNC")==0)return c->ext_opcode_sync;
     return 0;
 }
@@ -2539,27 +3868,67 @@ static int x11_handle_extension_request(x11_connection_t *c,uint8_t opcode,uint8
         return 0;
     }
     if(opcode==c->ext_opcode_xkeyboard){
+        static uint32_t xkb_force_trace_count;
+        if(c7_x11_trace_enabled()&&xkb_force_trace_count<96){
+            ++xkb_force_trace_count;
+            __boot_serial_force_puts("[x11-xkb!] minor=");
+            __boot_serial_force_putu32((uint32_t)minor);
+            __boot_serial_force_puts(" body=");
+            __boot_serial_force_putu32((uint32_t)body_len);
+            if(minor==8&&body_len>=6){
+                __boot_serial_force_puts(" full=");
+                __boot_serial_force_puthex64((uint64_t)x11_rd16(c,body+2));
+                __boot_serial_force_puts(" partial=");
+                __boot_serial_force_puthex64((uint64_t)x11_rd16(c,body+4));
+            }
+            if(minor==23&&body_len>=6){
+                __boot_serial_force_puts(" need=");
+                __boot_serial_force_puthex64((uint64_t)x11_rd16(c,body+2));
+                __boot_serial_force_puts(" want=");
+                __boot_serial_force_puthex64((uint64_t)x11_rd16(c,body+4));
+            }
+            __boot_serial_force_puts("\n");
+        }
         x11_trace_extension(c,"XKEYBOARD",minor,body_len,"handle");
         if(minor==0){ /* UseExtension */
             reply[1]=1; /* supported */
             x11_wr16(c,reply+8,1);
             x11_wr16(c,reply+10,0);
             sock_send(c->sock_fd,reply,sizeof(reply),0);
-        }else if(minor==3){ /* GetState */
-            reply[1]=0; /* group */
+        }else if(minor==1||minor==3||minor==5||minor==7||minor==9||
+                 minor==11||minor==14||minor==16||minor==18||minor==20){
+            /* State-changing XKB requests are accepted as no-ops for now. */
+        }else if(minor==4){ /* GetState */
+            x11_send_xkb_get_state_reply(c);
+        }else if(minor==6){ /* GetControls */
+            x11_send_xkb_get_controls_reply(c);
+        }else if(minor==8){ /* GetMap */
+            x11_send_xkb_get_map_reply(c,body,body_len);
+        }else if(minor==10){ /* GetCompatMap */
             sock_send(c->sock_fd,reply,sizeof(reply),0);
-        }else if(minor==5||minor==7||minor==8||minor==9||minor==11||minor==12||
-                 minor==14||minor==16||minor==18||minor==19||minor==20||minor==21){
-            /* Query-style XKB requests: empty-but-valid replies keep libX11
-             * moving until full keyboard maps are wired. */
-            if(minor==8){ /* GetMap: no components, no variable-length body. */
-                reply[1]=0; /* device id */
-                x11_wr16(c,reply+8,0); /* present */
-            }
+        }else if(minor==12){ /* GetIndicatorState */
             sock_send(c->sock_fd,reply,sizeof(reply),0);
-        }else if(minor==1||minor==2||minor==4||minor==6||minor==10||
-                 minor==13||minor==15||minor==17||minor==22){
-            /* Void XKB requests. */
+        }else if(minor==13){ /* GetIndicatorMap */
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
+        }else if(minor==15){ /* GetNamedIndicator */
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
+        }else if(minor==17){ /* GetNames */
+            x11_wr32(c,reply+8,0); /* no symbolic name blocks yet */
+            reply[12]=8;reply[13]=255;
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
+        }else if(minor==19){ /* GetGeometry */
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
+        }else if(minor==21){ /* PerClientFlags */
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
+        }else if(minor==22){ /* ListComponents */
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
+        }else if(minor==23){ /* GetKbdByName */
+            reply[8]=8;reply[9]=255;
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
+        }else if(minor==24){ /* GetDeviceInfo */
+            x11_send_xkb_get_device_info_reply(c);
+        }else if(minor==101){ /* SetDebuggingFlags */
+            sock_send(c->sock_fd,reply,sizeof(reply),0);
         }else{
             x11_trace_extension(c,"XKEYBOARD",minor,body_len,"missing");
         }
@@ -2743,7 +4112,7 @@ static int x11_pull_socket_rx(x11_connection_t *c){
     if(!s->used)return -ENOTCONN;
     used=(uint16_t)(s->rx_head-s->rx_tail);
     if(!used)return 0;
-    if((uint32_t)c->req_len+(uint32_t)used>2u*1024u*1024u)return -E2BIG;
+    if((uint32_t)c->req_len+(uint32_t)used>X11_MAX_REQUEST_BYTES)return -E2BIG;
     rc=x11_reqbuf_reserve(c,c->req_len+(uint32_t)used);
     if(rc<0)return rc;
     while(used){
@@ -2811,7 +4180,7 @@ int x11_process_request(int conn_idx){
     #define X11_W16(_p,_v) x11_wr16(c,(_p),(_v))
     #define X11_W32(_p,_v) x11_wr32(c,(_p),(_v))
     #define X11_RET(_v) do{if(body_heap)ulibc_free(body);return (_v);}while(0)
-    x11_trace_request(c,opcode,extra,req_len,body_len);
+    x11_trace_request(c,opcode,extra,req_len,body_len,body_len?body:0);
     if(x11_handle_extension_request(c,opcode,extra,body,body_len)==0)X11_RET(0);
     switch(opcode){
     case X11_CreateWindow:{
@@ -2825,7 +4194,10 @@ int x11_process_request(int conn_idx){
         uint16_t border=X11_U16(body+16);
         uint16_t klass=X11_U16(body+18);
         uint32_t visual=X11_U32(body+20);
+        uint32_t value_mask=X11_U32(body+24);
         x11_window_t *parent_w=x11_find_window(c,parent);
+        size_t vpos=28;
+        int bit;
         x11_trace_window_op(c,"create",wid,(int)w,(int)h);
         x11_window_t*wn=x11_find_window(c,wid);if(!wn){
             int i;for(i=0;i<X11_MAX_WINDOWS;++i)if(!c->windows[i].used){wn=&c->windows[i];break;}
@@ -2838,6 +4210,19 @@ int x11_process_request(int conn_idx){
         wn->visual=visual?visual:(parent_w?parent_w->visual:c->visual);
         wn->background_pixel=0xFF333366;/* default bg */
         wn->mapped=false;wn->visible=false;wn->event_mask=0;
+        /*
+         * CreateWindow trae el mismo value-list que ChangeWindowAttributes.
+         * GTK/Chromium suelen poner el event mask aca, no en una request aparte.
+         */
+        for(bit=0;bit<32&&vpos+4<=body_len;++bit){
+            uint32_t v;
+            if((value_mask&(1u<<bit))==0)continue;
+            v=X11_U32(body+vpos);
+            if(bit==1)wn->background_pixel=v;
+            else if(bit==2)wn->border_pixel=v;
+            else if(bit==11)wn->event_mask=v;
+            vpos+=4;
+        }
         if(w&&h&&((uint32_t)w*(uint32_t)h)<=0x1000000u){
             wn->backing_size=(uint32_t)w*(uint32_t)h*4u;
             wn->backing=(uint8_t*)ulibc_malloc(wn->backing_size);
@@ -2848,6 +4233,8 @@ int x11_process_request(int conn_idx){
         if(wn->backing)ulibc_memset(wn->backing,0,wn->backing_size);
         c->window_count++;
         g_x11_render_dirty=true;
+        /* CreateWindow solo crea el recurso. Si lo mostramos aca, GTK queda
+         * pensando que el WM le mapeo una ventana que todavia estaba armando. */
         x11_auto_map_if_client_window(c,wn);
         break;}
     case X11_ChangeWindowAttributes:{
@@ -2886,21 +4273,30 @@ int x11_process_request(int conn_idx){
         break;}
     case X11_MapWindow:{
         uint32_t wid=0;
+        bool browser_realized=false;
         if(body_len>=4)wid=X11_U32(body+0);
         x11_trace_window_op(c,"map",wid,-1,-1);
         x11_window_t*wn=x11_find_window(c,wid);
-        if(wn){wn->mapped=true;wn->visible=true;g_x11_render_dirty=true;
-            /* Push MapNotify + Expose so simple X11 clients draw without
-             * waiting for a full window manager round trip. */
+        if(wn&&(((x11_window_family_looks_like_browser(c,wn)||
+                  x11_large_surface_in_browser_conn(c,wn))&&
+                 x11_should_force_browser_size(c,wn))||
+                x11_should_force_browser_connection_window(c,wn))){
+            x11_force_browser_window_real_size(c,wn,"browser-map");
+            browser_realized=true;
+        }
+        if(wn&&!browser_realized){wn->mapped=true;g_x11_render_dirty=true;
+            /* Un WM real manda estos avisos; sin esto GTK/Chrome pueden esperar
+             * una ventana visible que para ellos nunca llega. */
             x11_push_map_notify_event(c,wid);
-            x11_push_expose((int)(c-g_x11_conns),wid,0,0,wn->width,wn->height);}
+            x11_update_visibility_family(c,wn,true);
+            x11_render_now();}
         break;}
     case X11_UnmapWindow:{
         if(body_len<4)break;
         {
             uint32_t wid=X11_U32(body+0);
             x11_window_t*wn=x11_find_window(c,wid);
-            if(wn){wn->mapped=false;wn->visible=false;g_x11_render_dirty=true;}
+            if(wn){wn->mapped=false;x11_update_visibility_family(c,wn,false);g_x11_render_dirty=true;}
         }
         break;}
     case X11_MapSubwindows:{
@@ -2911,7 +4307,8 @@ int x11_process_request(int conn_idx){
             for(i=0;i<X11_MAX_WINDOWS;++i){
                 if(!c->windows[i].used||c->windows[i].parent!=parent)continue;
                 c->windows[i].mapped=true;
-                c->windows[i].visible=true;
+                x11_push_map_notify_event(c,c->windows[i].id);
+                x11_update_visibility_family(c,&c->windows[i],false);
                 g_x11_render_dirty=true;
             }
         }
@@ -2959,7 +4356,12 @@ int x11_process_request(int conn_idx){
             }
             if(wn->width!=old_w||wn->height!=old_h)
                 x11_resize_window_backing(wn,old_w,old_h);
-            x11_auto_map_if_client_window(c,wn);
+            if((x11_window_family_looks_like_browser(c,wn)||x11_large_surface_in_browser_conn(c,wn))&&
+               x11_should_force_browser_size(c,wn)){
+                x11_force_browser_window_real_size(c,wn,"browser-map");
+            }else{
+                x11_auto_map_if_client_window(c,wn);
+            }
         }
         break;}
     case X11_CreatePixmap:{
@@ -3257,7 +4659,8 @@ int x11_process_request(int conn_idx){
             uint8_t reply[44];
             uint32_t visual=wn&&wn->visual?wn->visual:c->visual;
             uint16_t klass=wn&&wn->klass?wn->klass:1; /* InputOutput */
-            uint8_t map_state=wn&&wn->mapped?2:0;     /* IsViewable */
+            uint8_t map_state=0;
+            if(wn&&wn->mapped)map_state=x11_window_is_viewable(c,wn)?2:1;
             x11_reply_init(c,reply,sizeof(reply),0);   /* backing-store hint */
             X11_W32(reply+4,3); /* length=3 (12 bytes after 32-byte header) */
             X11_W32(reply+8,visual);
@@ -3400,6 +4803,7 @@ int x11_process_request(int conn_idx){
                 uint32_t type_cardinal=x11_atom_id_by_name(c,"CARDINAL");
                 uint32_t type_utf8=x11_atom_id_by_name(c,"UTF8_STRING");
                 uint32_t type_string=x11_atom_id_by_name(c,"STRING");
+                uint32_t type_visualid=x11_atom_id_by_name(c,"VISUALID");
                 if(prop_name&&ulibc_strcmp(prop_name,"WM_STATE")==0&&
                    (req_type==0||req_type==atom)){
                     x11_window_t *sw=x11_find_window(c,win);
@@ -3434,15 +4838,15 @@ int x11_process_request(int conn_idx){
                     X11_W32(reply+8,type_window);
                     X11_W32(reply+12,send_bytes?0u:4u);
                     X11_W32(reply+16,send_bytes?1u:0u);
-                    X11_W32(data,c->root_window);
+                    X11_W32(data,c->wm_check_window?c->wm_check_window:c->root_window);
                     sock_send(c->sock_fd,reply,sizeof(reply),0);
                     if(send_bytes)sock_send(c->sock_fd,data,send_bytes,0);
                     X11_RET(0);
                 }
                 if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_SUPPORTED")==0&&
                    (req_type==0||req_type==type_atom)){
-                    uint32_t vals[32];
-                    uint8_t data[128];
+                    uint32_t vals[64];
+                    uint8_t data[256];
                     uint32_t count=0,bi;
                     size_t total,start2;
                     vals[count++]=x11_intern_atom(c,"_NET_SUPPORTED",true);
@@ -3453,9 +4857,19 @@ int x11_process_request(int conn_idx){
                     vals[count++]=x11_intern_atom(c,"_NET_WM_WINDOW_TYPE",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_WINDOW_TYPE_NORMAL",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_STATE",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_ABOVE",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_BELOW",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_FOCUSED",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_FULLSCREEN",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_HIDDEN",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_MODAL",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_MAXIMIZED_VERT",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_MAXIMIZED_HORZ",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_SKIP_TASKBAR",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_SKIP_PAGER",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_STICKY",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_SYNC_REQUEST",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_SYNC_REQUEST_COUNTER",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_DESKTOP",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_ALLOWED_ACTIONS",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_ACTION_CLOSE",true);
@@ -3463,6 +4877,18 @@ int x11_process_request(int conn_idx){
                     vals[count++]=x11_intern_atom(c,"_NET_WM_ACTION_MAXIMIZE_VERT",true);
                     vals[count++]=x11_intern_atom(c,"_NET_WM_ACTION_MAXIMIZE_HORZ",true);
                     vals[count++]=x11_intern_atom(c,"_NET_FRAME_EXTENTS",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WORKAREA",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_CURRENT_DESKTOP",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_NUMBER_OF_DESKTOPS",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_DESKTOP_VIEWPORT",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_CLIENT_LIST",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_CLIENT_LIST_STACKING",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_VIRTUAL_ROOTS",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_PING",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_USER_TIME",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_USER_TIME_WINDOW",true);
+                    vals[count++]=x11_intern_atom(c,"_GTK_WORKAREAS",true);
+                    vals[count++]=x11_intern_atom(c,"_GTK_EDGE_CONSTRAINTS",true);
                     vals[count++]=x11_intern_atom(c,"WM_PROTOCOLS",true);
                     for(bi=0;bi<count;++bi)X11_W32(data+bi*4u,vals[bi]);
                     total=(size_t)count*4u;
@@ -3506,6 +4932,48 @@ int x11_process_request(int conn_idx){
                     if(send_bytes&&(send_bytes&3u))sock_send(c->sock_fd,pad,4u-(send_bytes&3u),0);
                     X11_RET(0);
                 }
+                if(prop_name&&ulibc_strcmp(prop_name,"RESOURCE_MANAGER")==0&&
+                   (req_type==0||req_type==type_string)){
+                    const char *rm=
+                        "Xft.dpi:\t96\n"
+                        "Xft.antialias:\t1\n"
+                        "Xft.hinting:\t1\n"
+                        "Xft.rgba:\trgb\n";
+                    uint32_t n=(uint32_t)ulibc_strlen(rm);
+                    uint8_t pad[4]={0,0,0,0};
+                    start=(size_t)long_off*4u;
+                    if(start<n){
+                        available=(size_t)n-start;
+                        send_bytes=(size_t)long_len*4u;
+                        if(send_bytes>available)send_bytes=available;
+                        bytes_after=(uint32_t)(available-send_bytes);
+                        nitems=(uint32_t)send_bytes;
+                    }
+                    reply[1]=8;
+                    X11_W32(reply+4,(uint32_t)((send_bytes+3u)/4u));
+                    X11_W32(reply+8,type_string);
+                    X11_W32(reply+12,bytes_after);
+                    X11_W32(reply+16,nitems);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,rm+start,send_bytes,0);
+                    if(send_bytes&&(send_bytes&3u))sock_send(c->sock_fd,pad,4u-(send_bytes&3u),0);
+                    X11_RET(0);
+                }
+                if(prop_name&&ulibc_strcmp(prop_name,"GDK_VISUALS")==0&&
+                   (req_type==0||req_type==type_visualid)){
+                    uint8_t data[4];
+                    X11_W32(data,c->visual);
+                    if(long_off!=0)send_bytes=0;
+                    else send_bytes=long_len?4u:0u;
+                    reply[1]=32;
+                    X11_W32(reply+4,send_bytes?1u:0u);
+                    X11_W32(reply+8,type_visualid?type_visualid:32u);
+                    X11_W32(reply+12,send_bytes?0u:4u);
+                    X11_W32(reply+16,send_bytes?1u:0u);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,data,send_bytes,0);
+                    X11_RET(0);
+                }
                 if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_FRAME_EXTENTS")==0&&
                    (req_type==0||req_type==type_cardinal)){
                     uint8_t data[16];
@@ -3521,7 +4989,10 @@ int x11_process_request(int conn_idx){
                     if(send_bytes)sock_send(c->sock_fd,data,send_bytes,0);
                     X11_RET(0);
                 }
-                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_WORKAREA")==0&&
+                if(x11_advertise_wm(c)&&prop_name&&
+                   (ulibc_strcmp(prop_name,"_NET_WORKAREA")==0||
+                    ulibc_strcmp(prop_name,"_GTK_WORKAREAS")==0||
+                    x11_name_starts_with(prop_name,"_GTK_WORKAREAS_D"))&&
                    (req_type==0||req_type==type_cardinal)){
                     uint8_t data[16];
                     ulibc_memset(data,0,sizeof(data));
@@ -3544,6 +5015,152 @@ int x11_process_request(int conn_idx){
                     X11_W32(reply+16,nitems);
                     sock_send(c->sock_fd,reply,sizeof(reply),0);
                     if(send_bytes)sock_send(c->sock_fd,data+start,send_bytes,0);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&
+                   (ulibc_strcmp(prop_name,"_NET_CURRENT_DESKTOP")==0||
+                    ulibc_strcmp(prop_name,"_GTK_EDGE_CONSTRAINTS")==0)&&
+                   (req_type==0||req_type==type_cardinal)){
+                    uint8_t data[4];
+                    X11_W32(data,0);
+                    if(long_off!=0)send_bytes=0;
+                    else send_bytes=long_len?4u:0u;
+                    reply[1]=32;
+                    X11_W32(reply+4,send_bytes?1u:0u);
+                    X11_W32(reply+8,type_cardinal);
+                    X11_W32(reply+12,send_bytes?0u:4u);
+                    X11_W32(reply+16,send_bytes?1u:0u);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,data,send_bytes,0);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_NUMBER_OF_DESKTOPS")==0&&
+                   (req_type==0||req_type==type_cardinal)){
+                    uint8_t data[4];
+                    X11_W32(data,1);
+                    if(long_off!=0)send_bytes=0;
+                    else send_bytes=long_len?4u:0u;
+                    reply[1]=32;
+                    X11_W32(reply+4,send_bytes?1u:0u);
+                    X11_W32(reply+8,type_cardinal);
+                    X11_W32(reply+12,send_bytes?0u:4u);
+                    X11_W32(reply+16,send_bytes?1u:0u);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,data,send_bytes,0);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_DESKTOP_VIEWPORT")==0&&
+                   (req_type==0||req_type==type_cardinal)){
+                    uint8_t data[8];
+                    X11_W32(data+0,0);
+                    X11_W32(data+4,0);
+                    start=(size_t)long_off*4u;
+                    if(start<sizeof(data)){
+                        available=sizeof(data)-start;
+                        send_bytes=(size_t)long_len*4u;
+                        if(send_bytes>available)send_bytes=available;
+                        bytes_after=(uint32_t)(available-send_bytes);
+                        nitems=(uint32_t)(send_bytes/4u);
+                    }
+                    reply[1]=32;
+                    X11_W32(reply+4,(uint32_t)((send_bytes+3u)/4u));
+                    X11_W32(reply+8,type_cardinal);
+                    X11_W32(reply+12,bytes_after);
+                    X11_W32(reply+16,nitems);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,data+start,send_bytes,0);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_ACTIVE_WINDOW")==0&&
+                   (req_type==0||req_type==type_window)){
+                    uint32_t vals[1];
+                    x11_window_t *active=x11_active_top_window(c);
+                    vals[0]=active?active->id:0;
+                    x11_send_property32_values_reply(c,type_window,vals,1,long_off,long_len);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_WM_WINDOW_TYPE")==0&&
+                   (req_type==0||req_type==type_atom)){
+                    uint8_t data[4];
+                    X11_W32(data,x11_intern_atom(c,"_NET_WM_WINDOW_TYPE_NORMAL",true));
+                    if(long_off!=0)send_bytes=0;
+                    else send_bytes=long_len?4u:0u;
+                    reply[1]=32;
+                    X11_W32(reply+4,send_bytes?1u:0u);
+                    X11_W32(reply+8,type_atom);
+                    X11_W32(reply+12,send_bytes?0u:4u);
+                    X11_W32(reply+16,send_bytes?1u:0u);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,data,send_bytes,0);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_WM_ALLOWED_ACTIONS")==0&&
+                   (req_type==0||req_type==type_atom)){
+                    uint32_t vals[4];
+                    uint8_t data[16];
+                    uint32_t count=0,bi;
+                    size_t total,start2;
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_ACTION_CLOSE",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_ACTION_MINIMIZE",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_ACTION_MAXIMIZE_VERT",true);
+                    vals[count++]=x11_intern_atom(c,"_NET_WM_ACTION_MAXIMIZE_HORZ",true);
+                    for(bi=0;bi<count;++bi)X11_W32(data+bi*4u,vals[bi]);
+                    total=(size_t)count*4u;
+                    start2=(size_t)long_off*4u;
+                    if(start2<total){
+                        available=total-start2;
+                        send_bytes=(size_t)long_len*4u;
+                        if(send_bytes>available)send_bytes=available;
+                        bytes_after=(uint32_t)(available-send_bytes);
+                        nitems=(uint32_t)(send_bytes/4u);
+                    }
+                    reply[1]=32;
+                    X11_W32(reply+4,(uint32_t)((send_bytes+3u)/4u));
+                    X11_W32(reply+8,type_atom);
+                    X11_W32(reply+12,bytes_after);
+                    X11_W32(reply+16,nitems);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,data+start2,send_bytes,0);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_WM_STATE")==0&&
+                   (req_type==0||req_type==type_atom)){
+                    uint32_t vals[1];
+                    uint32_t count=0;
+                    x11_window_t *active=x11_active_top_window(c);
+                    if(active&&active->id==win)vals[count++]=x11_intern_atom(c,"_NET_WM_STATE_FOCUSED",true);
+                    x11_send_property32_values_reply(c,type_atom,vals,count,long_off,long_len);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_VIRTUAL_ROOTS")==0&&
+                   (req_type==0||req_type==type_window)){
+                    x11_send_property32_values_reply(c,type_window,0,0,long_off,long_len);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&
+                   (ulibc_strcmp(prop_name,"_NET_WM_DESKTOP")==0||
+                    ulibc_strcmp(prop_name,"_NET_WM_USER_TIME")==0)&&
+                   (req_type==0||req_type==type_cardinal)){
+                    uint8_t data[4];
+                    X11_W32(data,0);
+                    if(long_off!=0)send_bytes=0;
+                    else send_bytes=long_len?4u:0u;
+                    reply[1]=32;
+                    X11_W32(reply+4,send_bytes?1u:0u);
+                    X11_W32(reply+8,type_cardinal);
+                    X11_W32(reply+12,send_bytes?0u:4u);
+                    X11_W32(reply+16,send_bytes?1u:0u);
+                    sock_send(c->sock_fd,reply,sizeof(reply),0);
+                    if(send_bytes)sock_send(c->sock_fd,data,send_bytes,0);
+                    X11_RET(0);
+                }
+                if(x11_advertise_wm(c)&&prop_name&&
+                   (ulibc_strcmp(prop_name,"_NET_CLIENT_LIST")==0||
+                    ulibc_strcmp(prop_name,"_NET_CLIENT_LIST_STACKING")==0)&&
+                   (req_type==0||req_type==type_window)){
+                    uint32_t vals[X11_MAX_WINDOWS];
+                    uint32_t count=x11_collect_client_windows(c,vals,X11_MAX_WINDOWS);
+                    x11_send_property32_values_reply(c,type_window,vals,count,long_off,long_len);
                     X11_RET(0);
                 }
                 if(prop_name&&ulibc_strcmp(prop_name,"_XSETTINGS_SETTINGS")==0&&
@@ -3573,6 +5190,30 @@ int x11_process_request(int conn_idx){
                     X11_RET(0);
                 }
             }
+            if(x11_advertise_wm(c)&&prop_name&&ulibc_strcmp(prop_name,"_NET_WM_STATE")==0){
+                uint32_t state_type_atom=x11_atom_id_by_name(c,"ATOM");
+                uint32_t vals[16];
+                uint32_t count2=0;
+                uint32_t focused=x11_intern_atom(c,"_NET_WM_STATE_FOCUSED",true);
+                bool have_focused=false;
+                x11_window_t *active=x11_active_top_window(c);
+                if(req_type!=0&&req_type!=state_type_atom)goto x11_state_passthrough;
+                if(prop&&prop->used&&prop->format==32&&prop->data){
+                    uint32_t pi,pcount=prop->data_bytes/4u;
+                    if(pcount>15u)pcount=15u;
+                    for(pi=0;pi<pcount;++pi){
+                        uint32_t v=x11_rd32(c,prop->data+pi*4u);
+                        if(v==focused)have_focused=true;
+                        vals[count2++]=v;
+                    }
+                }
+                if(active&&active->id==win&&focused&&!have_focused&&count2<16u){
+                    vals[count2++]=focused;
+                }
+                x11_send_property32_values_reply(c,state_type_atom,vals,count2,long_off,long_len);
+                X11_RET(0);
+            }
+x11_state_passthrough:
             if(prop&&prop->used&&prop->format&&(req_type==0||req_type==prop->type)){
                 unit=(prop->format==8)?1u:((prop->format==16)?2u:4u);
                 start=(size_t)long_off*4u;
@@ -3667,8 +5308,11 @@ int x11_process_request(int conn_idx){
             int16_t dst_y=src_y;
             uint8_t reply[32];
             if(src&&dst){
-                dst_x=(int16_t)(src_x+src->x-dst->x);
-                dst_y=(int16_t)(src_y+src->y-dst->y);
+                int sx=0,sy=0,dx=0,dy=0;
+                if(src->id!=c->root_window)(void)x11_window_content_origin(c,src,&sx,&sy);
+                if(dst->id!=c->root_window)(void)x11_window_content_origin(c,dst,&dx,&dy);
+                dst_x=(int16_t)(src_x+sx-dx);
+                dst_y=(int16_t)(src_y+sy-dy);
             }
             x11_reply_init(c,reply,sizeof(reply),1);
             X11_W32(reply+8,0); /* child */
@@ -3680,19 +5324,49 @@ int x11_process_request(int conn_idx){
     }
     case X11_QueryPointer:{
         uint8_t reply[32];
+        uint32_t query_wid=body_len>=4?X11_U32(body+0):c->root_window;
+        uint32_t child=0;
+        int win_x=c->pointer_x;
+        int win_y=c->pointer_y;
+        x11_window_t *query_w=x11_find_window(c,query_wid);
+        if(query_w&&query_w->id!=c->root_window){
+            int ox=0,oy=0;
+            if(x11_window_content_origin(c,query_w,&ox,&oy)){
+                win_x=c->pointer_x-ox;
+                win_y=c->pointer_y-oy;
+            }
+        }else{
+            int ci=-1,wx=0,wy=0;
+            x11_window_t *under=x11_find_screen_window(c->pointer_x,c->pointer_y,&ci,&wx,&wy);
+            (void)ci;
+            if(under){child=under->id;win_x=wx;win_y=wy;}
+        }
         x11_reply_init(c,reply,sizeof(reply),1); /* same-screen=true */
         X11_W32(reply+8,c->root_window);  /* root */
-        X11_W32(reply+12,c->root_window); /* child */
+        X11_W32(reply+12,child); /* child */
         X11_W16(reply+16,(uint16_t)c->pointer_x); /* root x */
         X11_W16(reply+18,(uint16_t)c->pointer_y); /* root y */
-        X11_W16(reply+20,(uint16_t)c->pointer_x); /* win x */
-        X11_W16(reply+22,(uint16_t)c->pointer_y); /* win y */
+        X11_W16(reply+20,(uint16_t)(int16_t)win_x); /* win x */
+        X11_W16(reply+22,(uint16_t)(int16_t)win_y); /* win y */
+        X11_W16(reply+24,(uint16_t)(g_x11_key_state_mask|g_x11_pointer_button_mask));
         sock_send(c->sock_fd,reply,32,0);X11_RET(0);}
     case X11_GetInputFocus:{
         uint8_t reply[32];
+        uint32_t focus=c->root_window;
         x11_reply_init(c,reply,sizeof(reply),0);
-        reply[8]=1;/* focus=PointerRoot */reply[9]=0;/* revert_to */
+        reply[1]=0;/* RevertToNone */
+        if(g_x11_focus_conn>=0&&g_x11_focus_conn<X11_MAX_CONN&&
+           &g_x11_conns[g_x11_focus_conn]==c&&g_x11_focus_window){
+            focus=g_x11_focus_window;
+        }
+        X11_W32(reply+8,focus);
         sock_send(c->sock_fd,reply,32,0);X11_RET(0);}
+    case X11_QueryKeymap:{
+        uint8_t reply[40];
+        x11_reply_init(c,reply,sizeof(reply),0);
+        x11_reply_set_length(c,reply,2);
+        ulibc_memcpy(reply+8,g_x11_key_down_map,sizeof(g_x11_key_down_map));
+        sock_send(c->sock_fd,reply,sizeof(reply),0);X11_RET(0);}
     case X11_GetSelectionOwner:{
         uint8_t reply[32];
         uint32_t selection;
@@ -3720,7 +5394,13 @@ int x11_process_request(int conn_idx){
     case X11_UngrabServer:
     case X11_OpenFont:
         break;/* no reply */
-    case X11_SetInputFocus:break;/* no reply */
+    case X11_SetInputFocus:{
+        if(body_len>=4){
+            uint32_t wid=X11_U32(body+0);
+            if(wid==0||wid==1)wid=c->root_window;
+            x11_focus_window_from_client(c,wid);
+        }
+        break;}/* no reply */
     case X11_SendEvent:{
         if(body_len>=36){
             uint32_t dst=X11_U32(body+0);
@@ -3730,8 +5410,11 @@ int x11_process_request(int conn_idx){
             ulibc_memcpy(&ev,body+8,sizeof(ev));
             if(dst==0||dst==1)dst=c->root_window;
             if(dst==c->root_window){
+                if(x11_handle_root_client_message(c,body+8)){
+                    break;
+                }
                 static uint32_t send_event_drop_trace=0;
-                if(send_event_drop_trace<32){
+                if(c7_x11_trace_enabled()&&send_event_drop_trace<32){
                     ++send_event_drop_trace;
                     __boot_serial_puts("[x11-send] drop-root fd=");
                     __boot_serial_putu32(c?(uint32_t)c->sock_fd:0);
@@ -3775,6 +5458,15 @@ int x11_process_request(int conn_idx){
         uint8_t reply[32];
         x11_reply_init(c,reply,sizeof(reply),0); /* GrabSuccess */
         sock_send(c->sock_fd,reply,32,0);X11_RET(0);}
+    case X11_UngrabPointer:
+    case X11_GrabButton:
+    case X11_UngrabButton:
+    case X11_ChangeActivePointerGrab:
+    case X11_UngrabKeyboard:
+    case X11_GrabKey:
+    case X11_UngrabKey:
+    case X11_AllowEvents:
+        break;/* no reply */
     case X11_Flush:case X11_Sync:break;/* no-op */
     case X11_ListExtensions:{
         /* Return list of supported X11 extensions */
@@ -3809,56 +5501,66 @@ int x11_process_request(int conn_idx){
         }
         X11_RET(0);}
     case X11_GetKeyboardMapping:{
-        /* Core X11 keyboard fallback: one keysym per keycode. */
+        /* Core X11 keyboard fallback. Firefox pregunta esto apenas recibe
+         * input; si respondemos otro rango, GTK termina leyendo basura. */
         uint8_t reply[32];
-        int first_kc=extra;
-        int count=body_len>=1?(int)body[0]:1;
-        int keysyms_per=1;
+        int first_kc=body_len>=1?(int)body[0]:(int)extra;
+        int count=body_len>=2?(int)body[1]:1;
+        int keysyms_per=2;
         int total=count*keysyms_per;
         int i;
+        static uint32_t keymap_trace_count;
+        /* Xlib deja el byte extra en cero aca: first/count vienen en el body. */
+        if(first_kc<=0)first_kc=8;
         if(count<=0)count=1;
         if(count>248)count=248;
         total=count*keysyms_per;
-        __boot_serial_force_puts("[x11-keymap!] first=");
-        __boot_serial_force_putu32((uint32_t)first_kc);
-        __boot_serial_force_puts(" count=");
-        __boot_serial_force_putu32((uint32_t)count);
-        __boot_serial_force_puts(" per=");
-        __boot_serial_force_putu32((uint32_t)keysyms_per);
-        __boot_serial_force_puts("\n");
+        if(c7_x11_trace_enabled()&&keymap_trace_count<3){
+            ++keymap_trace_count;
+            __boot_serial_puts("[x11-keymap] first=");
+            __boot_serial_putu32((uint32_t)first_kc);
+            __boot_serial_puts(" count=");
+            __boot_serial_putu32((uint32_t)count);
+            __boot_serial_puts(" per=");
+            __boot_serial_putu32((uint32_t)keysyms_per);
+            __boot_serial_puts("\n");
+        }
         x11_reply_init(c,reply,sizeof(reply),(uint8_t)keysyms_per);
         x11_reply_set_length(c,reply,(uint32_t)total);
         sock_send(c->sock_fd,reply,32,0);
-        for(i=0;i<total;i++){
-            uint8_t ksym[4];
+        for(i=0;i<count;i++){
+            uint8_t ksym[8];
             int kc=first_kc+i;
-            uint32_t sym=0;
+            uint32_t sym=0,shift=0;
             switch(kc){
                 case 9:sym=0xFF1Bu;break;  /* Escape */
-                case 10:sym='1';break;case 11:sym='2';break;case 12:sym='3';break;
-                case 13:sym='4';break;case 14:sym='5';break;case 15:sym='6';break;
-                case 16:sym='7';break;case 17:sym='8';break;case 18:sym='9';break;
-                case 19:sym='0';break;case 20:sym='-';break;case 21:sym='=';break;
+                case 10:sym='1';shift='!';break;case 11:sym='2';shift='@';break;case 12:sym='3';shift='#';break;
+                case 13:sym='4';shift='$';break;case 14:sym='5';shift='%';break;case 15:sym='6';shift='^';break;
+                case 16:sym='7';shift='&';break;case 17:sym='8';shift='*';break;case 18:sym='9';shift='(';break;
+                case 19:sym='0';shift=')';break;case 20:sym='-';shift='_';break;case 21:sym='=';shift='+';break;
                 case 22:sym=0xFF08u;break; /* BackSpace */
                 case 23:sym=0xFF09u;break; /* Tab */
-                case 24:sym='q';break;case 25:sym='w';break;case 26:sym='e';break;
-                case 27:sym='r';break;case 28:sym='t';break;case 29:sym='y';break;
-                case 30:sym='u';break;case 31:sym='i';break;case 32:sym='o';break;
-                case 33:sym='p';break;case 34:sym='[';break;case 35:sym=']';break;
+                case 24:sym='q';shift='Q';break;case 25:sym='w';shift='W';break;case 26:sym='e';shift='E';break;
+                case 27:sym='r';shift='R';break;case 28:sym='t';shift='T';break;case 29:sym='y';shift='Y';break;
+                case 30:sym='u';shift='U';break;case 31:sym='i';shift='I';break;case 32:sym='o';shift='O';break;
+                case 33:sym='p';shift='P';break;case 34:sym='[';shift='{';break;case 35:sym=']';shift='}';break;
                 case 36:sym=0xFF0Du;break; /* Return */
                 case 37:sym=0xFFE3u;break; /* Control_L */
-                case 38:sym='a';break;case 39:sym='s';break;case 40:sym='d';break;
-                case 41:sym='f';break;case 42:sym='g';break;case 43:sym='h';break;
-                case 44:sym='j';break;case 45:sym='k';break;case 46:sym='l';break;
-                case 47:sym=';';break;case 48:sym='\'';break;case 49:sym='`';break;
+                case 38:sym='a';shift='A';break;case 39:sym='s';shift='S';break;case 40:sym='d';shift='D';break;
+                case 41:sym='f';shift='F';break;case 42:sym='g';shift='G';break;case 43:sym='h';shift='H';break;
+                case 44:sym='j';shift='J';break;case 45:sym='k';shift='K';break;case 46:sym='l';shift='L';break;
+                case 47:sym=';';shift=':';break;case 48:sym='\'';shift='"';break;case 49:sym='`';shift='~';break;
                 case 50:sym=0xFFE1u;break; /* Shift_L */
-                case 51:sym='\\';break;
-                case 52:sym='z';break;case 53:sym='x';break;case 54:sym='c';break;
-                case 55:sym='v';break;case 56:sym='b';break;case 57:sym='n';break;
-                case 58:sym='m';break;case 59:sym=',';break;case 60:sym='.';break;
-                case 61:sym='/';break;
+                case 51:sym='\\';shift='|';break;
+                case 52:sym='z';shift='Z';break;case 53:sym='x';shift='X';break;case 54:sym='c';shift='C';break;
+                case 55:sym='v';shift='V';break;case 56:sym='b';shift='B';break;case 57:sym='n';shift='N';break;
+                case 58:sym='m';shift='M';break;case 59:sym=',';shift='<';break;case 60:sym='.';shift='>';break;
+                case 61:sym='/';shift='?';break;
+                case 62:sym=0xFFE2u;break; /* Shift_R */
                 case 64:sym=0xFFE9u;break; /* Alt_L */
                 case 65:sym=' ';break;
+                case 105:sym=0xFFE4u;break; /* Control_R */
+                case 108:sym=0xFFEAu;break; /* Alt_R */
                 case 111:sym=0xFF52u;break; /* Up */
                 case 113:sym=0xFF51u;break; /* Left */
                 case 114:sym=0xFF53u;break; /* Right */
@@ -3872,7 +5574,8 @@ int x11_process_request(int conn_idx){
                 default:sym=0;break;
             }
             x11_wr32(c,ksym,sym);
-            sock_send(c->sock_fd,ksym,4,0);
+            x11_wr32(c,ksym+4,shift);
+            sock_send(c->sock_fd,ksym,8,0);
         }
         X11_RET(0);}
     case X11_GetPointerMapping:{
@@ -3890,15 +5593,17 @@ int x11_process_request(int conn_idx){
         sock_send(c->sock_fd,reply,32,0);
         X11_RET(0);}
     case X11_GetModifierMapping:{
-        /* Keep the core modifier table conservative until the XKB/core
-         * keymap is complete. Chromium reads this table early and assumes
-         * every advertised keycode has already been covered by its local
-         * keyboard mapping; handing out Control/Alt keycodes here can trip
-         * a hard CHECK before the first browser window is created. */
         uint8_t reply[32];
         uint8_t map[8];
+        static uint32_t modmap_trace_count;
         ulibc_memset(map,0,sizeof(map));
-        __boot_serial_force_puts("[x11-modmap!] per=1 zeroed\n");
+        map[0]=50; /* Shift */
+        map[2]=37; /* Control */
+        map[3]=64; /* Alt */
+        if(c7_x11_trace_enabled()&&modmap_trace_count<3){
+            ++modmap_trace_count;
+            __boot_serial_puts("[x11-modmap] per=1 basic\n");
+        }
         x11_reply_init(c,reply,sizeof(reply),2);
         x11_reply_set_length(c,reply,2);
         reply[1]=1;
@@ -3913,13 +5618,15 @@ int x11_process_request(int conn_idx){
         /* Standard X11 reply-requiring opcodes we haven't handled above */
         if(opcode==47||opcode==49||opcode==97||opcode==108||
            opcode==44||opcode==46||opcode==83||opcode==84)needs_reply=true;
-        __boot_serial_puts("[x11-unhandled] op=");
-        __boot_serial_putu32((uint32_t)opcode);
-        __boot_serial_puts(" extra=");
-        __boot_serial_putu32((uint32_t)extra);
-        __boot_serial_puts(" body=");
-        __boot_serial_putu32((uint32_t)body_len);
-        __boot_serial_puts(needs_reply?" REPLY-REQUIRED\n":"\n");
+        if(c7_x11_trace_enabled()){
+            __boot_serial_puts("[x11-unhandled] op=");
+            __boot_serial_putu32((uint32_t)opcode);
+            __boot_serial_puts(" extra=");
+            __boot_serial_putu32((uint32_t)extra);
+            __boot_serial_puts(" body=");
+            __boot_serial_putu32((uint32_t)body_len);
+            __boot_serial_puts(needs_reply?" REPLY-REQUIRED\n":"\n");
+        }
         if(needs_reply){
             /* Send a generic error reply to unblock the client */
             uint8_t err[32];
@@ -3950,6 +5657,14 @@ static uint16_t x11_modifier_mask_for_keycode(uint8_t keycode){
     }
 }
 
+static void x11_key_down_map_set(uint8_t keycode,bool down){
+    uint8_t idx=(uint8_t)(keycode>>3);
+    uint8_t bit=(uint8_t)(1u<<(keycode&7u));
+    if(idx>=sizeof(g_x11_key_down_map))return;
+    if(down)g_x11_key_down_map[idx]=(uint8_t)(g_x11_key_down_map[idx]|bit);
+    else g_x11_key_down_map[idx]=(uint8_t)(g_x11_key_down_map[idx]&~bit);
+}
+
 static void x11_push_key_event_to_window(x11_connection_t *c,uint32_t wid,
                                          uint8_t keycode,bool press){
     uint8_t raw[32];
@@ -3958,15 +5673,15 @@ static void x11_push_key_event_to_window(x11_connection_t *c,uint32_t wid,
     x11_window_t *w;
     uint16_t mod_mask;
     uint16_t state;
+    static uint32_t key_trace_count;
     if(!c||!c->used)return;
     mod_mask=x11_modifier_mask_for_keycode(keycode);
     state=g_x11_key_state_mask;
-    if(press&&mod_mask){
-        g_x11_key_state_mask|=mod_mask;
-        state=g_x11_key_state_mask;
-    }else if(!press&&mod_mask){
-        state=(uint16_t)(state|mod_mask);
+    if(press){
+        x11_key_down_map_set(keycode,true);
+        if(mod_mask)g_x11_key_state_mask=(uint16_t)(g_x11_key_state_mask|mod_mask);
     }
+    if(!press&&mod_mask)state=(uint16_t)(state|mod_mask);
     w=x11_find_window(c,wid);
     if(!w)wid=c->root_window;
     root_x=c->pointer_x;
@@ -3984,18 +5699,36 @@ static void x11_push_key_event_to_window(x11_connection_t *c,uint32_t wid,
     raw[0]=press?X11_KeyPress:X11_KeyRelease;
     raw[1]=keycode;
     x11_wr16(c,raw+2,c->sequence);
-    x11_wr32(c,raw+4,c->root_window);
-    x11_wr32(c,raw+8,wid);
-    x11_wr32(c,raw+12,0);
-    x11_wr16(c,raw+16,(uint16_t)(int16_t)root_x);
-    x11_wr16(c,raw+18,(uint16_t)(int16_t)root_y);
-    x11_wr16(c,raw+20,(uint16_t)(int16_t)win_x);
-    x11_wr16(c,raw+22,(uint16_t)(int16_t)win_y);
-    x11_wr16(c,raw+24,state);
+    x11_wr32(c,raw+4,x11_next_server_time());
+    x11_wr32(c,raw+8,c->root_window);
+    x11_wr32(c,raw+12,wid);
+    x11_wr32(c,raw+16,0);
+    x11_wr16(c,raw+20,(uint16_t)(int16_t)root_x);
+    x11_wr16(c,raw+22,(uint16_t)(int16_t)root_y);
+    x11_wr16(c,raw+24,(uint16_t)(int16_t)win_x);
+    x11_wr16(c,raw+26,(uint16_t)(int16_t)win_y);
+    x11_wr16(c,raw+28,state);
     raw[30]=1; /* same-screen */
     ulibc_memcpy(&ev,raw,sizeof(ev));
     x11_push_event(c,&ev);
-    if(!press&&mod_mask)g_x11_key_state_mask=(uint16_t)(g_x11_key_state_mask&~mod_mask);
+    if(c7_x11_trace_enabled()&&key_trace_count<24){
+        ++key_trace_count;
+        __boot_serial_force_puts("[x11-key!] fd=");
+        __boot_serial_force_putu32((uint32_t)c->sock_fd);
+        __boot_serial_force_puts(" win=");
+        __boot_serial_force_puthex64((uint64_t)wid);
+        __boot_serial_force_puts(" kc=");
+        __boot_serial_force_putu32((uint32_t)keycode);
+        __boot_serial_force_puts(press?" down":" up");
+        __boot_serial_force_puts(" state=");
+        __boot_serial_force_puthex64((uint64_t)state);
+        __boot_serial_force_puts("\n");
+    }
+    ridux_request_cursor_redraw();
+    if(!press){
+        x11_key_down_map_set(keycode,false);
+        if(mod_mask)g_x11_key_state_mask=(uint16_t)(g_x11_key_state_mask&~mod_mask);
+    }
 }
 
 static void x11_push_mouse_event_to_window(x11_connection_t *c,uint32_t wid,
@@ -4004,7 +5737,11 @@ static void x11_push_mouse_event_to_window(x11_connection_t *c,uint32_t wid,
                                            int button,bool press){
     uint8_t raw[32];
     x11_event_t ev;
+    uint16_t button_mask=0;
+    uint16_t state;
     if(!c||!c->used)return;
+    if(button>0&&button<8)button_mask=(uint16_t)(1u<<(button+7));
+    state=(uint16_t)(g_x11_key_state_mask|g_x11_pointer_button_mask);
     c->pointer_x=root_x;
     c->pointer_y=root_y;
     ulibc_memset(raw,0,sizeof(raw));
@@ -4016,17 +5753,23 @@ static void x11_push_mouse_event_to_window(x11_connection_t *c,uint32_t wid,
         raw[1]=0;
     }
     x11_wr16(c,raw+2,c->sequence);
-    x11_wr32(c,raw+4,c->root_window);
-    x11_wr32(c,raw+8,wid?wid:c->root_window);
-    x11_wr32(c,raw+12,0);
-    x11_wr16(c,raw+16,(uint16_t)(int16_t)root_x);
-    x11_wr16(c,raw+18,(uint16_t)(int16_t)root_y);
-    x11_wr16(c,raw+20,(uint16_t)(int16_t)win_x);
-    x11_wr16(c,raw+22,(uint16_t)(int16_t)win_y);
-    x11_wr16(c,raw+24,(button>0&&press)?(uint16_t)(1u<<(button+7)):0);
+    x11_wr32(c,raw+4,x11_next_server_time());
+    x11_wr32(c,raw+8,c->root_window);
+    x11_wr32(c,raw+12,wid?wid:c->root_window);
+    x11_wr32(c,raw+16,0);
+    x11_wr16(c,raw+20,(uint16_t)(int16_t)root_x);
+    x11_wr16(c,raw+22,(uint16_t)(int16_t)root_y);
+    x11_wr16(c,raw+24,(uint16_t)(int16_t)win_x);
+    x11_wr16(c,raw+26,(uint16_t)(int16_t)win_y);
+    x11_wr16(c,raw+28,state);
     raw[30]=1; /* same-screen */
     ulibc_memcpy(&ev,raw,sizeof(ev));
     x11_push_event(c,&ev);
+    ridux_request_cursor_redraw();
+    if(button_mask){
+        if(press)g_x11_pointer_button_mask=(uint16_t)(g_x11_pointer_button_mask|button_mask);
+        else g_x11_pointer_button_mask=(uint16_t)(g_x11_pointer_button_mask&~button_mask);
+    }
 }
 
 void x11_push_key_event(int conn_idx,uint8_t keycode,bool press){
@@ -4066,6 +5809,76 @@ static x11_window_t *x11_find_screen_window(int screen_x,int screen_y,
     return 0;
 }
 
+static bool x11_window_coords(x11_connection_t *c,x11_window_t *w,
+                              int screen_x,int screen_y,int *win_x,int *win_y){
+    int ox=0,oy=0;
+    if(!c||!w||!x11_window_content_origin(c,w,&ox,&oy))return false;
+    if(win_x)*win_x=screen_x-ox;
+    if(win_y)*win_y=screen_y-oy;
+    return true;
+}
+
+static bool x11_button_grab_target(int screen_x,int screen_y,
+                                   x11_connection_t **out_c,x11_window_t **out_w,
+                                   int *win_x,int *win_y){
+    x11_connection_t *c;
+    x11_window_t *w;
+    if(g_x11_button_grab_conn<0||g_x11_button_grab_conn>=X11_MAX_CONN)return false;
+    c=&g_x11_conns[g_x11_button_grab_conn];
+    if(!c->used||!g_x11_button_grab_window)return false;
+    w=x11_find_window(c,g_x11_button_grab_window);
+    if(!w||!w->used||!w->mapped||!w->visible)return false;
+    if(!x11_window_coords(c,w,screen_x,screen_y,win_x,win_y))return false;
+    if(out_c)*out_c=c;
+    if(out_w)*out_w=w;
+    return true;
+}
+
+static void x11_update_pointer_focus(int conn_idx,x11_connection_t *c,x11_window_t *w,
+                                     int root_x,int root_y,int win_x,int win_y){
+    if(!c||!w)return;
+    if(g_x11_pointer_conn==conn_idx&&g_x11_pointer_window==w->id)return;
+    if(g_x11_pointer_conn>=0&&g_x11_pointer_conn<X11_MAX_CONN&&g_x11_pointer_window){
+        x11_connection_t *oldc=&g_x11_conns[g_x11_pointer_conn];
+        x11_window_t *oldw=oldc->used?x11_find_window(oldc,g_x11_pointer_window):0;
+        if(oldw&&oldw->used){
+            int oldx=0,oldy=0;
+            (void)x11_window_coords(oldc,oldw,root_x,root_y,&oldx,&oldy);
+            x11_push_crossing_event(oldc,oldw->id,X11_LeaveNotify,root_x,root_y,oldx,oldy);
+        }
+    }
+    g_x11_pointer_conn=conn_idx;
+    g_x11_pointer_window=w->id;
+    x11_push_crossing_event(c,w->id,X11_EnterNotify,root_x,root_y,win_x,win_y);
+}
+
+static x11_window_t *x11_find_title_window(int screen_x,int screen_y,
+                                           int *conn_idx,int *off_x,int *off_y){
+    int ci,wi;
+    for(ci=X11_MAX_CONN-1;ci>=0;--ci){
+        x11_connection_t *c=&g_x11_conns[ci];
+        if(!c->used)continue;
+        for(wi=X11_MAX_WINDOWS-1;wi>=0;--wi){
+            x11_window_t *w=&c->windows[wi];
+            int ox=0,oy=0;
+            int fx,fy,fw;
+            if(!w->used||!w->mapped||!w->visible||w->id==c->root_window)continue;
+            if(w->parent!=c->root_window||w->width<=1||w->height<=1)continue;
+            if(!x11_window_content_origin(c,w,&ox,&oy))continue;
+            fx=ox-2;
+            fy=oy-26;
+            fw=w->width+4;
+            if(screen_x<fx||screen_y<fy)continue;
+            if(screen_x>=fx+fw||screen_y>=fy+26)continue;
+            if(conn_idx)*conn_idx=ci;
+            if(off_x)*off_x=screen_x-fx;
+            if(off_y)*off_y=screen_y-fy;
+            return w;
+        }
+    }
+    return 0;
+}
+
 static bool x11_focus_is_valid(x11_connection_t **out_c,uint32_t *out_wid){
     x11_connection_t *c;
     x11_window_t *w;
@@ -4073,7 +5886,7 @@ static bool x11_focus_is_valid(x11_connection_t **out_c,uint32_t *out_wid){
     c=&g_x11_conns[g_x11_focus_conn];
     if(!c->used)return false;
     w=x11_find_window(c,g_x11_focus_window);
-    if(!w||!w->used||!w->mapped||!w->visible)return false;
+    if(!w||!w->used||w->id==c->root_window||!w->mapped||!w->visible)return false;
     if(out_c)*out_c=c;
     if(out_wid)*out_wid=w->id;
     return true;
@@ -4081,11 +5894,78 @@ static bool x11_focus_is_valid(x11_connection_t **out_c,uint32_t *out_wid){
 
 int x11_dispatch_pointer_event(int screen_x,int screen_y,int button,bool press){
     int ci=-1,wx=0,wy=0;
+    if(g_x11_drag_conn>=0&&g_x11_drag_conn<X11_MAX_CONN&&g_x11_drag_window){
+        x11_connection_t *dc=&g_x11_conns[g_x11_drag_conn];
+        x11_window_t *dw=dc->used?x11_find_window(dc,g_x11_drag_window):0;
+        if(!dw||!dw->used||!dw->mapped||!dw->visible){
+            g_x11_drag_conn=-1;
+            g_x11_drag_window=0;
+        }else if(button>0&&!press){
+            g_x11_drag_conn=-1;
+            g_x11_drag_window=0;
+            return 1;
+        }else{
+            int max_x=(int)dc->screen_width-dw->width-4;
+            int max_y=(int)dc->screen_height-dw->height-28;
+            dw->x=screen_x-g_x11_drag_off_x;
+            dw->y=screen_y-g_x11_drag_off_y;
+            if(max_x<0)max_x=0;
+            if(max_y<0)max_y=0;
+            if(dw->x<0)dw->x=0;
+            if(dw->y<0)dw->y=0;
+            if(dw->x>max_x)dw->x=max_x;
+            if(dw->y>max_y)dw->y=max_y;
+            dc->pointer_x=screen_x;
+            dc->pointer_y=screen_y;
+            x11_push_configure_notify(dc,dw->id,dw->x,dw->y,dw->width,dw->height,dw->border_width);
+            g_x11_render_dirty=true;
+            x11_render_now();
+            return 1;
+        }
+    }
+    if(g_x11_pointer_button_mask&&button<=0){
+        x11_connection_t *gc=0;
+        x11_window_t *gw=0;
+        if(x11_button_grab_target(screen_x,screen_y,&gc,&gw,&wx,&wy)){
+            x11_push_mouse_event_to_window(gc,gw->id,
+                                           screen_x,screen_y,wx,wy,button,press);
+            return 1;
+        }
+    }
+    if(button>0&&!press){
+        x11_connection_t *gc=0;
+        x11_window_t *gw=0;
+        if(x11_button_grab_target(screen_x,screen_y,&gc,&gw,&wx,&wy)){
+            x11_push_mouse_event_to_window(gc,gw->id,
+                                           screen_x,screen_y,wx,wy,button,press);
+            g_x11_button_grab_conn=-1;
+            g_x11_button_grab_window=0;
+            return 1;
+        }
+        g_x11_button_grab_conn=-1;
+        g_x11_button_grab_window=0;
+    }
+    if(button>0&&press){
+        int tci=-1,tox=0,toy=0;
+        x11_window_t *tw=x11_find_title_window(screen_x,screen_y,&tci,&tox,&toy);
+        if(tw&&tci>=0){
+            x11_window_t *kw=x11_keyboard_target_from_window(&g_x11_conns[tci],tw);
+            g_x11_drag_conn=tci;
+            g_x11_drag_window=tw->id;
+            g_x11_drag_off_x=tox;
+            g_x11_drag_off_y=toy;
+            x11_focus_window_now(&g_x11_conns[tci],kw?kw->id:tw->id);
+            return 1;
+        }
+    }
     x11_window_t *w=x11_find_screen_window(screen_x,screen_y,&ci,&wx,&wy);
     if(!w||ci<0)return 0;
+    x11_update_pointer_focus(ci,&g_x11_conns[ci],w,screen_x,screen_y,wx,wy);
     if(button>0&&press){
-        g_x11_focus_conn=ci;
-        g_x11_focus_window=w->id;
+        x11_window_t *kw=x11_keyboard_target_from_window(&g_x11_conns[ci],w);
+        g_x11_button_grab_conn=ci;
+        g_x11_button_grab_window=w->id;
+        x11_focus_window_now(&g_x11_conns[ci],kw?kw->id:w->id);
     }
     x11_push_mouse_event_to_window(&g_x11_conns[ci],w->id,
                                    screen_x,screen_y,wx,wy,button,press);
@@ -4096,19 +5976,96 @@ int x11_dispatch_key_event(uint8_t keycode,bool press){
     extern c7_framebuffer_t g_fb;
     x11_connection_t *c=0;
     uint32_t wid=0;
+    x11_window_t *target;
+    static uint32_t dispatch_trace_count;
+    if(c7_x11_trace_enabled()&&dispatch_trace_count<96){
+        ++dispatch_trace_count;
+        __boot_serial_force_puts("[x11-dispatch-key!] kc=");
+        __boot_serial_force_putu32((uint32_t)keycode);
+        __boot_serial_force_puts(press?" down":" up");
+        __boot_serial_force_puts(" focus_conn=");
+        __boot_serial_force_putu32((uint32_t)(g_x11_focus_conn>=0?g_x11_focus_conn:0xFFFFFFFFu));
+        __boot_serial_force_puts(" focus_win=");
+        __boot_serial_force_puthex64((uint64_t)g_x11_focus_window);
+        __boot_serial_force_puts("\n");
+    }
     if(!x11_focus_is_valid(&c,&wid)){
         int ci=-1,wx=0,wy=0;
-        x11_window_t *w=x11_find_screen_window((int)(g_fb.width/2u),
-                                               (int)(g_fb.height/2u),
-                                               &ci,&wx,&wy);
+        x11_window_t *w=0;
+        /* Prefer pointer-owned window when keyboard focus got stale/lost. */
+        if(g_x11_pointer_conn>=0&&g_x11_pointer_conn<X11_MAX_CONN&&g_x11_pointer_window){
+            x11_connection_t *pc=&g_x11_conns[g_x11_pointer_conn];
+            x11_window_t *pw=pc->used?x11_find_window(pc,g_x11_pointer_window):0;
+            if(pw&&pw->used&&pw->mapped&&pw->visible&&pw->id!=pc->root_window){
+                c=pc;
+                wid=pw->id;
+            }
+        }
+        if(!c||!wid){
+            /* Then use the active top-level from any live X11 connection. */
+            int i;
+            for(i=0;i<X11_MAX_CONN;++i){
+                x11_connection_t *cc=&g_x11_conns[i];
+                x11_window_t *aw;
+                if(!cc->used)continue;
+                aw=x11_active_top_window(cc);
+                if(!aw||!aw->used||!aw->mapped||!aw->visible)continue;
+                target=x11_keyboard_target_from_window(cc,aw);
+                c=cc;
+                wid=(target&&target->id)?target->id:aw->id;
+                break;
+            }
+        }
+        if(!c||!wid){
+            w=x11_find_screen_window((int)(g_fb.width/2u),
+                                     (int)(g_fb.height/2u),
+                                     &ci,&wx,&wy);
+        }
         (void)wx;(void)wy;
-        if(!w||ci<0)return 0;
-        c=&g_x11_conns[ci];
-        wid=w->id;
-        g_x11_focus_conn=ci;
-        g_x11_focus_window=wid;
+        if((!c||!wid)&&(!w||ci<0))w=x11_find_keyboard_window(&ci);
+        if((!c||!wid)&&w&&ci>=0){
+            c=&g_x11_conns[ci];
+            wid=w->id;
+        }
+        if(!w||ci<0){
+            if(!c||!wid){
+                if(c7_x11_trace_enabled()&&dispatch_trace_count<96){
+                    __boot_serial_force_puts("[x11-dispatch-key!] no-target\n");
+                }
+                return 0;
+            }
+        }
+        x11_focus_window_now(c,wid);
+        if(g_x11_focus_conn>=0&&g_x11_focus_conn<X11_MAX_CONN&&
+           &g_x11_conns[g_x11_focus_conn]==c&&g_x11_focus_window)wid=g_x11_focus_window;
+    }
+    target=x11_key_delivery_target(c,wid,press);
+    if(target&&target->id!=wid){
+        static uint32_t key_target_trace=0;
+        if(c7_x11_trace_enabled()&&key_target_trace<24){
+            ++key_target_trace;
+            __boot_serial_puts("[x11-key-route] focus=");
+            __boot_serial_puthex64((uint64_t)wid);
+            __boot_serial_puts(" deliver=");
+            __boot_serial_puthex64((uint64_t)target->id);
+            __boot_serial_puts(" mask=");
+            __boot_serial_puthex64((uint64_t)target->event_mask);
+            __boot_serial_puts(" kc=");
+            __boot_serial_putu32((uint32_t)keycode);
+            __boot_serial_puts(press?" down":" up");
+            __boot_serial_puts("\n");
+        }
+        wid=target->id;
+    }
+    if(c7_x11_trace_enabled()&&dispatch_trace_count<96){
+        __boot_serial_force_puts("[x11-dispatch-key!] deliver=");
+        __boot_serial_force_puthex64((uint64_t)wid);
+        __boot_serial_force_puts("\n");
     }
     x11_push_key_event_to_window(c,wid,keycode,press);
+    if(!press){
+        x11_request_input_repaint(c,x11_find_window(c,wid));
+    }
     return 1;
 }
 
@@ -4237,6 +6194,39 @@ static x11_window_t *x11_top_window(x11_connection_t *c,x11_window_t *w){
     return cur?cur:w;
 }
 
+static bool x11_is_client_top_window(x11_connection_t *c,x11_window_t *w){
+    if(!c||!w||!w->used)return false;
+    if(w->id==c->root_window||w->id==c->wm_check_window||w->id==c->xsettings_window)return false;
+    if(w->parent!=c->root_window)return false;
+    if(w->width<=1||w->height<=1)return false;
+    return true;
+}
+
+static x11_window_t *x11_active_top_window(x11_connection_t *c){
+    x11_window_t *w,*top;
+    if(!c)return 0;
+    if(g_x11_focus_conn>=0&&g_x11_focus_conn<X11_MAX_CONN&&
+       &g_x11_conns[g_x11_focus_conn]==c&&g_x11_focus_window){
+        w=x11_find_window(c,g_x11_focus_window);
+        top=x11_top_window(c,w);
+        if(top&&x11_is_client_top_window(c,top))return top;
+    }
+    return 0;
+}
+
+static uint32_t x11_collect_client_windows(x11_connection_t *c,uint32_t *out,uint32_t max){
+    uint32_t n=0;
+    int i;
+    if(!c||!out||!max)return 0;
+    for(i=0;i<X11_MAX_WINDOWS;++i){
+        x11_window_t *w=&c->windows[i];
+        if(!x11_is_client_top_window(c,w))continue;
+        if(!w->mapped||!w->visible)continue;
+        if(n<max)out[n++]=w->id;
+    }
+    return n;
+}
+
 static void x11_top_frame_origin(x11_connection_t *c,x11_window_t *top,int *x,int *y){
     extern c7_framebuffer_t g_fb;
     int idx=x11_window_index(c,top);
@@ -4280,10 +6270,38 @@ static bool x11_window_content_origin(x11_connection_t *c,x11_window_t *w,int *x
 }
 
 static void x11_blit_window_to_fb(x11_connection_t *c,x11_window_t *w){
+    extern c7_framebuffer_t g_fb;
     int sx=0,sy=0;
     int row,col;
     if(!c||!w||!w->backing||!w->backing_size||w->width<=0||w->height<=0)return;
     if(!x11_window_content_origin(c,w,&sx,&sy))return;
+    if(g_use_backbuffer&&g_fb.red_pos==16&&g_fb.green_pos==8&&g_fb.blue_pos==0&&
+       g_fb.red_size==8&&g_fb.green_size==8&&g_fb.blue_size==8){
+        int src_x=0,src_y=0;
+        int dst_x=sx,dst_y=sy;
+        int copy_w=w->width,copy_h=w->height;
+        if(dst_x<0){src_x=-dst_x;copy_w+=dst_x;dst_x=0;}
+        if(dst_y<0){src_y=-dst_y;copy_h+=dst_y;dst_y=0;}
+        if(dst_x+copy_w>(int)g_fb.width)copy_w=(int)g_fb.width-dst_x;
+        if(dst_y+copy_h>(int)g_fb.height)copy_h=(int)g_fb.height-dst_y;
+        if(copy_w<=0||copy_h<=0)return;
+        for(row=0;row<copy_h;++row){
+            const uint8_t *sp=w->backing+((size_t)(src_y+row)*(size_t)w->width+(size_t)src_x)*4u;
+            uint32_t *dp=&g_backbuffer[(size_t)(dst_y+row)*C7_FB_MAX_WIDTH+(size_t)dst_x];
+            for(col=0;col<copy_w;++col){
+                uint8_t a=sp[col*4u+3u];
+                if(a==0u||a==255u){
+                    dp[col]=(uint32_t)sp[col*4u+0u]|
+                            ((uint32_t)sp[col*4u+1u]<<8)|
+                            ((uint32_t)sp[col*4u+2u]<<16);
+                }else{
+                    x11_put_fb_pixel_argb(dst_x+col,dst_y+row,
+                                          x11_backing_pixel_argb(sp+col*4u));
+                }
+            }
+        }
+        return;
+    }
     for(row=0;row<w->height;++row){
         for(col=0;col<w->width;++col){
             size_t off=((size_t)row*(size_t)w->width+(size_t)col)*4u;
@@ -4397,7 +6415,8 @@ static bool x11_has_any_connection(void){
 static void x11_trace_render_snapshot(void){
     int ci,wi;
     uint32_t visible=0;
-    if(g_x11_trace_render_count>=40)return;
+    if(!c7_x11_trace_enabled())return;
+    if(g_x11_trace_render_count>=16)return;
     for(ci=0;ci<X11_MAX_CONN;++ci){
         x11_connection_t *c=&g_x11_conns[ci];
         if(!c->used)continue;
@@ -4409,10 +6428,10 @@ static void x11_trace_render_snapshot(void){
     }
     if(!visible)return;
     ++g_x11_trace_render_count;
-    __boot_serial_puts("[x11-render] #");
-    __boot_serial_putu32(g_x11_trace_render_count);
-    __boot_serial_puts(" visible=");
-    __boot_serial_putu32(visible);
+    __boot_serial_force_puts("[x11-render!] #");
+    __boot_serial_force_putu32(g_x11_trace_render_count);
+    __boot_serial_force_puts(" visible=");
+    __boot_serial_force_putu32(visible);
     for(ci=0;ci<X11_MAX_CONN;++ci){
         x11_connection_t *c=&g_x11_conns[ci];
         if(!c->used)continue;
@@ -4421,29 +6440,40 @@ static void x11_trace_render_snapshot(void){
             int fx=0,fy=0;
             if(!w->used||!w->mapped||!w->visible||w->id==c->root_window)continue;
             x11_top_frame_origin(c,w,&fx,&fy);
-            __boot_serial_puts(" first=0x");
-            __boot_serial_puthex64((uint64_t)w->id);
-            __boot_serial_puts(" ");
-            __boot_serial_putu32((uint32_t)w->width);
-            __boot_serial_puts("x");
-            __boot_serial_putu32((uint32_t)w->height);
-            __boot_serial_puts(" fb=");
-            __boot_serial_putu32((uint32_t)fx);
-            __boot_serial_puts(",");
-            __boot_serial_putu32((uint32_t)fy);
-            __boot_serial_puts(" backing=");
-            __boot_serial_putu32(w->backing_size);
-            __boot_serial_puts("\n");
+            __boot_serial_force_puts(" first=0x");
+            __boot_serial_force_puthex64((uint64_t)w->id);
+            __boot_serial_force_puts(" ");
+            __boot_serial_force_putu32((uint32_t)w->width);
+            __boot_serial_force_puts("x");
+            __boot_serial_force_putu32((uint32_t)w->height);
+            __boot_serial_force_puts(" fb=");
+            __boot_serial_force_putu32((uint32_t)fx);
+            __boot_serial_force_puts(",");
+            __boot_serial_force_putu32((uint32_t)fy);
+            __boot_serial_force_puts(" backing=");
+            __boot_serial_force_putu32(w->backing_size);
+            __boot_serial_force_puts("\n");
             return;
         }
     }
-    __boot_serial_puts("\n");
+    __boot_serial_force_puts("\n");
 }
 
 void x11_render_now(void){
     int bx=0,by=0,bw=0,bh=0;
     bool have_bounds=x11_visible_bounds(&bx,&by,&bw,&bh);
-    if(!g_x11_render_dirty&&!have_bounds)return;
+    if(!g_x11_render_dirty){
+        if(have_bounds)ridux_request_cursor_redraw();
+        return;
+    }
+    if(ridux_scene_needs_redraw()){
+        static uint32_t scene_pending_trace;
+        if(c7_x11_trace_enabled()&&scene_pending_trace<12){
+            ++scene_pending_trace;
+            __boot_serial_force_puts("[x11-render!] desktop-pending, overlay now\n");
+        }
+        ridux_request_cursor_redraw();
+    }
     x11_trace_render_snapshot();
     x11_render_windows();
     if(g_use_backbuffer)fb_present();
@@ -4452,10 +6482,29 @@ void x11_render_now(void){
     g_x11_render_dirty=false;
 }
 
+void x11_render_scene_overlay_to_backbuffer_now(void){
+    int bx=0,by=0,bw=0,bh=0;
+    bool have_bounds=x11_visible_bounds(&bx,&by,&bw,&bh);
+    if(!have_bounds)return;
+    x11_trace_render_snapshot();
+    x11_render_windows();
+    g_x11_render_dirty=false;
+}
+
+void x11_render_scene_overlay_now(void){
+    int bx=0,by=0,bw=0,bh=0;
+    bool have_bounds=x11_visible_bounds(&bx,&by,&bw,&bh);
+    if(!have_bounds)return;
+    x11_render_scene_overlay_to_backbuffer_now();
+    if(g_use_backbuffer)fb_present();
+    ridux_present_cursor_after_external_blit(bx,by,bw,bh);
+}
+
 void x11_tick(void){
     static uint32_t render_spin;
     int i;
     if(!g_x11_render_dirty&&!x11_has_any_connection())return;
+    x11_nudge_browser_repaint();
     for(i=0;i<X11_MAX_CONN;++i){
         x11_connection_t*c=&g_x11_conns[i];if(!c->used)continue;
         {
@@ -4466,7 +6515,7 @@ void x11_tick(void){
         }
         /* Send pending events to client */
         while(c->event_count>0){
-            if(g_x11_trace_event_count<80){
+            if(c7_x11_trace_enabled()&&g_x11_trace_event_count<16){
                 x11_event_t *ev=&c->events[c->event_head];
                 ++g_x11_trace_event_count;
                 __boot_serial_puts("[x11-event] fd=");
@@ -4503,6 +6552,8 @@ wl7_surface_t g_wl7_surfaces[WL7_MAX_SURFACES];
 wl7_buffer_t  g_wl7_buffers[WL7_MAX_BUFFERS];
 wl7_global_t  g_wl7_globals[WL7_MAX_GLOBALS];
 int g_wl7_global_count=0;
+static bool g_wl7_rendered_this_tick=false;
+static bool g_wl7_present_rendered_surfaces=true;
 
 static wl7_surface_t*wl7_find_surface(uint32_t id){int i;for(i=0;i<WL7_MAX_SURFACES;++i)if(g_wl7_surfaces[i].used&&g_wl7_surfaces[i].id==id)return&g_wl7_surfaces[i];return 0;}
 static wl7_buffer_t*wl7_find_buffer(uint32_t id){int i;for(i=0;i<WL7_MAX_BUFFERS;++i)if(g_wl7_buffers[i].used&&g_wl7_buffers[i].id==id)return&g_wl7_buffers[i];return 0;}
@@ -4543,6 +6594,17 @@ static int wl7_find_buffer_index(uint32_t id){int i;for(i=0;i<WL7_MAX_BUFFERS;++
 #define WL7_OBJ_PRESENTATION 23
 #define WL7_OBJ_PRESENT_FB   24
 #define WL7_OBJ_REGION       25
+#define WL7_OBJ_LAYER_SHELL  26
+#define WL7_OBJ_LAYER_SURFACE 27
+
+#define WL7_LAYER_BACKGROUND 0u
+#define WL7_LAYER_BOTTOM     1u
+#define WL7_LAYER_TOP        2u
+#define WL7_LAYER_OVERLAY    3u
+#define WL7_LAYER_ANCHOR_TOP    1u
+#define WL7_LAYER_ANCHOR_BOTTOM 2u
+#define WL7_LAYER_ANCHOR_LEFT   4u
+#define WL7_LAYER_ANCHOR_RIGHT  8u
 
 typedef struct {
     bool     used;
@@ -4601,6 +6663,30 @@ typedef struct {
     uint32_t id;
     int      client_idx;
     uint32_t surface_id;
+    uint32_t output_id;
+    uint32_t layer;
+    uint32_t anchor;
+    uint32_t keyboard_interactivity;
+    int32_t  exclusive_zone;
+    int32_t  margin_top;
+    int32_t  margin_right;
+    int32_t  margin_bottom;
+    int32_t  margin_left;
+    int32_t  req_width;
+    int32_t  req_height;
+    uint32_t last_configure_serial;
+    uint32_t last_ack_serial;
+    bool     configured;
+    bool     initial_commit_seen;
+    bool     configure_pending;
+    char     ns[48];
+} wl7_layer_surface_t;
+
+typedef struct {
+    bool     used;
+    uint32_t id;
+    int      client_idx;
+    uint32_t surface_id;
     bool     src_set;
     int32_t  src_x;
     int32_t  src_y;
@@ -4638,6 +6724,7 @@ static wl7_pool_t g_wl7_pools[WL7_MAX_POOLS];
 static wl7_callback_t g_wl7_callbacks[WL7_MAX_CALLBACKS];
 static wl7_xdg_surface_t g_wl7_xdg_surfaces[WL7_MAX_SURFACES];
 static wl7_xdg_toplevel_t g_wl7_xdg_toplevels[WL7_MAX_SURFACES];
+static wl7_layer_surface_t g_wl7_layer_surfaces[WL7_MAX_SURFACES];
 static wl7_viewport_t g_wl7_viewports[WL7_MAX_VIEWPORTS];
 static wl7_dmabuf_params_t g_wl7_dmabuf_params[WL7_MAX_DMABUF_PARAMS];
 static wl7_presentation_fb_t g_wl7_present_fbs[WL7_MAX_PRESENT_FEEDBACK];
@@ -4655,6 +6742,7 @@ static uint32_t g_wl7_client_xdg_wm_base_obj[WL7_MAX_CLIENTS];
 static uint32_t g_wl7_client_viewporter_obj[WL7_MAX_CLIENTS];
 static uint32_t g_wl7_client_dmabuf_obj[WL7_MAX_CLIENTS];
 static uint32_t g_wl7_client_presentation_obj[WL7_MAX_CLIENTS];
+static uint32_t g_wl7_client_layer_shell_obj[WL7_MAX_CLIENTS];
 static uint32_t g_wl7_client_pointer_focus[WL7_MAX_CLIENTS];
 static uint32_t g_wl7_client_keyboard_focus[WL7_MAX_CLIENTS];
 static uint32_t g_wl7_client_touch_focus[WL7_MAX_CLIENTS];
@@ -4795,6 +6883,30 @@ static wl7_xdg_toplevel_t*wl7_alloc_xdg_toplevel(void){
     }
     return 0;
 }
+static wl7_layer_surface_t*wl7_find_layer_surface(uint32_t id){
+    int i;
+    for(i=0;i<WL7_MAX_SURFACES;++i)
+        if(g_wl7_layer_surfaces[i].used&&g_wl7_layer_surfaces[i].id==id)
+            return &g_wl7_layer_surfaces[i];
+    return 0;
+}
+static wl7_layer_surface_t*wl7_find_layer_surface_by_surface(uint32_t surface_id){
+    int i;
+    for(i=0;i<WL7_MAX_SURFACES;++i)
+        if(g_wl7_layer_surfaces[i].used&&g_wl7_layer_surfaces[i].surface_id==surface_id)
+            return &g_wl7_layer_surfaces[i];
+    return 0;
+}
+static wl7_layer_surface_t*wl7_alloc_layer_surface(void){
+    int i;
+    for(i=0;i<WL7_MAX_SURFACES;++i){
+        if(g_wl7_layer_surfaces[i].used)continue;
+        ulibc_memset(&g_wl7_layer_surfaces[i],0,sizeof(g_wl7_layer_surfaces[i]));
+        g_wl7_layer_surfaces[i].used=true;
+        return &g_wl7_layer_surfaces[i];
+    }
+    return 0;
+}
 static wl7_viewport_t*wl7_find_viewport(uint32_t id){
     int i;
     for(i=0;i<WL7_MAX_VIEWPORTS;++i)if(g_wl7_viewports[i].used&&g_wl7_viewports[i].id==id)return &g_wl7_viewports[i];
@@ -4856,6 +6968,25 @@ static wl7_presentation_fb_t*wl7_alloc_present_fb(void){
 static int32_t wl7_fixed_to_int(int32_t fx){
     return (fx>=0)?(fx>>8):-(((-fx)>>8));
 }
+static int wl7_recv_right_fd(int sock_fd,int *out_fd){
+    int pass_fd=-1;
+    int rc;
+    if(!out_fd)return -EFAULT;
+    *out_fd=-1;
+    rc=sock_recv_right(sock_fd,&pass_fd);
+    if(rc<0)return rc;
+    rc=compat3_take_scm_right(pass_fd,out_fd);
+    if(rc<0)return rc;
+    return 0;
+}
+static uint32_t wl7_alloc_server_id(wl7_client_t *cl){
+    uint32_t id;
+    if(!cl)return 0;
+    if(cl->next_id<0xFF000000u)cl->next_id=0xFF000000u;
+    id=cl->next_id++;
+    if(cl->next_id<0xFF000000u)cl->next_id=0xFF000000u;
+    return id;
+}
 static void wl7_buffer_reset_slot(int bidx,int client_idx,bool drop_meta){
     uint32_t old_id;
     if(bidx<0||bidx>=WL7_MAX_BUFFERS||!g_wl7_buffers[bidx].used)return;
@@ -4874,6 +7005,33 @@ static void wl7_buffer_reset_slot(int bidx,int client_idx,bool drop_meta){
     if(drop_meta&&client_idx>=0&&client_idx<WL7_MAX_CLIENTS&&old_id){
         wl7_meta_drop(client_idx,old_id);
     }
+}
+static int wl7_create_dmabuf_buffer(int client_idx,uint32_t new_id,wl7_dmabuf_params_t *dp,
+                                    int32_t width,int32_t height,uint32_t format){
+    int i;
+    if(!dp||!dp->plane0_set||dp->fd<0||!new_id||width<=0||height<=0)return -EINVAL;
+    for(i=0;i<WL7_MAX_BUFFERS;++i){
+        if(g_wl7_buffers[i].used)continue;
+        ulibc_memset(&g_wl7_buffers[i],0,sizeof(g_wl7_buffers[i]));
+        g_wl7_buffers[i].used=true;
+        g_wl7_buffers[i].id=new_id;
+        g_wl7_buffers[i].fd=dp->fd;
+        g_wl7_buffers[i].width=(uint32_t)width;
+        g_wl7_buffers[i].height=(uint32_t)height;
+        g_wl7_buffers[i].stride=dp->stride?dp->stride:((uint32_t)width*4u);
+        g_wl7_buffers[i].format=format;
+        g_wl7_buffers[i].data=0;
+        g_wl7_buffers[i].data_size=0;
+        g_wl7_buffer_pool[i]=0;
+        g_wl7_buffer_offset[i]=dp->offset;
+        g_wl7_buffer_dirty[i]=true;
+        g_wl7_buffer_owns_fd[i]=true;
+        wl7_meta_set(client_idx,new_id,WL7_OBJ_BUFFER,i);
+        dp->fd=-1;
+        dp->plane0_set=false;
+        return 0;
+    }
+    return -ENOMEM;
 }
 static uint32_t wl7_next_serial(void){
     uint32_t s=g_wl7_serial++;
@@ -5019,8 +7177,9 @@ static void wl7_send_pointer_leave(int sock_fd,uint32_t pointer_obj,uint32_t sur
 static void wl7_send_keyboard_keymap(int sock_fd,uint32_t keyboard_obj){
     uint8_t pld[12];
     wl7_wr_u32(pld+0,0); /* WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP */
-    wl7_wr_u32(pld+4,0); /* no fd */
+    wl7_wr_u32(pld+4,0); /* fd slot; the descriptor itself travels via SCM_RIGHTS */
     wl7_wr_u32(pld+8,0); /* size */
+    (void)compat3_send_devnull_right_to_socket_ref_from_current(sock_fd);
     (void)wl7_send_event(sock_fd,keyboard_obj,0,pld,12);
 }
 static void wl7_send_keyboard_repeat_info(int sock_fd,uint32_t keyboard_obj){
@@ -5148,6 +7307,167 @@ static void wl7_send_xdg_toplevel_configure(int sock_fd,uint32_t toplevel_obj,in
 static void wl7_send_xdg_toplevel_close(int sock_fd,uint32_t toplevel_obj){
     (void)wl7_send_event(sock_fd,toplevel_obj,1,0,0);
 }
+static uint32_t wl7_output_w(void){extern c7_framebuffer_t g_fb;return g_fb.width?g_fb.width:1280u;}
+static uint32_t wl7_output_h(void){extern c7_framebuffer_t g_fb;return g_fb.height?g_fb.height:720u;}
+static uint32_t wl7_layer_axis_available(uint32_t total,int32_t a,int32_t b){
+    int64_t v=(int64_t)total-(int64_t)a-(int64_t)b;
+    return v>0?(uint32_t)v:1u;
+}
+static uint32_t wl7_layer_config_w(wl7_layer_surface_t *ls,wl7_buffer_t *b){
+    uint32_t fbw=wl7_output_w();
+    if(!ls)return fbw;
+    if(ls->req_width>0)return (uint32_t)ls->req_width;
+    if((ls->anchor&WL7_LAYER_ANCHOR_LEFT)&&(ls->anchor&WL7_LAYER_ANCHOR_RIGHT))
+        return wl7_layer_axis_available(fbw,ls->margin_left,ls->margin_right);
+    if(ls->layer==WL7_LAYER_BACKGROUND)return fbw;
+    if(b&&b->width)return b->width;
+    return fbw;
+}
+static uint32_t wl7_layer_config_h(wl7_layer_surface_t *ls,wl7_buffer_t *b){
+    uint32_t fbh=wl7_output_h();
+    if(!ls)return fbh;
+    if(ls->req_height>0)return (uint32_t)ls->req_height;
+    if((ls->anchor&WL7_LAYER_ANCHOR_TOP)&&(ls->anchor&WL7_LAYER_ANCHOR_BOTTOM))
+        return wl7_layer_axis_available(fbh,ls->margin_top,ls->margin_bottom);
+    if(ls->layer==WL7_LAYER_BACKGROUND)return fbh;
+    if(b&&b->height)return b->height;
+    if(ls->exclusive_zone>0)return (uint32_t)ls->exclusive_zone;
+    if(ls->anchor&WL7_LAYER_ANCHOR_BOTTOM)return 72u;
+    return 34u;
+}
+static void wl7_apply_layer_surface_layout(wl7_layer_surface_t *ls,wl7_surface_t *s,wl7_buffer_t *b){
+    uint32_t fbw=wl7_output_w(),fbh=wl7_output_h();
+    uint32_t w,h;
+    int32_t x=0,y=0;
+    if(!ls||!s)return;
+    w=wl7_layer_config_w(ls,b);
+    h=wl7_layer_config_h(ls,b);
+    if(ls->layer==WL7_LAYER_BACKGROUND){
+        s->x=0;
+        s->y=0;
+        return;
+    }
+    if((ls->anchor&WL7_LAYER_ANCHOR_LEFT)&&(ls->anchor&WL7_LAYER_ANCHOR_RIGHT)){
+        x=ls->margin_left;
+    }else if(ls->anchor&WL7_LAYER_ANCHOR_LEFT){
+        x=ls->margin_left;
+    }else if(ls->anchor&WL7_LAYER_ANCHOR_RIGHT){
+        x=(int32_t)fbw-(int32_t)w-ls->margin_right;
+    }else{
+        x=((int32_t)fbw-(int32_t)w)/2;
+    }
+    if((ls->anchor&WL7_LAYER_ANCHOR_TOP)&&(ls->anchor&WL7_LAYER_ANCHOR_BOTTOM)){
+        y=ls->margin_top;
+    }else if(ls->anchor&WL7_LAYER_ANCHOR_TOP){
+        y=ls->margin_top;
+    }else if(ls->anchor&WL7_LAYER_ANCHOR_BOTTOM){
+        y=(int32_t)fbh-(int32_t)h-ls->margin_bottom;
+    }else{
+        y=((int32_t)fbh-(int32_t)h)/2;
+    }
+    s->x=x;
+    s->y=y;
+}
+static void wl7_send_layer_surface_configure(int sock_fd,wl7_layer_surface_t *ls,wl7_buffer_t *b){
+    uint8_t pld[12];
+    uint32_t serial;
+    uint32_t w,h;
+    if(!ls||!ls->id)return;
+    serial=wl7_next_serial();
+    w=wl7_layer_config_w(ls,b);
+    h=wl7_layer_config_h(ls,b);
+    ls->last_configure_serial=serial;
+    ls->configured=false;
+    ls->configure_pending=false;
+    wl7_wr_u32(pld+0,serial);
+    wl7_wr_u32(pld+4,w);
+    wl7_wr_u32(pld+8,h);
+    (void)wl7_send_event(sock_fd,ls->id,0,pld,12); /* zwlr_layer_surface_v1.configure */
+    if(g_wl7_send_trace_count<WL7_TRACE_SEND_LIMIT){
+        ++g_wl7_send_trace_count;
+        __boot_serial_puts("[wl7-send] layer.configure obj=");
+        __boot_serial_puthex64((uint64_t)ls->id);
+        __boot_serial_puts(" surf=");
+        __boot_serial_puthex64((uint64_t)ls->surface_id);
+        __boot_serial_puts(" layer=");
+        __boot_serial_putu32(ls->layer);
+        __boot_serial_puts(" anchor=");
+        __boot_serial_puthex64((uint64_t)ls->anchor);
+        __boot_serial_puts(" size=");
+        __boot_serial_putu32(w);
+        __boot_serial_puts("x");
+        __boot_serial_putu32(h);
+        __boot_serial_puts(" serial=");
+        __boot_serial_putu32(serial);
+        __boot_serial_puts("\n");
+    }
+}
+static void wl7_maybe_send_layer_configure(int client_idx,wl7_layer_surface_t *ls,wl7_buffer_t *b){
+    wl7_client_t *cl;
+    if(!ls||client_idx<0||client_idx>=WL7_MAX_CLIENTS)return;
+    cl=&g_wl7_clients[client_idx];
+    if(!cl->used)return;
+    if(ls->last_configure_serial&&ls->last_ack_serial!=ls->last_configure_serial){
+        ls->configure_pending=true;
+        return;
+    }
+    wl7_send_layer_surface_configure(cl->sock_fd,ls,b);
+}
+static int wl7_surface_render_priority(wl7_surface_t *s){
+    wl7_layer_surface_t *ls;
+    if(!s)return 2;
+    ls=wl7_find_layer_surface_by_surface(s->id);
+    if(!ls)return 2;
+    if(ls->layer==WL7_LAYER_BACKGROUND)return 0;
+    if(ls->layer==WL7_LAYER_BOTTOM)return 1;
+    if(ls->layer==WL7_LAYER_OVERLAY)return 4;
+    return 3;
+}
+static bool wl7_surface_is_background(wl7_surface_t *s){
+    wl7_layer_surface_t *ls=s?wl7_find_layer_surface_by_surface(s->id):0;
+    return ls&&ls->layer==WL7_LAYER_BACKGROUND;
+}
+static bool wl7_surface_visual_size(wl7_surface_t *s,wl7_buffer_t *b,int32_t *out_w,int32_t *out_h){
+    wl7_viewport_t *vp;
+    wl7_layer_surface_t *ls;
+    wl7_xdg_toplevel_t *tl;
+    int32_t w=0,h=0;
+    if(!s)return false;
+    vp=wl7_find_viewport_by_surface(s->id);
+    if(vp&&vp->dst_set&&vp->dst_w>0&&vp->dst_h>0){
+        w=vp->dst_w;
+        h=vp->dst_h;
+    }
+    if((w<=0||h<=0)&&(ls=wl7_find_layer_surface_by_surface(s->id))!=0){
+        w=(int32_t)wl7_layer_config_w(ls,b);
+        h=(int32_t)wl7_layer_config_h(ls,b);
+    }
+    if((w<=0||h<=0)&&(tl=wl7_find_xdg_toplevel_by_surface(s->id))!=0){
+        if(tl->width>0)w=tl->width;
+        if(tl->height>0)h=tl->height;
+    }
+    if((w<=0||h<=0)&&b){
+        w=(int32_t)b->width;
+        h=(int32_t)b->height;
+    }
+    if(w<=0||h<=0)return false;
+    if(out_w)*out_w=w;
+    if(out_h)*out_h=h;
+    return true;
+}
+static bool wl7_surface_contains_point(wl7_surface_t *s,wl7_buffer_t *b,int screen_x,int screen_y,int *lx,int *ly){
+    int32_t w=0,h=0;
+    int px,py;
+    if(!s||!s->used||!s->mapped)return false;
+    if(wl7_surface_is_background(s))return false;
+    if(!wl7_surface_visual_size(s,b,&w,&h))return false;
+    px=screen_x-s->x;
+    py=screen_y-s->y;
+    if(px<0||py<0||px>=w||py>=h)return false;
+    if(lx)*lx=px;
+    if(ly)*ly=py;
+    return true;
+}
 static void wl7_send_initial_focus_events(int client_idx,uint32_t surface_id){
     wl7_client_t *cl;
     uint32_t ptr_obj;
@@ -5213,6 +7533,7 @@ static void wl7_send_focus_leave_events(int client_idx,uint32_t surface_id){
 static bool wl7_surface_accepts_input(int client_idx,uint32_t surface_id){
     wl7_surface_t *s=wl7_find_surface(surface_id);
     if(!s||!s->used||!s->mapped)return false;
+    if(wl7_surface_is_background(s))return false;
     return s->client_idx==client_idx;
 }
 static void wl7_set_active_surface(int client_idx,uint32_t surface_id,int sx,int sy,bool pointer,bool keyboard){
@@ -5277,8 +7598,8 @@ static void wl7_schedule_xdg_configure(int client_idx,uint32_t surface_id){
         tl=wl7_find_xdg_toplevel(xs->toplevel_id);
         if(tl){
             bool initial_configure=(xs->last_ack_serial==0);
-            int32_t cw=initial_configure?0:(tl->width>0?tl->width:1280);
-            int32_t ch=initial_configure?0:(tl->height>0?tl->height:720);
+            int32_t cw=initial_configure?0:(tl->width>0?tl->width:(int32_t)wl7_output_w());
+            int32_t ch=initial_configure?0:(tl->height>0?tl->height:(int32_t)wl7_output_h());
             bool active=initial_configure?false:tl->activated;
             tl->last_configure_serial=serial;
             tl->configured=false;
@@ -5314,12 +7635,17 @@ static void wl7_schedule_xdg_configure(int client_idx,uint32_t surface_id){
     }
 }
 static uint32_t wl7_pick_mapped_surface(int client_idx){
-    int i;
-    for(i=0;i<WL7_MAX_SURFACES;++i){
-        if(!g_wl7_surfaces[i].used)continue;
-        if(g_wl7_surfaces[i].client_idx!=client_idx)continue;
-        if(!g_wl7_surfaces[i].mapped)continue;
-        return g_wl7_surfaces[i].id;
+    int pass,i;
+    for(pass=4;pass>=1;--pass){
+        for(i=WL7_MAX_SURFACES-1;i>=0;--i){
+            wl7_surface_t *s=&g_wl7_surfaces[i];
+            if(!s->used)continue;
+            if(s->client_idx!=client_idx)continue;
+            if(!s->mapped)continue;
+            if(wl7_surface_is_background(s))continue;
+            if(wl7_surface_render_priority(s)!=pass)continue;
+            return s->id;
+        }
     }
     return 0;
 }
@@ -5339,6 +7665,7 @@ static void wl7_drop_surface_related(int client_idx,uint32_t surface_id,bool sen
     int i;
     wl7_xdg_surface_t *xs=wl7_find_xdg_surface_by_surface(surface_id);
     wl7_xdg_toplevel_t *tl=wl7_find_xdg_toplevel_by_surface(surface_id);
+    wl7_layer_surface_t *ls=wl7_find_layer_surface_by_surface(surface_id);
     if(xs){
         xs->used=false;
         xs->id=0;
@@ -5367,6 +7694,13 @@ static void wl7_drop_surface_related(int client_idx,uint32_t surface_id,bool sen
         tl->last_configure_serial=0;
         tl->title[0]=0;
         tl->app_id[0]=0;
+    }
+    if(ls){
+        if(send_close&&g_wl7_clients[client_idx].used){
+            (void)wl7_send_event(g_wl7_clients[client_idx].sock_fd,ls->id,1,0,0); /* closed */
+        }
+        wl7_meta_drop(client_idx,ls->id);
+        ulibc_memset(ls,0,sizeof(*ls));
     }
     for(i=0;i<WL7_MAX_CALLBACKS;++i){
         if(!g_wl7_callbacks[i].used)continue;
@@ -5435,6 +7769,8 @@ static void wl7_send_seat_caps(int sock_fd,uint32_t seat_obj){
 static void wl7_send_output_info(int sock_fd,uint32_t out_obj){
     uint8_t pld[96];
     size_t pos=0;
+    uint32_t ow=wl7_output_w();
+    uint32_t oh=wl7_output_h();
     ulibc_memset(pld,0,sizeof(pld));
     wl7_wr_u32(pld+pos,0);pos+=4; /* x */
     wl7_wr_u32(pld+pos,0);pos+=4; /* y */
@@ -5447,8 +7783,8 @@ static void wl7_send_output_info(int sock_fd,uint32_t out_obj){
     (void)wl7_send_event(sock_fd,out_obj,0,pld,pos); /* geometry */
     pos=0;
     wl7_wr_u32(pld+pos,3);pos+=4; /* current|preferred */
-    wl7_wr_u32(pld+pos,1280);pos+=4;
-    wl7_wr_u32(pld+pos,720);pos+=4;
+    wl7_wr_u32(pld+pos,ow);pos+=4;
+    wl7_wr_u32(pld+pos,oh);pos+=4;
     wl7_wr_u32(pld+pos,60000);pos+=4;
     (void)wl7_send_event(sock_fd,out_obj,1,pld,pos); /* mode */
     wl7_wr_u32(pld,1);
@@ -5459,29 +7795,68 @@ static int wl7_refresh_buffer_data(int bidx){
     wl7_buffer_t *b;
     wl7_pool_t *pool;
     int src_fd=-1;
+    bool is_dmabuf=false;
     size_t need;
-    int64_t rd;
     if(bidx<0||bidx>=WL7_MAX_BUFFERS)return -EINVAL;
     b=&g_wl7_buffers[bidx];
     if(!b->used)return -ENOENT;
     pool=wl7_find_pool((uint32_t)g_wl7_buffer_pool[bidx]);
     if(pool&&pool->fd>=0)src_fd=pool->fd;
-    else if(b->fd>=0)src_fd=b->fd;
+    else if(b->fd>=0){src_fd=b->fd;is_dmabuf=true;}
     if(src_fd<0)return -EBADF;
     need=(size_t)b->stride*(size_t)b->height;
     if(need==0||need>16u*1024u*1024u)return -E2BIG;
-    if(!b->data||b->data_size<need){
-        if(b->data)ulibc_free(b->data);
-        b->data=(uint8_t*)ulibc_malloc(need);
-        if(!b->data){b->data_size=0;return -ENOMEM;}
-        b->data_size=(uint32_t)need;
+    if(is_dmabuf){
+        uint64_t drm_kptr=0;
+        uint64_t drm_avail=0;
+        if(drm_resolve_prime_fd(src_fd,(uint64_t)g_wl7_buffer_offset[bidx],
+                                (uint64_t)need,&drm_kptr,&drm_avail)>0&&drm_avail>=(uint64_t)need){
+            if(!b->data||b->data_size<need){
+                if(b->data)ulibc_free(b->data);
+                b->data=(uint8_t*)ulibc_malloc(need);
+                if(!b->data){b->data_size=0;return -ENOMEM;}
+                b->data_size=(uint32_t)need;
+            }
+            ulibc_memcpy(b->data,(const void*)(uintptr_t)drm_kptr,need);
+            g_wl7_buffer_dirty[bidx]=false;
+            return 0;
+        }
     }
-    (void)real_sys_lseek(src_fd,(int64_t)g_wl7_buffer_offset[bidx],SEEK_SET);
-    rd=real_sys_read(src_fd,b->data,need);
-    if(rd<0)return (int)rd;
-    if((size_t)rd<need)ulibc_memset(b->data+rd,0,need-(size_t)rd);
-    g_wl7_buffer_dirty[bidx]=false;
-    return 0;
+    {
+        int64_t mapped=real_sys_mmap(0,(uint64_t)need,1,1,src_fd,
+                                     (uint64_t)g_wl7_buffer_offset[bidx]);
+        if(mapped>=0){
+            if(!b->data||b->data_size<need){
+                if(b->data)ulibc_free(b->data);
+                b->data=(uint8_t*)ulibc_malloc(need);
+                if(!b->data){
+                    (void)real_sys_munmap((uint64_t)mapped,(uint64_t)need);
+                    b->data_size=0;
+                    return -ENOMEM;
+                }
+                b->data_size=(uint32_t)need;
+            }
+            ulibc_memcpy(b->data,(const void*)(uintptr_t)mapped,need);
+            (void)real_sys_munmap((uint64_t)mapped,(uint64_t)need);
+            g_wl7_buffer_dirty[bidx]=false;
+            return 0;
+        }
+    }
+    {
+        int64_t rd;
+        if(!b->data||b->data_size<need){
+            if(b->data)ulibc_free(b->data);
+            b->data=(uint8_t*)ulibc_malloc(need);
+            if(!b->data){b->data_size=0;return -ENOMEM;}
+            b->data_size=(uint32_t)need;
+        }
+        (void)real_sys_lseek(src_fd,(int64_t)g_wl7_buffer_offset[bidx],SEEK_SET);
+        rd=real_sys_read(src_fd,b->data,need);
+        if(rd<0)return (int)rd;
+        if((size_t)rd<need)ulibc_memset(b->data+rd,0,need-(size_t)rd);
+        g_wl7_buffer_dirty[bidx]=false;
+        return 0;
+    }
 }
 
 static void wl7_register_globals(void){
@@ -5493,10 +7868,10 @@ static void wl7_register_globals(void){
     g_wl7_globals[4].id=WL7_OUTPUT_ID;g_wl7_globals[4].interface=WL7_IFACE_OUTPUT;g_wl7_globals[4].version=2;
     g_wl7_globals[5].id=WL7_XDG_WM_BASE_ID;g_wl7_globals[5].interface=WL7_IFACE_XDG_WM_BASE;g_wl7_globals[5].version=2;
     g_wl7_globals[6].id=WL7_VIEWPORTER_ID;g_wl7_globals[6].interface=WL7_IFACE_VIEWPORTER;g_wl7_globals[6].version=1;
-    /* Do not advertise linux-dmabuf yet: wl_shm path is stable and avoids
-     * black/invisible frames when clients pick GPU buffers we can't import. */
-    g_wl7_globals[7].id=WL7_PRESENTATION_ID;g_wl7_globals[7].interface=WL7_IFACE_PRESENTATION;g_wl7_globals[7].version=1;
-    g_wl7_global_count=8;
+    g_wl7_globals[7].id=WL7_DMABUF_ID;g_wl7_globals[7].interface=WL7_IFACE_DMABUF;g_wl7_globals[7].version=3;
+    g_wl7_globals[8].id=WL7_PRESENTATION_ID;g_wl7_globals[8].interface=WL7_IFACE_PRESENTATION;g_wl7_globals[8].version=1;
+    g_wl7_globals[9].id=WL7_LAYER_SHELL_ID;g_wl7_globals[9].interface=WL7_IFACE_LAYER_SHELL;g_wl7_globals[9].version=4;
+    g_wl7_global_count=10;
 }
 
 static int wl7_client_idx_by_sock(int sock_fd){
@@ -5523,6 +7898,7 @@ static int wl7_attach_client_socket(int cfd){
     g_wl7_client_viewporter_obj[(int)(cl-g_wl7_clients)]=0;
     g_wl7_client_dmabuf_obj[(int)(cl-g_wl7_clients)]=0;
     g_wl7_client_presentation_obj[(int)(cl-g_wl7_clients)]=0;
+    g_wl7_client_layer_shell_obj[(int)(cl-g_wl7_clients)]=0;
     g_wl7_client_pointer_focus[(int)(cl-g_wl7_clients)]=0;
     g_wl7_client_keyboard_focus[(int)(cl-g_wl7_clients)]=0;
     g_wl7_client_touch_focus[(int)(cl-g_wl7_clients)]=0;
@@ -5597,6 +7973,12 @@ int wl7_detach_socket(int sock_fd){
         wl7_meta_drop(idx,g_wl7_viewports[i].id);
         ulibc_memset(&g_wl7_viewports[i],0,sizeof(g_wl7_viewports[i]));
     }
+    for(i=0;i<WL7_MAX_SURFACES;++i){
+        if(!g_wl7_layer_surfaces[i].used)continue;
+        if(g_wl7_layer_surfaces[i].client_idx!=idx)continue;
+        wl7_meta_drop(idx,g_wl7_layer_surfaces[i].id);
+        ulibc_memset(&g_wl7_layer_surfaces[i],0,sizeof(g_wl7_layer_surfaces[i]));
+    }
     for(i=0;i<WL7_MAX_DMABUF_PARAMS;++i){
         if(!g_wl7_dmabuf_params[i].used)continue;
         if(g_wl7_dmabuf_params[i].client_idx!=idx)continue;
@@ -5641,6 +8023,7 @@ int wl7_detach_socket(int sock_fd){
     g_wl7_client_viewporter_obj[idx]=0;
     g_wl7_client_dmabuf_obj[idx]=0;
     g_wl7_client_presentation_obj[idx]=0;
+    g_wl7_client_layer_shell_obj[idx]=0;
     g_wl7_client_pointer_focus[idx]=0;
     g_wl7_client_keyboard_focus[idx]=0;
     g_wl7_client_touch_focus[idx]=0;
@@ -5779,6 +8162,9 @@ int wl7_process_message(int client_idx){
                         g_wl7_client_presentation_obj[client_idx]=new_id;
                         wl7_meta_set(client_idx,new_id,WL7_OBJ_PRESENTATION,0);
                         wl7_send_presentation_clock_id(cl->sock_fd,new_id);
+                    }else if(name==WL7_LAYER_SHELL_ID){
+                        g_wl7_client_layer_shell_obj[client_idx]=new_id;
+                        wl7_meta_set(client_idx,new_id,WL7_OBJ_LAYER_SHELL,0);
                     }
                 }
                 break;
@@ -5818,7 +8204,7 @@ int wl7_process_message(int client_idx){
                     uint32_t pool_sz=wl7_rd_u32(body+4);
                     int memfd=-1;
                     wl7_pool_t *pool=wl7_alloc_pool();
-                    (void)sock_recv_right(cl->sock_fd,&memfd);
+                    (void)wl7_recv_right_fd(cl->sock_fd,&memfd);
                     if(!pool)break;
                     pool->id=pool_id;
                     pool->client_idx=client_idx;
@@ -5960,6 +8346,7 @@ int wl7_process_message(int client_idx){
                     wl7_buffer_t *b=wl7_find_buffer(s->attached_buffer);
                     bool has_buffer=false;
                     wl7_xdg_surface_t *xs=wl7_find_xdg_surface_by_surface(s->id);
+                    wl7_layer_surface_t *ls=wl7_find_layer_surface_by_surface(s->id);
                     if(s->attached_buffer==0){
                         s->buffer_id=0;
                         s->mapped=false;
@@ -5998,15 +8385,27 @@ int wl7_process_message(int client_idx){
                             wl7_schedule_xdg_configure(client_idx,s->id);
                         }
                     }
+                    if(ls){
+                        if(!ls->initial_commit_seen){
+                            uint32_t out_obj=g_wl7_client_output_obj[client_idx];
+                            ls->initial_commit_seen=true;
+                            ls->configure_pending=true;
+                            wl7_send_surface_enter(cl->sock_fd,s->id,out_obj?out_obj:WL7_OUTPUT_ID);
+                        }
+                        if(ls->configure_pending||!ls->last_configure_serial){
+                            wl7_maybe_send_layer_configure(client_idx,ls,b);
+                        }
+                    }
                     if(!has_buffer){
                         if(sidx>=0)wl7_clear_surface_damage(sidx);
                         break;
                     }
+                    if(ls)wl7_apply_layer_surface_layout(ls,s,b);
                     s->mapped=true;
                     if(sidx>=0&&!g_wl7_surface_has_damage[sidx]){
                         wl7_mark_surface_damage(s->id,0,0,0,0,true);
                     }
-                    if(!was_mapped){
+                    if(!was_mapped&&!ls){
                         wl7_send_initial_focus_events(client_idx,s->id);
                     }
                     if(s->frame_callback_id){
@@ -6094,6 +8493,94 @@ int wl7_process_message(int client_idx){
                     wl7_meta_drop(client_idx,obj_id);
                 }
                 break;
+            case WL7_OBJ_LAYER_SHELL:
+                if(opcode==0&&body_len>=20){ /* get_layer_surface */
+                    uint32_t layer_surf_id=wl7_rd_u32(body+0);
+                    uint32_t surf_id=wl7_rd_u32(body+4);
+                    uint32_t out_id=wl7_rd_u32(body+8);
+                    uint32_t layer=wl7_rd_u32(body+12);
+                    size_t off=16;
+                    char ns[48];
+                    wl7_surface_t *s=wl7_find_surface(surf_id);
+                    wl7_layer_surface_t *ls=wl7_alloc_layer_surface();
+                    ns[0]=0;
+                    (void)wl7_read_wl_string(body,body_len,&off,ns,sizeof(ns));
+                    if(!s||!ls){
+                        if(ls)ulibc_memset(ls,0,sizeof(*ls));
+                        break;
+                    }
+                    ls->id=layer_surf_id;
+                    ls->client_idx=client_idx;
+                    ls->surface_id=surf_id;
+                    ls->output_id=out_id;
+                    ls->layer=(layer<=WL7_LAYER_OVERLAY)?layer:WL7_LAYER_TOP;
+                    ls->anchor=0;
+                    ls->exclusive_zone=0;
+                    ls->req_width=0;
+                    ls->req_height=0;
+                    ls->configured=false;
+                    ls->initial_commit_seen=false;
+                    ls->configure_pending=true;
+                    ulibc_strncpy(ls->ns,ns,sizeof(ls->ns)-1);
+                    ls->ns[sizeof(ls->ns)-1]=0;
+                    wl7_meta_set(client_idx,layer_surf_id,WL7_OBJ_LAYER_SURFACE,0);
+                    wl7_mark_surface_damage(surf_id,0,0,0,0,true);
+                    if(g_wl7_req_trace_count<WL7_TRACE_REQ_LIMIT){
+                        ++g_wl7_req_trace_count;
+                        __boot_serial_puts("[wl7-layer] new surf=");
+                        __boot_serial_puthex64((uint64_t)surf_id);
+                        __boot_serial_puts(" layer=");
+                        __boot_serial_putu32(ls->layer);
+                        __boot_serial_puts(" ns=");
+                        __boot_serial_puts(ls->ns);
+                        __boot_serial_puts("\n");
+                    }
+                }else if(opcode==1){ /* destroy */
+                    if(g_wl7_client_layer_shell_obj[client_idx]==obj_id)g_wl7_client_layer_shell_obj[client_idx]=0;
+                    wl7_meta_drop(client_idx,obj_id);
+                }
+                break;
+            case WL7_OBJ_LAYER_SURFACE:{
+                wl7_layer_surface_t *ls=wl7_find_layer_surface(obj_id);
+                if(!ls)break;
+                if(opcode==0&&body_len>=8){ /* set_size */
+                    ls->req_width=wl7_rd_s32(body+0);
+                    ls->req_height=wl7_rd_s32(body+4);
+                    ls->configure_pending=true;
+                }else if(opcode==1&&body_len>=4){ /* set_anchor */
+                    ls->anchor=wl7_rd_u32(body+0)&(WL7_LAYER_ANCHOR_TOP|WL7_LAYER_ANCHOR_BOTTOM|WL7_LAYER_ANCHOR_LEFT|WL7_LAYER_ANCHOR_RIGHT);
+                    ls->configure_pending=true;
+                }else if(opcode==2&&body_len>=4){ /* set_exclusive_zone */
+                    ls->exclusive_zone=wl7_rd_s32(body+0);
+                    ls->configure_pending=true;
+                }else if(opcode==3&&body_len>=16){ /* set_margin */
+                    ls->margin_top=wl7_rd_s32(body+0);
+                    ls->margin_right=wl7_rd_s32(body+4);
+                    ls->margin_bottom=wl7_rd_s32(body+8);
+                    ls->margin_left=wl7_rd_s32(body+12);
+                    ls->configure_pending=true;
+                }else if(opcode==4&&body_len>=4){ /* set_keyboard_interactivity */
+                    ls->keyboard_interactivity=wl7_rd_u32(body+0);
+                }else if(opcode==5){ /* get_popup */
+                    /* Popups are accepted as ordinary xdg popups for now. */
+                }else if(opcode==6&&body_len>=4){ /* ack_configure */
+                    uint32_t serial=wl7_rd_u32(body+0);
+                    ls->last_ack_serial=serial;
+                    if(serial==ls->last_configure_serial)ls->configured=true;
+                    if(ls->configure_pending&&ls->configured)wl7_maybe_send_layer_configure(client_idx,ls,0);
+                }else if(opcode==7){ /* destroy */
+                    wl7_surface_t *s=wl7_find_surface(ls->surface_id);
+                    if(s)s->mapped=false;
+                    ulibc_memset(ls,0,sizeof(*ls));
+                    wl7_meta_drop(client_idx,obj_id);
+                }else if(opcode==8&&body_len>=4){ /* set_layer */
+                    uint32_t layer=wl7_rd_u32(body+0);
+                    ls->layer=(layer<=WL7_LAYER_OVERLAY)?layer:WL7_LAYER_TOP;
+                    ls->configure_pending=true;
+                }else if(opcode==9&&body_len>=4){ /* set_exclusive_edge */
+                    (void)wl7_rd_u32(body+0);
+                }
+                break;}
             case WL7_OBJ_VIEWPORTER:
                 if(opcode==0){ /* destroy */
                     if(g_wl7_client_viewporter_obj[client_idx]==obj_id)g_wl7_client_viewporter_obj[client_idx]=0;
@@ -6185,7 +8672,7 @@ int wl7_process_message(int client_idx){
                     uint32_t mod_hi=wl7_rd_u32(body+12);
                     uint32_t mod_lo=wl7_rd_u32(body+16);
                     (void)mod_hi;(void)mod_lo;
-                    (void)sock_recv_right(cl->sock_fd,&dmafd);
+                    (void)wl7_recv_right_fd(cl->sock_fd,&dmafd);
                     if(!dp||plane_idx!=0){
                         if(dmafd>=0)(void)real_sys_close(dmafd);
                         break;
@@ -6195,40 +8682,28 @@ int wl7_process_message(int client_idx){
                     dp->offset=offset;
                     dp->stride=stride;
                     dp->plane0_set=true;
-                }else if(opcode==2){ /* create: force fallback path */
-                    (void)wl7_send_event(cl->sock_fd,obj_id,1,0,0); /* failed */
+                }else if(opcode==2&&body_len>=16){ /* create */
+                    int32_t width=wl7_rd_s32(body+0);
+                    int32_t height=wl7_rd_s32(body+4);
+                    uint32_t format=wl7_rd_u32(body+8);
+                    uint32_t flags=wl7_rd_u32(body+12);
+                    uint32_t new_id=wl7_alloc_server_id(cl);
+                    uint8_t epld[4];
+                    (void)flags;
+                    if(wl7_create_dmabuf_buffer(client_idx,new_id,dp,width,height,format)<0){
+                        (void)wl7_send_event(cl->sock_fd,obj_id,1,0,0); /* failed */
+                        break;
+                    }
+                    wl7_wr_u32(epld,new_id);
+                    (void)wl7_send_event(cl->sock_fd,obj_id,0,epld,4); /* created */
                 }else if(opcode==3&&body_len>=20){ /* create_immed */
                     uint32_t new_id=wl7_rd_u32(body+0);
                     int32_t width=wl7_rd_s32(body+4);
                     int32_t height=wl7_rd_s32(body+8);
                     uint32_t format=wl7_rd_u32(body+12);
                     uint32_t flags=wl7_rd_u32(body+16);
-                    int i;
                     (void)flags;
-                    if(!dp||!dp->plane0_set||dp->fd<0||width<=0||height<=0){
-                        break;
-                    }
-                    for(i=0;i<WL7_MAX_BUFFERS;++i){
-                        if(g_wl7_buffers[i].used)continue;
-                        ulibc_memset(&g_wl7_buffers[i],0,sizeof(g_wl7_buffers[i]));
-                        g_wl7_buffers[i].used=true;
-                        g_wl7_buffers[i].id=new_id;
-                        g_wl7_buffers[i].fd=dp->fd;
-                        g_wl7_buffers[i].width=(uint32_t)width;
-                        g_wl7_buffers[i].height=(uint32_t)height;
-                        g_wl7_buffers[i].stride=dp->stride?dp->stride:((uint32_t)width*4u);
-                        g_wl7_buffers[i].format=format;
-                        g_wl7_buffers[i].data=0;
-                        g_wl7_buffers[i].data_size=0;
-                        g_wl7_buffer_pool[i]=0;
-                        g_wl7_buffer_offset[i]=dp->offset;
-                        g_wl7_buffer_dirty[i]=true;
-                        g_wl7_buffer_owns_fd[i]=true;
-                        wl7_meta_set(client_idx,new_id,WL7_OBJ_BUFFER,i);
-                        dp->fd=-1;
-                        dp->plane0_set=false;
-                        break;
-                    }
+                    (void)wl7_create_dmabuf_buffer(client_idx,new_id,dp,width,height,format);
                 }
                 break;}
             case WL7_OBJ_PRESENTATION:
@@ -6309,8 +8784,8 @@ int wl7_process_message(int client_idx){
                         tl->xdg_surface_id=xs->id;
                         tl->configured=false;
                         tl->activated=true;
-                        tl->width=1280;
-                        tl->height=720;
+                        tl->width=(int32_t)wl7_output_w();
+                        tl->height=(int32_t)wl7_output_h();
                         tl->last_configure_serial=0;
                         tl->title[0]=0;
                         tl->app_id[0]=0;
@@ -6479,10 +8954,33 @@ static uint32_t wl7_pixel_to_argb(uint32_t px,uint32_t fmt){
     return px;
 }
 
+static void wl7_note_dirty_bounds(bool *valid,int *x0,int *y0,int *x1,int *y1,
+                                  int x,int y,int w,int h,uint32_t fbw,uint32_t fbh){
+    int rx0=x,ry0=y,rx1=x+w,ry1=y+h;
+    if(w<=0||h<=0||!fbw||!fbh)return;
+    if(rx0<0)rx0=0;
+    if(ry0<0)ry0=0;
+    if(rx1>(int)fbw)rx1=(int)fbw;
+    if(ry1>(int)fbh)ry1=(int)fbh;
+    if(rx0>=rx1||ry0>=ry1)return;
+    if(!*valid){
+        *valid=true;
+        *x0=rx0;*y0=ry0;*x1=rx1;*y1=ry1;
+    }else{
+        if(rx0<*x0)*x0=rx0;
+        if(ry0<*y0)*y0=ry0;
+        if(rx1>*x1)*x1=rx1;
+        if(ry1>*y1)*y1=ry1;
+    }
+}
+
 void wl7_render_surfaces(void){
     extern c7_framebuffer_t g_fb;
-    int i;
+    int pass,i;
     bool rendered=false;
+    bool dirty_valid=false;
+    int dirty_x0=0,dirty_y0=0,dirty_x1=0,dirty_y1=0;
+    for(pass=0;pass<5;++pass){
     for(i=0;i<WL7_MAX_SURFACES;++i){
         wl7_surface_t*s=&g_wl7_surfaces[i];
         int bidx;
@@ -6495,8 +8993,11 @@ void wl7_render_surfaces(void){
         int32_t row,col;
         uint32_t *fb;
         uint32_t fbw,fbh,fbp;
+        uint32_t dst_stride_px;
+        uint32_t dst_limit;
         uint32_t stride_px;
         if(!s->used||!s->mapped)continue;
+        if(wl7_surface_render_priority(s)!=pass)continue;
         bidx=wl7_find_buffer_index(s->buffer_id);
         b=(bidx>=0)?&g_wl7_buffers[bidx]:0;
         if(!b){
@@ -6570,17 +9071,27 @@ void wl7_render_surfaces(void){
         if(src_y0+src_h>(int32_t)b->height)src_h=(int32_t)b->height-src_y0;
         if(viewport_active&&out_w<=0)out_w=src_w;
         if(viewport_active&&out_h<=0)out_h=src_h;
-        fb=(uint32_t*)(uintptr_t)g_fb.address;
         fbw=g_fb.width;
         fbh=g_fb.height;
-        fbp=g_fb.pitch;
+        if(g_use_backbuffer){
+            fb=g_backbuffer;
+            dst_stride_px=C7_FB_MAX_WIDTH;
+            fbp=C7_FB_MAX_WIDTH*4u;
+        }else{
+            fb=(uint32_t*)(uintptr_t)g_fb.address;
+            fbp=g_fb.pitch;
+            dst_stride_px=fbp/4u;
+        }
+        dst_limit=dst_stride_px*fbh;
         stride_px=b->stride/4u;
-        if(stride_px==0u||fbp<4u){
+        if(stride_px==0u||fbp<4u||dst_stride_px==0u){
             wl7_clear_surface_damage(i);
             continue;
         }
         if(viewport_active){
             rendered=true;
+            wl7_note_dirty_bounds(&dirty_valid,&dirty_x0,&dirty_y0,&dirty_x1,&dirty_y1,
+                                  s->x,s->y,out_w,out_h,fbw,fbh);
             for(row=0;row<out_h;++row){
                 int32_t sy=src_y0+(int32_t)(((int64_t)row*(int64_t)src_h)/(int64_t)out_h);
                 int32_t dy=s->y+row;
@@ -6591,8 +9102,8 @@ void wl7_render_surfaces(void){
                     uint32_t src_off,dst_off,src_px,dst_px;
                     if(dx<0||dx>=(int32_t)fbw)continue;
                     src_off=(uint32_t)sy*stride_px+(uint32_t)sx;
-                    dst_off=(uint32_t)dy*(fbp/4u)+(uint32_t)dx;
-                    if(src_off>=b->data_size/4u||dst_off>=fbw*fbh)continue;
+                    dst_off=(uint32_t)dy*dst_stride_px+(uint32_t)dx;
+                    if(src_off>=b->data_size/4u||dst_off>=dst_limit)continue;
                     src_px=((uint32_t*)b->data)[src_off];
                     src_px=wl7_pixel_to_argb(src_px,b->format);
                     dst_px=fb[dst_off];
@@ -6601,6 +9112,8 @@ void wl7_render_surfaces(void){
             }
         }else{
             rendered=true;
+            wl7_note_dirty_bounds(&dirty_valid,&dirty_x0,&dirty_y0,&dirty_x1,&dirty_y1,
+                                  s->x+src_x0,s->y+src_y0,src_w,src_h,fbw,fbh);
             for(row=0;row<src_h;++row){
                 int32_t sy=src_y0+row;
                 int32_t dy=s->y+sy;
@@ -6611,8 +9124,8 @@ void wl7_render_surfaces(void){
                     uint32_t src_off,dst_off,src_px,dst_px;
                     if(dx<0||dx>=(int32_t)fbw)continue;
                     src_off=(uint32_t)sy*stride_px+(uint32_t)sx;
-                    dst_off=(uint32_t)dy*(fbp/4u)+(uint32_t)dx;
-                    if(src_off>=b->data_size/4u||dst_off>=fbw*fbh)continue;
+                    dst_off=(uint32_t)dy*dst_stride_px+(uint32_t)dx;
+                    if(src_off>=b->data_size/4u||dst_off>=dst_limit)continue;
                     src_px=((uint32_t*)b->data)[src_off];
                     src_px=wl7_pixel_to_argb(src_px,b->format);
                     dst_px=fb[dst_off];
@@ -6628,7 +9141,26 @@ void wl7_render_surfaces(void){
             g_wl7_surface_release_pending[i]=false;
         }
     }
-    if(rendered)ridux_request_cursor_redraw();
+    }
+    if(rendered){
+        g_wl7_rendered_this_tick=true;
+        if(g_wl7_present_rendered_surfaces){
+            if(g_use_backbuffer)fb_present();
+            if(dirty_valid)
+                ridux_present_cursor_after_external_blit(dirty_x0,dirty_y0,
+                                                         dirty_x1-dirty_x0,
+                                                         dirty_y1-dirty_y0);
+            else
+                ridux_request_cursor_redraw();
+        }
+    }
+}
+
+void wl7_render_surfaces_to_backbuffer_now(void){
+    bool old=g_wl7_present_rendered_surfaces;
+    g_wl7_present_rendered_surfaces=false;
+    wl7_render_surfaces();
+    g_wl7_present_rendered_surfaces=old;
 }
 
 void wl7_push_keyboard_event(int client_idx,uint32_t key,uint32_t state){
@@ -6713,28 +9245,25 @@ void wl7_push_pointer_event(int client_idx,int x,int y,uint32_t button,uint32_t 
 }
 
 int wl7_dispatch_pointer_event(int screen_x,int screen_y,uint32_t button,uint32_t state){
-    int i;
-    for(i=WL7_MAX_SURFACES-1;i>=0;--i){
-        wl7_surface_t *s=&g_wl7_surfaces[i];
-        wl7_buffer_t *b;
-        int lx,ly;
-        if(!s->used||!s->mapped)continue;
-        b=wl7_find_buffer(s->buffer_id);
-        if(!b||!b->used||!b->width||!b->height)continue;
-        if(screen_x<s->x||screen_y<s->y)continue;
-        if(screen_x>=s->x+(int)b->width||screen_y>=s->y+(int)b->height)continue;
-        lx=screen_x-s->x;
-        ly=screen_y-s->y;
-        /* Si el usuario clickea una superficie Wayland, esa superficie pasa
-         * a ser la dueña del teclado. Esto era lo que dejaba a Firefox
-         * dibujado pero medio "fantasma": recibia pixels, no foco real. */
-        if(button&&state){
-            wl7_set_active_surface(s->client_idx,s->id,lx,ly,true,true);
-        }else{
-            wl7_set_active_surface(s->client_idx,s->id,lx,ly,true,false);
+    int pass,i;
+    for(pass=4;pass>=1;--pass){
+        for(i=WL7_MAX_SURFACES-1;i>=0;--i){
+            wl7_surface_t *s=&g_wl7_surfaces[i];
+            wl7_buffer_t *b;
+            int lx=0,ly=0;
+            if(!s->used||!s->mapped)continue;
+            if(wl7_surface_render_priority(s)!=pass)continue;
+            b=wl7_find_buffer(s->buffer_id);
+            if(!b||!b->used||!b->width||!b->height)continue;
+            if(!wl7_surface_contains_point(s,b,screen_x,screen_y,&lx,&ly))continue;
+            if(button&&state){
+                wl7_set_active_surface(s->client_idx,s->id,lx,ly,true,true);
+            }else{
+                wl7_set_active_surface(s->client_idx,s->id,lx,ly,true,false);
+            }
+            wl7_push_pointer_event(s->client_idx,lx,ly,button,state);
+            return 1;
         }
-        wl7_push_pointer_event(s->client_idx,lx,ly,button,state);
-        return 1;
     }
     return 0;
 }
@@ -6776,6 +9305,7 @@ static bool wl7_has_work(void){
 void wl7_tick(void){
     int i;
     int pass;
+    g_wl7_rendered_this_tick=false;
     if(!wl7_has_work())return;
     g_wl7_frame_clock_ms+=16u;
     for(i=0;i<WL7_MAX_CLIENTS;++i){
@@ -6826,9 +9356,15 @@ void wl7_tick(void){
 
 void compat7_tick_all(void){
     static uint32_t tick_div;
+    extern void drm_virtgpu_pump(void);
+    e1000_poll_rx();
+    drm_virtgpu_pump();
     if((tick_div++ & 3u)==0u)tcp7_tick();
     x11_tick();
     wl7_tick();
+    if(g_wl7_rendered_this_tick&&x11_has_visible_client_windows()){
+        x11_render_scene_overlay_now();
+    }
 }
 
 /* SHELL COMMANDS + INIT */
@@ -6886,12 +9422,16 @@ static void cmd7_x11(const char*a,char*o,int mx){
 
 static void cmd7_wl(const char*a,char*o,int mx){
     (void)a;
+    int clients=0,surfaces=0,buffers=0,i;
+    for(i=0;i<WL7_MAX_CLIENTS;++i)if(g_wl7_clients[i].used)++clients;
+    for(i=0;i<WL7_MAX_SURFACES;++i)if(g_wl7_surfaces[i].used)++surfaces;
+    for(i=0;i<WL7_MAX_BUFFERS;++i)if(g_wl7_buffers[i].used)++buffers;
     ulibc_snprintf(o,(size_t)mx,
         "=== RiduxOS Wayland Bridge (compat7) ===\n"
         "Clients: %d/%d  Surfaces: %d/%d  Buffers: %d/%d  Globals: %d\n",
-        WL7_MAX_CLIENTS,WL7_MAX_CLIENTS,
-        WL7_MAX_SURFACES,WL7_MAX_SURFACES,
-        WL7_MAX_BUFFERS,WL7_MAX_BUFFERS,
+        clients,WL7_MAX_CLIENTS,
+        surfaces,WL7_MAX_SURFACES,
+        buffers,WL7_MAX_BUFFERS,
         g_wl7_global_count);
 }
 
@@ -6919,6 +9459,19 @@ void compat7_init_all(void){
     g_x11_trace_atom_count=0;
     g_x11_trace_render_count=0;
     g_x11_server_time=1;
+    g_x11_focus_conn=-1;
+    g_x11_focus_window=0;
+    g_x11_key_state_mask=0;
+    ulibc_memset(g_x11_key_down_map,0,sizeof(g_x11_key_down_map));
+    g_x11_pointer_button_mask=0;
+    g_x11_pointer_conn=-1;
+    g_x11_pointer_window=0;
+    g_x11_drag_conn=-1;
+    g_x11_drag_window=0;
+    g_x11_drag_off_x=0;
+    g_x11_drag_off_y=0;
+    g_x11_button_grab_conn=-1;
+    g_x11_button_grab_window=0;
     g_wl7_trace_count=0;
     g_wl7_req_trace_count=0;
     g_wl7_send_trace_count=0;
@@ -6933,6 +9486,7 @@ void compat7_init_all(void){
     ulibc_memset(g_wl7_callbacks,0,sizeof(g_wl7_callbacks));
     ulibc_memset(g_wl7_xdg_surfaces,0,sizeof(g_wl7_xdg_surfaces));
     ulibc_memset(g_wl7_xdg_toplevels,0,sizeof(g_wl7_xdg_toplevels));
+    ulibc_memset(g_wl7_layer_surfaces,0,sizeof(g_wl7_layer_surfaces));
     ulibc_memset(g_wl7_viewports,0,sizeof(g_wl7_viewports));
     ulibc_memset(g_wl7_dmabuf_params,0,sizeof(g_wl7_dmabuf_params));
     ulibc_memset(g_wl7_present_fbs,0,sizeof(g_wl7_present_fbs));
@@ -6950,6 +9504,7 @@ void compat7_init_all(void){
     ulibc_memset(g_wl7_client_viewporter_obj,0,sizeof(g_wl7_client_viewporter_obj));
     ulibc_memset(g_wl7_client_dmabuf_obj,0,sizeof(g_wl7_client_dmabuf_obj));
     ulibc_memset(g_wl7_client_presentation_obj,0,sizeof(g_wl7_client_presentation_obj));
+    ulibc_memset(g_wl7_client_layer_shell_obj,0,sizeof(g_wl7_client_layer_shell_obj));
     ulibc_memset(g_wl7_client_pointer_focus,0,sizeof(g_wl7_client_pointer_focus));
     ulibc_memset(g_wl7_client_keyboard_focus,0,sizeof(g_wl7_client_keyboard_focus));
     ulibc_memset(g_wl7_client_touch_focus,0,sizeof(g_wl7_client_touch_focus));

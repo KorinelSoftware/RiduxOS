@@ -1,0 +1,17 @@
+GLIBC_2.2.5 {
+    global:
+        __secure_getenv;
+};
+
+GLIBC_2.17 {
+    global:
+        secure_getenv;
+};
+
+GLIBC_PRIVATE {
+    global:
+        __libc_secure_getenv;
+        __libc_enable_secure;
+    local:
+        *;
+};

@@ -41,7 +41,7 @@ ICON_SPECS: tuple[AssetSpec, ...] = (
     AssetSpec("BROWSER", ("RiduxIcons/SearchLupaIcon.png", "RiduxIcons/SeageLogoIcon.png")),
     AssetSpec("FIREFOX", ("RiduxIcons/SeageLogoIcon.png", "RiduxIcons/SearchLupaIcon.png")),
     AssetSpec("WEATHER", ("RiduxIcons/ClimaIcon.png", "RiduxIcons/CloudIcon.png")),
-    AssetSpec("STORE", ("RiduxIcons/JerosStoreIcon.png",)),
+    AssetSpec("STORE", ("RiduxIcons/RiduxStore.png",)),
     AssetSpec("ABOUT", ("RiduxIcons/RiduxIconLogo.png",)),
     AssetSpec("MEDIA", ("RiduxIcons/ReproductorMusicaIcon.png", "RiduxIcons/MusicFolderIcon.png")),
     AssetSpec("EDITOR", ("RiduxIcons/DocumentsFolderIcon.png", "RiduxIcons/NotesIcon.png")),
@@ -56,6 +56,18 @@ ICON_SPECS: tuple[AssetSpec, ...] = (
     AssetSpec("TRAY_VOLUME", ("RiduxIcons/Fluent/tray_volume.png", "RiduxIcons/VoiceRecorderIcon.png")),
     AssetSpec("TRAY_BATTERY", ("RiduxIcons/Fluent/tray_battery.png", "RiduxIcons/SettingsIcon.png")),
     AssetSpec("TRAY_SETTINGS", ("RiduxIcons/Fluent/tray_settings.png", "RiduxIcons/SettingsIcon.png")),
+    AssetSpec("FOLDER_HOME", ("RiduxIcons/HomeFolderIcon.png", "RiduxIcons/FolderIcon.png")),
+    AssetSpec("FOLDER_DOCUMENTS", ("RiduxIcons/DocumentsFolderIcon.png", "RiduxIcons/FolderIcon.png")),
+    AssetSpec("FOLDER_DOWNLOADS", ("RiduxIcons/DownloadsFolder.png", "RiduxIcons/FolderIcon.png")),
+    AssetSpec("FOLDER_MUSIC", ("RiduxIcons/MusicFolderIcon.png", "RiduxIcons/FolderIcon.png")),
+    AssetSpec("FOLDER_PICTURES", ("RiduxIcons/ImageFolderIcon.png", "RiduxIcons/FolderIcon.png")),
+    AssetSpec("FOLDER_VIDEOS", ("RiduxIcons/VideoFolderIcon.png", "RiduxIcons/FolderIcon.png")),
+    AssetSpec("FOLDER_DESKTOP", ("RiduxIcons/FolderDekstop.png", "RiduxIcons/FolderIcon.png")),
+    AssetSpec("FILE_PDF", ("RiduxIcons/PDFFileIcon.png", "RiduxIcons/SimpleFileIcon.png")),
+    AssetSpec("FILE_IMAGE", ("RiduxIcons/ImageFileIcon.png", "RiduxIcons/SimpleFileIcon.png")),
+    AssetSpec("FILE_TEXT", ("RiduxIcons/txtFileIcon.png", "RiduxIcons/SimpleFileIcon.png")),
+    AssetSpec("PERSONALIZATION", ("RiduxIcons/PersonalizationIcon.png", "RiduxIcons/SettingsIcon.png")),
+    AssetSpec("USER", ("RiduxIcons/UserIcon.png", "RiduxIcons/RiduxIconLogo.png")),
 )
 
 WALLPAPER_SPECS: tuple[AssetSpec, ...] = (

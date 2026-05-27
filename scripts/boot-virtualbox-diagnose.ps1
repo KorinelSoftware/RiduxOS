@@ -8,6 +8,8 @@ param(
     [int]$BootSeconds = 30,
     [int]$StartTimeoutSeconds = 60,
     [int]$TailLines = 220,
+    [ValidateSet("usbtablet", "ps2", "usb")]
+    [string]$Mouse = "ps2",
     [switch]$TraceWait,
     [switch]$Headless,
     [switch]$KeepRunning,
@@ -106,8 +108,9 @@ Invoke-VBox @(
     "--cpus", "$CpuCount",
     "--cpuexecutioncap", "$CpuExecutionCap",
     "--vram", "$VramMB",
-    "--graphicscontroller", "vboxsvga",
-    "--mouse", "ps2",
+    "--graphicscontroller", "vmsvga",
+    "--accelerate3d", "on",
+    "--mouse", $Mouse,
     "--keyboard", "ps2",
     "--boot1", "dvd",
     "--audio-enabled", "off"

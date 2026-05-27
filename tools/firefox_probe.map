@@ -1,0 +1,8 @@
+GLIBC_2.2.5 {
+    global:
+        fclose;
+        fgets;
+        fopen;
+    local:
+        *;
+};

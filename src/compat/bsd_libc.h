@@ -226,5 +226,7 @@ void compat5_register_shell_cmds(void);
  * failure (-ENOENT if the path doesn't exist, -ENOEXEC if it isn't a
  * valid ELF64, -ENOMEM if address space allocation fails, etc.). */
 int compat5_spawn_user_elf_background(const char *path, char *detail, size_t detail_cap);
+int compat5_spawn_user_elf_background_args(const char *path, const char *extra_args,
+                                           char *detail, size_t detail_cap);
 
 #endif /* RIDUX_COMPAT5_H */

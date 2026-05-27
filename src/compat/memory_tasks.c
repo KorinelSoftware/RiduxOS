@@ -11,10 +11,17 @@
 #include "memory_tasks.h"
 
 #define PAGE_HUGE 0x080ULL
+#define C2_USER_TOP 0x0000800000000000ULL
 
 extern void __boot_serial_puts(const char *s);
 extern void __boot_serial_puthex64(uint64_t v);
 extern void compat3_task_close_all_fds(task_t *t);
+extern void compat3_debug_wayfire_addr_mapping(const task_t *cur, uint64_t addr, const char *tag);
+extern void compat3_debug_wayfire_stack_mapping(const task_t *cur, uint64_t sp, const char *tag);
+extern bool kvfs_exists(const char *path);
+
+static bool task_is_desktop_runtime(const task_t *t);
+static bool task_desktop_debug_trace_enabled(void);
 
 /* local helpers */
 static inline void c2_outb(uint16_t p,uint8_t v){__asm__ volatile("outb %0,%1"::"a"(v),"Nd"(p));}
@@ -30,6 +37,115 @@ static void c2_append_u32(char *d,size_t *l,size_t c,uint32_t v){char t[12];int 
 static void c2_append_u64(char *d,size_t *l,size_t c,uint64_t v){char t[24];int i=0;if(!v){c2_append_ch(d,l,c,'0');return;}while(v){t[i++]='0'+(char)(v%10);v/=10;}while(--i>=0)c2_append_ch(d,l,c,t[i]);}
 static void c2_append_hex32(char *d,size_t *l,size_t c,uint32_t v){const char *h="0123456789abcdef";int i;c2_append_ch(d,l,c,'0');c2_append_ch(d,l,c,'x');for(i=28;i>=0;i-=4)c2_append_ch(d,l,c,h[(v>>i)&0xF]);}
 static void c2_append_hex64(char *d,size_t *l,size_t c,uint64_t v){const char *h="0123456789abcdef";int i;c2_append_ch(d,l,c,'0');c2_append_ch(d,l,c,'x');for(i=60;i>=0;i-=4)c2_append_ch(d,l,c,h[(v>>i)&0xF]);}
+
+uint64_t paging_get_entry(address_space_t *as,uint64_t virt);
+
+static bool c2_user_bytes_present(address_space_t *as,uint64_t va,size_t n){
+    uint64_t end;
+    if(!as||!va||!n)return false;
+    if(va>=C2_USER_TOP||n>C2_USER_TOP-va)return false;
+    end=va+(uint64_t)n-1ULL;
+    for(;;){
+        uint64_t entry=paging_get_entry(as,va);
+        if(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&PAGE_HUGE))return false;
+        if((va&~(PAGE_SIZE-1ULL))==(end&~(PAGE_SIZE-1ULL)))break;
+        va=(va&~(PAGE_SIZE-1ULL))+PAGE_SIZE;
+    }
+    return true;
+}
+
+static bool c2_user_copy_out_task(task_t *t,uint64_t dst,const void *src,size_t len,const char *tag){
+    uint64_t base,end;
+    size_t done=0;
+    if(!len)return true;
+    if(!t||!t->addr_space||!dst||!src)return false;
+    base=dst;
+    end=base+(uint64_t)len-1ULL;
+    if(end<base||base>=C2_USER_TOP||end>=C2_USER_TOP)return false;
+    while(done<len){
+        uint64_t va=base+(uint64_t)done;
+        uint64_t page=va&~(PAGE_SIZE-1ULL);
+        size_t in_page=(size_t)(va-page);
+        size_t chunk=PAGE_SIZE-in_page;
+        uint64_t entry,phys;
+        if(chunk>len-done)chunk=len-done;
+        entry=paging_get_entry(t->addr_space,page);
+        if(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||
+           !(entry&PAGE_WRITABLE)||(entry&PAGE_HUGE)){
+            if(task_desktop_debug_trace_enabled()&&task_is_desktop_runtime(t)){
+                static uint32_t trace_count;
+                if(trace_count<32u){
+                    ++trace_count;
+                    __boot_serial_force_puts("[sig-usercopy-fail] #");
+                    __boot_serial_force_putu32(trace_count);
+                    __boot_serial_force_puts(" tag=");
+                    __boot_serial_force_puts(tag?tag:"?");
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)t->pid);
+                    __boot_serial_force_puts(" name=");
+                    __boot_serial_force_puts(t->name);
+                    __boot_serial_force_puts(" va=");
+                    __boot_serial_force_puthex64(va);
+                    __boot_serial_force_puts(" entry=");
+                    __boot_serial_force_puthex64(entry);
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            return false;
+        }
+        phys=paging_translate(t->addr_space,va);
+        if(!phys)return false;
+        c2_memcpy(PHYS_TO_DMAP(phys),(const uint8_t*)src+done,chunk);
+        done+=chunk;
+    }
+    return true;
+}
+
+static bool c2_user_copy_in_task(task_t *t,void *dst,uint64_t src,size_t len,const char *tag){
+    uint64_t base,end;
+    size_t done=0;
+    if(!len)return true;
+    if(!t||!t->addr_space||!dst||!src)return false;
+    base=src;
+    end=base+(uint64_t)len-1ULL;
+    if(end<base||base>=C2_USER_TOP||end>=C2_USER_TOP)return false;
+    while(done<len){
+        uint64_t va=base+(uint64_t)done;
+        uint64_t page=va&~(PAGE_SIZE-1ULL);
+        size_t in_page=(size_t)(va-page);
+        size_t chunk=PAGE_SIZE-in_page;
+        uint64_t entry,phys;
+        if(chunk>len-done)chunk=len-done;
+        entry=paging_get_entry(t->addr_space,page);
+        if(!(entry&PAGE_PRESENT)||!(entry&PAGE_USER)||(entry&PAGE_HUGE)){
+            if(task_desktop_debug_trace_enabled()&&task_is_desktop_runtime(t)){
+                static uint32_t trace_count;
+                if(trace_count<32u){
+                    ++trace_count;
+                    __boot_serial_force_puts("[sig-userread-fail] #");
+                    __boot_serial_force_putu32(trace_count);
+                    __boot_serial_force_puts(" tag=");
+                    __boot_serial_force_puts(tag?tag:"?");
+                    __boot_serial_force_puts(" pid=");
+                    __boot_serial_force_putu32((uint32_t)t->pid);
+                    __boot_serial_force_puts(" name=");
+                    __boot_serial_force_puts(t->name);
+                    __boot_serial_force_puts(" va=");
+                    __boot_serial_force_puthex64(va);
+                    __boot_serial_force_puts(" entry=");
+                    __boot_serial_force_puthex64(entry);
+                    __boot_serial_force_puts("\n");
+                }
+            }
+            return false;
+        }
+        phys=paging_translate(t->addr_space,va);
+        if(!phys)return false;
+        c2_memcpy((uint8_t*)dst+done,PHYS_TO_DMAP(phys),chunk);
+        done+=chunk;
+    }
+    return true;
+}
 
 static inline uint64_t rdtsc(void){uint32_t lo,hi;__asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));return((uint64_t)hi<<32)|lo;}
 static inline uint64_t read_cr3(void){uint64_t v;__asm__ volatile("mov %%cr3,%0":"=r"(v));return v;}
@@ -135,6 +251,16 @@ static uint32_t g_pmm_total;
 static uint32_t g_pmm_free;
 static uint32_t g_pmm_hint;
 static uint64_t g_pmm_base = 0x200000ULL; /* start after 2MB */
+static uint64_t g_pmm_memory_limit;
+
+#define PMM_USABLE_RANGE_MAX 32
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+} pmm_usable_range_t;
+
+static pmm_usable_range_t g_pmm_usable_ranges[PMM_USABLE_RANGE_MAX];
+static uint32_t g_pmm_usable_range_count;
 
 static bool pmm_frame_index(uint64_t phys,uint32_t *idx_out){
     uint32_t idx;
@@ -162,17 +288,82 @@ void pmm_set_alloc_base(uint64_t phys_base){
     g_pmm_base=phys_base&~(PAGE_SIZE-1ULL);
 }
 
+void pmm_set_memory_limit(uint64_t mem_bytes){
+    if(mem_bytes<PAGE_SIZE)return;
+    g_pmm_memory_limit=mem_bytes&~(PAGE_SIZE-1ULL);
+}
+
+void pmm_clear_usable_ranges(void){
+    g_pmm_usable_range_count=0;
+    c2_memset(g_pmm_usable_ranges,0,sizeof(g_pmm_usable_ranges));
+}
+
+void pmm_add_usable_range(uint64_t phys_base,uint64_t bytes){
+    uint64_t end;
+    if(!bytes||g_pmm_usable_range_count>=PMM_USABLE_RANGE_MAX)return;
+    end=phys_base+bytes;
+    if(end<=phys_base)end=~0ULL;
+    g_pmm_usable_ranges[g_pmm_usable_range_count].start=phys_base;
+    g_pmm_usable_ranges[g_pmm_usable_range_count].end=end;
+    ++g_pmm_usable_range_count;
+}
+
 void pmm_init(uint64_t mem_bytes){
-    uint32_t pages=(uint32_t)(mem_bytes/PAGE_SIZE);
+    uint32_t pages;
     uint32_t reserve_pages;
+    if(g_pmm_memory_limit&&mem_bytes>g_pmm_memory_limit)mem_bytes=g_pmm_memory_limit;
+    pages=(uint32_t)(mem_bytes/PAGE_SIZE);
     if(pages>PMM_MAX_PAGES)pages=PMM_MAX_PAGES;
-    g_pmm_total=pages; g_pmm_free=pages;
-    c2_memset(g_pmm_bitmap,0,sizeof(g_pmm_bitmap));
+    g_pmm_total=pages; g_pmm_free=0;
+    c2_memset(g_pmm_bitmap,0xFF,sizeof(g_pmm_bitmap));
     c2_memset(g_pmm_pt_bitmap,0,sizeof(g_pmm_pt_bitmap));
+    if(g_pmm_usable_range_count){
+        uint32_t r;
+        uint64_t limit=(uint64_t)pages*PAGE_SIZE;
+        for(r=0;r<g_pmm_usable_range_count;++r){
+            uint64_t s=(g_pmm_usable_ranges[r].start+PAGE_SIZE-1ULL)&~(PAGE_SIZE-1ULL);
+            uint64_t e=g_pmm_usable_ranges[r].end&~(PAGE_SIZE-1ULL);
+            uint32_t first,last,idx;
+            if(e<=s||s>=limit)continue;
+            if(e>limit)e=limit;
+            first=(uint32_t)(s/PAGE_SIZE);
+            last=(uint32_t)(e/PAGE_SIZE);
+            if(last>pages)last=pages;
+            for(idx=first;idx<last;++idx){
+                uint32_t word=idx/32u;
+                uint32_t bit=idx%32u;
+                if(g_pmm_bitmap[word]&(1u<<bit)){
+                    g_pmm_bitmap[word]&=~(1u<<bit);
+                    ++g_pmm_free;
+                }
+            }
+        }
+    }else{
+        c2_memset(g_pmm_bitmap,0,sizeof(g_pmm_bitmap));
+        g_pmm_free=pages;
+    }
     reserve_pages=(uint32_t)(g_pmm_base/PAGE_SIZE);
     if(reserve_pages>pages)reserve_pages=pages;
-    {uint32_t i;for(i=0;i<reserve_pages;++i){g_pmm_bitmap[i/32]|=(1u<<(i%32));g_pmm_free--;}}
+    {uint32_t i;for(i=0;i<reserve_pages;++i){
+        uint32_t word=i/32u;
+        uint32_t bit=i%32u;
+        if(!(g_pmm_bitmap[word]&(1u<<bit))){
+            g_pmm_bitmap[word]|=(1u<<bit);
+            if(g_pmm_free)g_pmm_free--;
+        }
+    }}
     g_pmm_hint=reserve_pages<g_pmm_total?reserve_pages:0;
+    __boot_serial_force_puts("[pmm-init] total=");
+    __boot_serial_force_putu32(g_pmm_total);
+    __boot_serial_force_puts(" free=");
+    __boot_serial_force_putu32(g_pmm_free);
+    __boot_serial_force_puts(" base=");
+    __boot_serial_force_puthex64(g_pmm_base);
+    __boot_serial_force_puts(" limit=");
+    __boot_serial_force_puthex64((uint64_t)pages*PAGE_SIZE);
+    __boot_serial_force_puts(" ranges=");
+    __boot_serial_force_putu32(g_pmm_usable_range_count);
+    __boot_serial_force_puts("\n");
 }
 uint64_t pmm_alloc_frame(void){
     uint32_t start,end,idx;
@@ -196,7 +387,7 @@ uint64_t pmm_alloc_frame(void){
     return 0;
 }
 
-static uint64_t pmm_alloc_contiguous_frames(uint32_t pages){
+uint64_t pmm_alloc_contiguous_frames(uint32_t pages){
     uint32_t idx,start=0,run=0;
     if(pages==0||pages>g_pmm_total)return 0;
     for(idx=0;idx<g_pmm_total;++idx){
@@ -267,6 +458,74 @@ void paging_init(void){
 
 address_space_t *paging_get_kernel_space(void){return &g_kernel_as;}
 
+#define C2_PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
+
+static bool c2_phys_frame_in_range(uint64_t phys){
+    if(!g_pmm_total)return true;
+    return phys < (uint64_t)g_pmm_total * PAGE_SIZE;
+}
+
+static bool c2_dmap_page_table_ptr_valid(const page_table_t *pt){
+    uint64_t va=(uint64_t)(uintptr_t)pt;
+    uint64_t phys;
+    if(!pt)return false;
+    if((va & (PAGE_SIZE-1ULL)) != 0)return false;
+    if(va < DMAP_BASE)return false;
+    phys=va-DMAP_BASE;
+    return c2_phys_frame_in_range(phys);
+}
+
+static bool c2_page_table_entry_phys_valid(uint64_t entry){
+    return c2_phys_frame_in_range(entry & C2_PTE_ADDR_MASK);
+}
+
+static page_table_t *c2_page_table_from_entry(uint64_t entry){
+    page_table_t *pt;
+    if(!(entry & PAGE_PRESENT))return 0;
+    if(entry & PAGE_HUGE)return 0;
+    if(!c2_page_table_entry_phys_valid(entry))return 0;
+    pt=(page_table_t*)PHYS_TO_DMAP(entry & C2_PTE_ADDR_MASK);
+    if(!c2_dmap_page_table_ptr_valid(pt))return 0;
+    return pt;
+}
+
+static bool c2_address_space_ready(address_space_t *as){
+    return as && c2_dmap_page_table_ptr_valid(as->pml4);
+}
+
+static bool c2_user_paging_edit_allowed(address_space_t *as,uint64_t virt){
+    if(!as||as==&g_kernel_as)return true;
+    /*
+     * User mappings normally live above RIDUX_USER_LOW_SAFE, but Linux
+     * ET_EXEC binaries still use the classic 0x400000 image base.  User
+     * address spaces own a deep-cloned low-half page-table tree, so allowing
+     * those ELF leaves to split the identity huge page does not promote the
+     * shared kernel mapping.
+     */
+    return virt>=RIDUX_USER_LOW_SAFE || virt>=RIDUX_USER_LOW_MAP_MIN;
+}
+
+static void c2_trace_paging_map_fail(const char *stage,address_space_t *as,uint64_t virt,uint64_t entry){
+    static uint32_t trace_count=0;
+    if(trace_count>=64)return;
+    ++trace_count;
+    __boot_serial_force_puts("[paging-map-fail] stage=");
+    __boot_serial_force_puts(stage?stage:"?");
+    __boot_serial_force_puts(" as=");
+    __boot_serial_force_puthex64((uint64_t)(uintptr_t)as);
+    __boot_serial_force_puts(" pml4=");
+    __boot_serial_force_puthex64(as?(uint64_t)(uintptr_t)as->pml4:0);
+    __boot_serial_force_puts(" cr3=");
+    __boot_serial_force_puthex64(as?as->cr3_phys:0);
+    __boot_serial_force_puts(" virt=");
+    __boot_serial_force_puthex64(virt);
+    __boot_serial_force_puts(" entry=");
+    __boot_serial_force_puthex64(entry);
+    __boot_serial_force_puts(" free=");
+    __boot_serial_force_putu32(pmm_free_count());
+    __boot_serial_force_puts("\n");
+}
+
 /* ----------------------------------------------------------------
  * Deep-clone helpers for paging_create_address_space
  *
@@ -302,9 +561,10 @@ static bool deep_clone_pd(page_table_t *dst_pd, const page_table_t *src_pd) {
             continue;
         }
         {
-            page_table_t *src_pt = (page_table_t*)PHYS_TO_DMAP(entry & ~0xFFFULL);
+            page_table_t *src_pt = c2_page_table_from_entry(entry);
             page_table_t *dst_pt = alloc_page_table();
             int pti;
+            if (!src_pt) return false;
             if (!dst_pt) return false;
             for (pti = 0; pti < 512; ++pti) {
                 uint64_t pte = src_pt->entries[pti];
@@ -333,8 +593,9 @@ static bool deep_clone_pdpt(page_table_t *dst_pdpt, const page_table_t *src_pdpt
             continue;
         }
         {
-            page_table_t *src_pd = (page_table_t*)PHYS_TO_DMAP(entry & ~0xFFFULL);
+            page_table_t *src_pd = c2_page_table_from_entry(entry);
             page_table_t *dst_pd = alloc_page_table();
+            if (!src_pd) return false;
             if (!dst_pd) return false;
             if (!deep_clone_pd(dst_pd, src_pd)) return false;
             dst_pdpt->entries[pdpti] = DMAP_TO_PHYS((uint64_t)dst_pd)
@@ -352,6 +613,7 @@ address_space_t *paging_create_address_space(void){
     page_table_t *pml4;
     int i;
     if(next_space>=TASK_MAX)return 0;
+    if(!c2_address_space_ready(&g_kernel_as))return 0;
     as=&spaces[next_space++];
     pml4=alloc_page_table();
     if(!pml4)return 0;
@@ -370,8 +632,9 @@ address_space_t *paging_create_address_space(void){
         uint64_t entry = g_kernel_as.pml4->entries[i];
         if (!(entry & PAGE_PRESENT)) { pml4->entries[i] = 0; continue; }
         if (i < 256) {
-            page_table_t *src_pdpt = (page_table_t*)PHYS_TO_DMAP(entry & ~0xFFFULL);
+            page_table_t *src_pdpt = c2_page_table_from_entry(entry);
             page_table_t *dst_pdpt = alloc_page_table();
+            if (!src_pdpt) return 0;
             if (!dst_pdpt) return 0;
             if (!deep_clone_pdpt(dst_pdpt, src_pdpt)) return 0;
             pml4->entries[i] = DMAP_TO_PHYS((uint64_t)dst_pdpt)
@@ -389,9 +652,13 @@ address_space_t *paging_create_address_space(void){
 
 void paging_destroy_address_space(address_space_t *as){
     /* Free user page tables (simplified: just free PML4) */
-    if(as&&as->pml4&&as!=&g_kernel_as){
+    if(as&&as->pml4&&as!=&g_kernel_as&&c2_dmap_page_table_ptr_valid(as->pml4)){
         pmm_free_frame(DMAP_TO_PHYS((uint64_t)as->pml4));
         as->pml4=0;
+        as->cr3_phys=0;
+    }else if(as&&as!=&g_kernel_as){
+        as->pml4=0;
+        as->cr3_phys=0;
     }
 }
 
@@ -413,7 +680,8 @@ static bool paging_split_2m_huge(page_table_t *pd, uint64_t pdi, bool user_acces
     page_table_t *pt;
     int i;
     if (!(old & PAGE_HUGE)) return true;            /* nothing to split */
-    huge_phys = old & ~0xFFFULL & ~(uint64_t)PAGE_HUGE;
+    if (!c2_page_table_entry_phys_valid(old)) return false;
+    huge_phys = old & C2_PTE_ADDR_MASK & ~(uint64_t)PAGE_HUGE;
     /* The PTE format does not include the HUGE bit; preserve the
      * existing leaf protections and only add PAGE_USER for the page
      * we are about to replace with an explicit user mapping. */
@@ -440,7 +708,8 @@ static bool paging_split_1g_huge(page_table_t *pdpt, uint64_t pdpti, bool user_a
     page_table_t *pd;
     int i;
     if (!(old & PAGE_HUGE)) return true;
-    huge_phys = old & ~0xFFFULL & ~(uint64_t)PAGE_HUGE;
+    if (!c2_page_table_entry_phys_valid(old)) return false;
+    huge_phys = old & C2_PTE_ADDR_MASK & ~(uint64_t)PAGE_HUGE;
     pde_flags = old & 0xFFFULL;   /* keep HUGE bit for child PDEs */
     pd = alloc_page_table();
     if (!pd) return false;
@@ -453,6 +722,55 @@ static bool paging_split_1g_huge(page_table_t *pdpt, uint64_t pdpti, bool user_a
     return true;
 }
 
+static void paging_map_dmap_usable_ranges(void){
+    const uint64_t addr_mask=0x000FFFFFFFFFF000ULL;
+    uint64_t pml4i=(DMAP_BASE>>39)&0x1FF;
+    page_table_t *pdpt;
+    uint32_t r;
+    uint32_t high_ranges=0;
+    uint32_t mapped_2m=0;
+    if(!c2_address_space_ready(&g_kernel_as))return;
+    if(!(g_kernel_as.pml4->entries[pml4i]&PAGE_PRESENT)){
+        __boot_serial_force_puts("[dmap-usable] missing-dmap-pml4\n");
+        return;
+    }
+    pdpt=c2_page_table_from_entry(g_kernel_as.pml4->entries[pml4i]);
+    if(!pdpt){
+        __boot_serial_force_puts("[dmap-usable] invalid-dmap-pdpt\n");
+        return;
+    }
+    for(r=0;r<g_pmm_usable_range_count;++r){
+        uint64_t limit=(uint64_t)g_pmm_total*PAGE_SIZE;
+        uint64_t s=g_pmm_usable_ranges[r].start&~((1ULL<<21)-1ULL);
+        uint64_t e=(g_pmm_usable_ranges[r].end+((1ULL<<21)-1ULL))&~((1ULL<<21)-1ULL);
+        uint64_t pa;
+        if(e<=0x100000000ULL||s>=limit)continue;
+        if(s<0x100000000ULL)s=0x100000000ULL;
+        if(e>limit)e=limit;
+        ++high_ranges;
+        for(pa=s;pa<e;pa+=(1ULL<<21)){
+            uint64_t pdpti=(pa>>30)&0x1FF;
+            uint64_t pdi=(pa>>21)&0x1FF;
+            page_table_t *pd;
+            if(!(pdpt->entries[pdpti]&PAGE_PRESENT)){
+                pd=alloc_page_table();
+                if(!pd)return;
+                pdpt->entries[pdpti]=DMAP_TO_PHYS((uint64_t)pd)|PAGE_PRESENT|PAGE_WRITABLE;
+            }
+            if(pdpt->entries[pdpti]&PAGE_HUGE)continue;
+            pd=c2_page_table_from_entry(pdpt->entries[pdpti]);
+            if(!pd)continue;
+            pd->entries[pdi]=(pa&addr_mask)|PAGE_PRESENT|PAGE_WRITABLE|PAGE_HUGE;
+            ++mapped_2m;
+        }
+    }
+    __boot_serial_force_puts("[dmap-usable] high_ranges=");
+    __boot_serial_force_putu32(high_ranges);
+    __boot_serial_force_puts(" huge2m=");
+    __boot_serial_force_putu32(mapped_2m);
+    __boot_serial_force_puts("\n");
+}
+
 bool paging_map(address_space_t *as,uint64_t virt,uint64_t phys,uint64_t flags){
     uint64_t pml4i=(virt>>39)&0x1FF;
     uint64_t pdpti=(virt>>30)&0x1FF;
@@ -461,38 +779,63 @@ bool paging_map(address_space_t *as,uint64_t virt,uint64_t phys,uint64_t flags){
     page_table_t *pdpt,*pd,*pt;
     bool want_user = (flags & PAGE_USER) != 0;
     uint64_t parent_promote = want_user ? PAGE_USER : 0;
-    if(!as||!as->pml4)return false;
+    if(!c2_address_space_ready(as)){
+        c2_trace_paging_map_fail("as",as,virt,0);
+        return false;
+    }
+    if(!c2_user_paging_edit_allowed(as,virt)){
+        c2_trace_paging_map_fail("low-guard",as,virt,0);
+        return false;
+    }
     flags=c2_sanitize_page_flags(flags);
     /* PML4 -> PDPT */
     if(!(as->pml4->entries[pml4i]&PAGE_PRESENT)){
-        pdpt=alloc_page_table();if(!pdpt)return false;
+        pdpt=alloc_page_table();if(!pdpt){c2_trace_paging_map_fail("alloc-pdpt",as,virt,0);return false;}
         as->pml4->entries[pml4i]=DMAP_TO_PHYS((uint64_t)pdpt)|PAGE_PRESENT|PAGE_WRITABLE|PAGE_USER;
     } else if(parent_promote && !(as->pml4->entries[pml4i]&PAGE_USER)) {
         as->pml4->entries[pml4i] |= PAGE_USER;
     }
-    pdpt=(page_table_t*)PHYS_TO_DMAP(as->pml4->entries[pml4i]&~0xFFFULL);
+    pdpt=c2_page_table_from_entry(as->pml4->entries[pml4i]);
+    if(!pdpt){
+        c2_trace_paging_map_fail("pml4e",as,virt,as->pml4->entries[pml4i]);
+        return false;
+    }
     if (pdpt->entries[pdpti] & PAGE_HUGE) {
-        if (!paging_split_1g_huge(pdpt, pdpti, want_user)) return false;
+        if (!paging_split_1g_huge(pdpt, pdpti, want_user)){
+            c2_trace_paging_map_fail("split1g",as,virt,pdpt->entries[pdpti]);
+            return false;
+        }
     }
     /* PDPT -> PD */
     if(!(pdpt->entries[pdpti]&PAGE_PRESENT)){
-        pd=alloc_page_table();if(!pd)return false;
+        pd=alloc_page_table();if(!pd){c2_trace_paging_map_fail("alloc-pd",as,virt,pdpt->entries[pdpti]);return false;}
         pdpt->entries[pdpti]=DMAP_TO_PHYS((uint64_t)pd)|PAGE_PRESENT|PAGE_WRITABLE|PAGE_USER;
     } else if(parent_promote && !(pdpt->entries[pdpti]&PAGE_USER)) {
         pdpt->entries[pdpti] |= PAGE_USER;
     }
-    pd=(page_table_t*)PHYS_TO_DMAP(pdpt->entries[pdpti]&~0xFFFULL);
+    pd=c2_page_table_from_entry(pdpt->entries[pdpti]);
+    if(!pd){
+        c2_trace_paging_map_fail("pdpte",as,virt,pdpt->entries[pdpti]);
+        return false;
+    }
     if (pd->entries[pdi] & PAGE_HUGE) {
-        if (!paging_split_2m_huge(pd, pdi, want_user)) return false;
+        if (!paging_split_2m_huge(pd, pdi, want_user)){
+            c2_trace_paging_map_fail("split2m",as,virt,pd->entries[pdi]);
+            return false;
+        }
     }
     /* PD -> PT */
     if(!(pd->entries[pdi]&PAGE_PRESENT)){
-        pt=alloc_page_table();if(!pt)return false;
+        pt=alloc_page_table();if(!pt){c2_trace_paging_map_fail("alloc-pt",as,virt,pd->entries[pdi]);return false;}
         pd->entries[pdi]=DMAP_TO_PHYS((uint64_t)pt)|PAGE_PRESENT|PAGE_WRITABLE|PAGE_USER;
     } else if(parent_promote && !(pd->entries[pdi]&PAGE_USER)) {
         pd->entries[pdi] |= PAGE_USER;
     }
-    pt=(page_table_t*)PHYS_TO_DMAP(pd->entries[pdi]&~0xFFFULL);
+    pt=c2_page_table_from_entry(pd->entries[pdi]);
+    if(!pt){
+        c2_trace_paging_map_fail("pde",as,virt,pd->entries[pdi]);
+        return false;
+    }
     pt->entries[pti]=phys|flags;
     invlpg(virt);
     return true;
@@ -501,15 +844,19 @@ bool paging_map(address_space_t *as,uint64_t virt,uint64_t phys,uint64_t flags){
 bool paging_unmap(address_space_t *as,uint64_t virt){
     uint64_t pml4i=(virt>>39)&0x1FF,pdpti=(virt>>30)&0x1FF,pdi=(virt>>21)&0x1FF,pti=(virt>>12)&0x1FF;
     page_table_t *pdpt,*pd,*pt;
-    if(!as||!as->pml4)return false;
+    if(!c2_address_space_ready(as))return false;
+    if(!c2_user_paging_edit_allowed(as,virt))return false;
     if(!(as->pml4->entries[pml4i]&PAGE_PRESENT))return false;
-    pdpt=(page_table_t*)PHYS_TO_DMAP(as->pml4->entries[pml4i]&~0xFFFULL);
+    pdpt=c2_page_table_from_entry(as->pml4->entries[pml4i]);
+    if(!pdpt)return false;
     if(pdpt->entries[pdpti]&PAGE_HUGE)return false;
     if(!(pdpt->entries[pdpti]&PAGE_PRESENT))return false;
-    pd=(page_table_t*)PHYS_TO_DMAP(pdpt->entries[pdpti]&~0xFFFULL);
+    pd=c2_page_table_from_entry(pdpt->entries[pdpti]);
+    if(!pd)return false;
     if(pd->entries[pdi]&PAGE_HUGE)return false;
     if(!(pd->entries[pdi]&PAGE_PRESENT))return false;
-    pt=(page_table_t*)PHYS_TO_DMAP(pd->entries[pdi]&~0xFFFULL);
+    pt=c2_page_table_from_entry(pd->entries[pdi]);
+    if(!pt)return false;
     pt->entries[pti]=0;
     invlpg(virt);
     return true;
@@ -519,17 +866,20 @@ uint64_t paging_translate(address_space_t *as,uint64_t virt){
     const uint64_t addr_mask=0x000FFFFFFFFFF000ULL;
     uint64_t pml4i=(virt>>39)&0x1FF,pdpti=(virt>>30)&0x1FF,pdi=(virt>>21)&0x1FF,pti=(virt>>12)&0x1FF;
     page_table_t *pdpt,*pd,*pt;
-    if(!as||!as->pml4)return 0;
+    if(!c2_address_space_ready(as))return 0;
     if(!(as->pml4->entries[pml4i]&PAGE_PRESENT))return 0;
-    pdpt=(page_table_t*)PHYS_TO_DMAP(as->pml4->entries[pml4i]&~0xFFFULL);
+    pdpt=c2_page_table_from_entry(as->pml4->entries[pml4i]);
+    if(!pdpt)return 0;
     if(pdpt->entries[pdpti]&PAGE_HUGE)
         return((pdpt->entries[pdpti]&addr_mask)&~((1ULL<<30)-1ULL))|(virt&((1ULL<<30)-1ULL));
     if(!(pdpt->entries[pdpti]&PAGE_PRESENT))return 0;
-    pd=(page_table_t*)PHYS_TO_DMAP(pdpt->entries[pdpti]&~0xFFFULL);
+    pd=c2_page_table_from_entry(pdpt->entries[pdpti]);
+    if(!pd)return 0;
     if(pd->entries[pdi]&PAGE_HUGE)
         return((pd->entries[pdi]&addr_mask)&~((1ULL<<21)-1ULL))|(virt&((1ULL<<21)-1ULL));
     if(!(pd->entries[pdi]&PAGE_PRESENT))return 0;
-    pt=(page_table_t*)PHYS_TO_DMAP(pd->entries[pdi]&~0xFFFULL);
+    pt=c2_page_table_from_entry(pd->entries[pdi]);
+    if(!pt)return 0;
     if(!(pt->entries[pti]&PAGE_PRESENT))return 0;
     return(pt->entries[pti]&addr_mask)|(virt&0xFFF);
 }
@@ -537,38 +887,45 @@ uint64_t paging_translate(address_space_t *as,uint64_t virt){
 uint64_t paging_get_entry(address_space_t *as,uint64_t virt){
     uint64_t pml4i=(virt>>39)&0x1FF,pdpti=(virt>>30)&0x1FF,pdi=(virt>>21)&0x1FF,pti=(virt>>12)&0x1FF;
     page_table_t *pdpt,*pd,*pt;
-    if(!as||!as->pml4)return 0;
+    if(!c2_address_space_ready(as))return 0;
     if(!(as->pml4->entries[pml4i]&PAGE_PRESENT))return 0;
-    pdpt=(page_table_t*)PHYS_TO_DMAP(as->pml4->entries[pml4i]&~0xFFFULL);
+    pdpt=c2_page_table_from_entry(as->pml4->entries[pml4i]);
+    if(!pdpt)return 0;
     if(pdpt->entries[pdpti]&PAGE_HUGE)return pdpt->entries[pdpti];
     if(!(pdpt->entries[pdpti]&PAGE_PRESENT))return 0;
-    pd=(page_table_t*)PHYS_TO_DMAP(pdpt->entries[pdpti]&~0xFFFULL);
+    pd=c2_page_table_from_entry(pdpt->entries[pdpti]);
+    if(!pd)return 0;
     if(pd->entries[pdi]&PAGE_HUGE)return pd->entries[pdi];
     if(!(pd->entries[pdi]&PAGE_PRESENT))return 0;
-    pt=(page_table_t*)PHYS_TO_DMAP(pd->entries[pdi]&~0xFFFULL);
+    pt=c2_page_table_from_entry(pd->entries[pdi]);
+    if(!pt)return 0;
     return pt->entries[pti];
 }
 
 bool paging_set_entry(address_space_t *as,uint64_t virt,uint64_t entry){
     uint64_t pml4i=(virt>>39)&0x1FF,pdpti=(virt>>30)&0x1FF,pdi=(virt>>21)&0x1FF,pti=(virt>>12)&0x1FF;
     page_table_t *pdpt,*pd,*pt;
-    if(!as||!as->pml4)return false;
+    if(!c2_address_space_ready(as))return false;
+    if(!c2_user_paging_edit_allowed(as,virt))return false;
     entry=c2_sanitize_page_flags(entry);
     if(!(as->pml4->entries[pml4i]&PAGE_PRESENT))return false;
-    pdpt=(page_table_t*)PHYS_TO_DMAP(as->pml4->entries[pml4i]&~0xFFFULL);
+    pdpt=c2_page_table_from_entry(as->pml4->entries[pml4i]);
+    if(!pdpt)return false;
     if(pdpt->entries[pdpti]&PAGE_HUGE)return false;
     if(!(pdpt->entries[pdpti]&PAGE_PRESENT))return false;
-    pd=(page_table_t*)PHYS_TO_DMAP(pdpt->entries[pdpti]&~0xFFFULL);
+    pd=c2_page_table_from_entry(pdpt->entries[pdpti]);
+    if(!pd)return false;
     if(pd->entries[pdi]&PAGE_HUGE)return false;
     if(!(pd->entries[pdi]&PAGE_PRESENT))return false;
-    pt=(page_table_t*)PHYS_TO_DMAP(pd->entries[pdi]&~0xFFFULL);
+    pt=c2_page_table_from_entry(pd->entries[pdi]);
+    if(!pt)return false;
     pt->entries[pti]=entry;
     invlpg(virt);
     return true;
 }
 
 void paging_switch(address_space_t *as){
-    if(as&&as->cr3_phys)write_cr3(as->cr3_phys);
+    if(c2_address_space_ready(as)&&as->cr3_phys)write_cr3(as->cr3_phys);
 }
 void paging_flush_tlb(uint64_t virt){invlpg(virt);}
 
@@ -813,8 +1170,8 @@ extern int64_t real_sys_getuid(void);
 extern int64_t real_sys_getgid(void);
 extern int64_t real_sys_geteuid(void);
 extern int64_t real_sys_getegid(void);
-extern int64_t real_sys_setuid(uint32_t uid);
-extern int64_t real_sys_setgid(uint32_t gid);
+extern int64_t real_sys_setuid(int uid);
+extern int64_t real_sys_setgid(int gid);
 extern int64_t real_sys_setpgid(int pid, int pgid);
 extern int64_t real_sys_getpgid(int pid);
 extern int64_t real_sys_setsid(void);
@@ -1165,6 +1522,7 @@ void task_init(void){
     /* Task 0: kernel idle */
     task_t *t=&g_tasks[0];
     t->used=true; t->pid=g_task_next_pid++; t->tgid=t->pid; t->ppid=0; t->pgid=1; t->sid=1;
+    t->uid=0; t->euid=0; t->suid=0; t->gid=0; t->egid=0; t->sgid=0;
     t->fdt_group=t->pid;
     t->state=TASK_RUNNING; t->nice=0;
     c2_strlcpy(t->name,"kernel",TASK_NAME_LEN);
@@ -1185,7 +1543,71 @@ void task_init(void){
     for(i=0;i<NSIG;++i)t->sigactions[i].handler=SIG_DFL;
 }
 
-task_t *task_current(void){return &g_tasks[g_current_task];}
+static bool task_current_index_usable(int idx){
+    if(idx<0||idx>=TASK_MAX)return false;
+    if(!g_tasks[idx].used)return false;
+    if(g_tasks[idx].state==TASK_FREE||g_tasks[idx].state==TASK_ZOMBIE)return false;
+    return true;
+}
+
+static int task_index_from_kernel_rsp_value(uint64_t rsp){
+    int i;
+    for(i=0;i<TASK_MAX;++i){
+        uint64_t base,top;
+        if(!g_tasks[i].used||!g_tasks[i].kernel_stack)continue;
+        base=(uint64_t)(uintptr_t)g_tasks[i].kernel_stack;
+        top=g_tasks[i].kernel_stack_top;
+        if(rsp>=base&&rsp<top)return i;
+    }
+    return -1;
+}
+
+static void task_recover_current_index(const char *where){
+    uint64_t rsp;
+    int old_idx;
+    int idx;
+    static uint32_t trace_count;
+    if(task_current_index_usable(g_current_task))return;
+    __asm__ volatile("mov %%rsp,%0":"=r"(rsp));
+    old_idx=g_current_task;
+    idx=task_index_from_kernel_rsp_value(rsp);
+    if(idx<0){
+        int i;
+        for(i=0;i<TASK_MAX;++i){
+            if(g_tasks[i].used&&g_tasks[i].state==TASK_RUNNING){
+                idx=i;
+                break;
+            }
+        }
+    }
+    if(idx<0)idx=0;
+    g_current_task=idx;
+    if(g_tasks[idx].used&&g_tasks[idx].state!=TASK_RUNNING&&
+       g_tasks[idx].state!=TASK_ZOMBIE&&g_tasks[idx].state!=TASK_FREE){
+        g_tasks[idx].state=TASK_RUNNING;
+    }
+    if(task_desktop_debug_trace_enabled()&&trace_count<32){
+        ++trace_count;
+        __boot_serial_force_puts("[sched-current-recover!] where=");
+        __boot_serial_force_puts(where?where:"?");
+        __boot_serial_force_puts(" old=");
+        __boot_serial_force_putu32((uint32_t)old_idx);
+        __boot_serial_force_puts(" new=");
+        __boot_serial_force_putu32((uint32_t)g_current_task);
+        __boot_serial_force_puts(" rsp=");
+        __boot_serial_force_puthex64(rsp);
+        if(g_tasks[g_current_task].name[0]){
+            __boot_serial_force_puts(" name=");
+            __boot_serial_force_puts(g_tasks[g_current_task].name);
+        }
+        __boot_serial_force_puts("\n");
+    }
+}
+
+task_t *task_current(void){
+    task_recover_current_index("current");
+    return &g_tasks[g_current_task];
+}
 
 uint64_t *task_syscall_user_frame(const task_t *t){
     extern uint64_t *g_syscall_user_frame;
@@ -1193,6 +1615,8 @@ uint64_t *task_syscall_user_frame(const task_t *t){
     if(t&&t->syscall_user_frame)return t->syscall_user_frame;
     return g_syscall_user_frame;
 }
+
+static bool task_is_wayfire_runtime(const task_t *t);
 
 void task_capture_syscall_user_context(void){
     extern uint64_t *g_syscall_user_frame;
@@ -1214,8 +1638,51 @@ void task_capture_syscall_user_context(void){
     cur->ctx.rsp=f[20];
 }
 
+void task_repair_syscall_return_frame(uint64_t *frame){
+    task_t *cur;
+    const uint64_t *saved;
+    bool changed=false;
+    int i;
+    static uint32_t trace_count=0;
+    if(!frame)return;
+    cur=task_current();
+    if(!cur||!cur->used||!cur->syscall_user_frame_valid)return;
+    saved=cur->syscall_user_frame_copy;
+    for(i=0;i<14;++i){
+        if(frame[i]!=saved[i]){
+            frame[i]=saved[i];
+            changed=true;
+        }
+    }
+    if(saved[17]&&frame[12]!=saved[17]){
+        frame[12]=saved[17]; /* saved RCX: SYSCALL return RIP */
+        changed=true;
+    }
+    if(saved[19])frame[4]=saved[19]|0x202ULL;  /* saved R11: user RFLAGS, keep ring3 IRQs enabled */
+    if(saved[20]&&frame[20]!=saved[20]){
+        frame[20]=saved[20]; /* iret RSP */
+        changed=true;
+    }
+    if(changed&&trace_count<96){
+        ++trace_count;
+        __boot_serial_puts("[sysret-frame-repair] pid=");
+        __boot_serial_putu32((uint32_t)cur->pid);
+        if(cur->name[0]){
+            __boot_serial_puts(" name=");
+            __boot_serial_puts(cur->name);
+        }
+        __boot_serial_puts(" rip=");
+        __boot_serial_puthex64(saved[17]);
+        __boot_serial_puts(" rsp=");
+        __boot_serial_puthex64(saved[20]);
+        __boot_serial_puts("\n");
+    }
+}
+
 void task_note_irq_user_context(uint64_t rip,uint64_t rsp,uint64_t frame_base){
     task_t *cur;
+    static uint32_t desktop_irq_sample_count;
+    static uint32_t desktop_irq_stride;
     (void)frame_base;
     if(g_current_task<0||g_current_task>=TASK_MAX)return;
     cur=&g_tasks[g_current_task];
@@ -1223,6 +1690,33 @@ void task_note_irq_user_context(uint64_t rip,uint64_t rsp,uint64_t frame_base){
     c2_capture_live_user_fsgs(cur);
     cur->ctx.rip=rip;
     cur->ctx.rsp=rsp;
+    if(task_is_desktop_runtime(cur)&&task_desktop_debug_trace_enabled()&&desktop_irq_sample_count<8u){
+        ++desktop_irq_stride;
+        if((desktop_irq_stride&0xFFu)==0u){
+            ++desktop_irq_sample_count;
+            __boot_serial_force_puts("[desktop-irq-sample!] #");
+            __boot_serial_force_putu32(desktop_irq_sample_count);
+            __boot_serial_force_puts(" pid=");
+            __boot_serial_force_putu32((uint32_t)cur->pid);
+            if(cur->name[0]){
+                __boot_serial_force_puts(" name=");
+                __boot_serial_force_puts(cur->name);
+            }
+            __boot_serial_force_puts(" state=");
+            __boot_serial_force_putu32((uint32_t)cur->state);
+            __boot_serial_force_puts(" ntp=");
+            __boot_serial_force_putu32(cur->no_timer_preempt?1u:0u);
+            __boot_serial_force_puts(" rip=");
+            __boot_serial_force_puthex64(rip);
+            __boot_serial_force_puts(" rsp=");
+            __boot_serial_force_puthex64(rsp);
+            __boot_serial_force_puts(" fs=");
+            __boot_serial_force_puthex64(cur->ctx.fs_base);
+            __boot_serial_force_puts("\n");
+            compat3_debug_wayfire_addr_mapping(cur,rip,"desktop-irq-rip");
+            compat3_debug_wayfire_stack_mapping(cur,rsp,"desktop-irq-sp");
+        }
+    }
 }
 
 void task_restore_current_user_msrs(void){
@@ -1299,6 +1793,96 @@ static bool task_is_browser_runtime(const task_t *t){
     return false;
 }
 
+static bool task_is_wayfire_runtime(const task_t *t){
+    if(!t)return false;
+    if(c2_has_token(t->exec_path,"/opt/wayfire/")||
+       c2_has_token(t->exec_path,"/opt/hyprland/")||
+       c2_has_token(t->exec_path,"/Hyprland")||
+       c2_has_token(t->exec_path,"/hyprland")||
+       c2_has_token(t->exec_path,"/start-hyprland")||
+       c2_has_token(t->exec_path,"/hyprctl")||
+       c2_has_token(t->exec_path,"/hyprpaper")||
+       c2_has_token(t->exec_path,"/hypridle")||
+       c2_has_token(t->exec_path,"/hyprlock")||
+       c2_has_token(t->exec_path,"/nwg-dock-hyprland")||
+       c2_has_token(t->exec_path,"/xdg-desktop-portal-hyprland")||
+       c2_has_token(t->exec_path,"/xdg-document-portal")||
+       c2_has_token(t->exec_path,"/xdg-permission-store")||
+       c2_has_token(t->exec_path,"/wayfire")||
+       c2_has_token(t->exec_path,"/wf-")||
+       c2_has_token(t->exec_path,"/wf-shell")||
+       c2_has_token(t->exec_path,"/ridux-ui-shell")||
+       c2_has_token(t->exec_path,"/injury-compositor")||
+       c2_has_token(t->exec_path,"/injury-shell")||
+       c2_has_token(t->exec_path,"/ridux-panel")||
+       c2_has_token(t->exec_path,"/waybar")||
+       c2_has_token(t->exec_path,"/pipewire")||
+       c2_has_token(t->exec_path,"/wireplumber")||
+       c2_has_token(t->exec_path,"/xdg-desktop-portal")||
+       c2_has_token(t->exec_path,"/swaync")||
+       c2_has_token(t->exec_path,"/thunar"))return true;
+    if(c2_has_token(t->name,"wayfire")||
+       c2_has_token(t->name,"Hyprland")||
+       c2_has_token(t->name,"hyprland")||
+       c2_has_token(t->name,"start-hyprland")||
+       c2_has_token(t->name,"hyprctl")||
+       c2_has_token(t->name,"hyprpaper")||
+       c2_has_token(t->name,"hypridle")||
+       c2_has_token(t->name,"hyprlock")||
+       c2_has_token(t->name,"nwg-dock-hyprland")||
+       c2_has_token(t->name,"xdg-desktop-portal-hyprland")||
+       c2_has_token(t->name,"xdg-document-portal")||
+       c2_has_token(t->name,"xdg-permission-store")||
+       c2_has_token(t->name,"wf-")||
+       c2_has_token(t->name,"wf-shell")||
+       c2_has_token(t->name,"ridux-ui-shell")||
+       c2_has_token(t->name,"injury-compositor")||
+       c2_has_token(t->name,"injury-shell")||
+       c2_has_token(t->name,"ridux-panel")||
+       c2_has_token(t->name,"waybar")||
+       c2_has_token(t->name,"pipewire")||
+       c2_has_token(t->name,"wireplumber")||
+       c2_has_token(t->name,"xdg-desktop-portal")||
+       c2_has_token(t->name,"swaync")||
+       c2_has_token(t->name,"thunar"))return true;
+    return false;
+}
+
+static bool task_is_desktop_runtime(const task_t *t){
+    if(task_is_wayfire_runtime(t))return true;
+    if(!t)return false;
+    if(c2_has_token(t->exec_path,"/ridux-qt-")||
+       c2_has_token(t->exec_path,"/pipewire")||
+       c2_has_token(t->exec_path,"/wireplumber")||
+       c2_has_token(t->exec_path,"/xdg-desktop-portal")||
+       c2_has_token(t->exec_path,"/xdg-document-portal")||
+       c2_has_token(t->exec_path,"/xdg-permission-store")||
+       c2_has_token(t->exec_path,"/swaync")||
+       c2_has_token(t->exec_path,"/wofi")||
+       c2_has_token(t->exec_path,"/foot")||
+       c2_has_token(t->exec_path,"/wlogout")||
+       c2_has_token(t->exec_path,"/wdisplays"))return true;
+    if(c2_has_token(t->name,"ridux-qt-")||
+       c2_has_token(t->name,"pipewire")||
+       c2_has_token(t->name,"wireplumber")||
+       c2_has_token(t->name,"xdg-desktop-portal")||
+       c2_has_token(t->name,"xdg-document-portal")||
+       c2_has_token(t->name,"xdg-permission-store")||
+       c2_has_token(t->name,"swaync")||
+       c2_has_token(t->name,"wofi")||
+       c2_has_token(t->name,"foot")||
+       c2_has_token(t->name,"wlogout")||
+       c2_has_token(t->name,"wdisplays"))return true;
+    return false;
+}
+
+static bool task_desktop_debug_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0)cached=(kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                        kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    return cached!=0;
+}
+
 static bool task_has_runnable_browser_peer(const task_t *cur){
     int i;
     if(!cur||!cur->addr_space)return false;
@@ -1312,6 +1896,20 @@ static bool task_has_runnable_browser_peer(const task_t *cur){
         if(t->tgid&&t->tgid==cur->tgid)return true;
         if(t->ppid==cur->pid||cur->ppid==t->pid)return true;
         if(t->pgid&&t->pgid==cur->pgid&&task_is_browser_runtime(cur))return true;
+    }
+    return false;
+}
+
+static bool task_has_runnable_desktop_peer(const task_t *cur){
+    int i;
+    if(!cur)return false;
+    for(i=0;i<TASK_MAX;++i){
+        const task_t *t=&g_tasks[i];
+        if(!t->used||t==cur)continue;
+        if(t->state!=TASK_RUNNABLE||t->ctx.cs!=0x28)continue;
+        if(t->addr_space&&t->addr_space==cur->addr_space)return true;
+        if(t->tgid&&cur->tgid&&t->tgid==cur->tgid)return true;
+        if(task_is_desktop_runtime(t))return true;
     }
     return false;
 }
@@ -1330,29 +1928,94 @@ static bool task_browser_syscall_can_yield(uint64_t nr){
     }
 }
 
+static bool task_desktop_syscall_should_coop_yield(uint64_t nr){
+    switch(nr){
+        case 7:   /* poll */
+        case 23:  /* select */
+        case 24:  /* sched_yield */
+        case 35:  /* nanosleep */
+        case 43:  /* accept */
+        case 45:  /* recvfrom */
+        case 47:  /* recvmsg */
+        case 61:  /* wait4 */
+        case 202: /* futex */
+        case 230: /* clock_nanosleep */
+        case 232: /* epoll_wait */
+        case 270: /* pselect6 */
+        case 271: /* ppoll */
+        case 281: /* epoll_pwait */
+            return true;
+        default:
+            return false;
+    }
+}
+
 void task_browser_coop_yield_after_syscall(uint64_t nr){
     task_t *cur;
+    bool is_browser;
+    bool is_desktop;
     static uint32_t coop_count=0;
     static uint32_t trace_count=0;
+    static uint32_t desktop_coop_count=0;
+    static uint32_t desktop_trace_count=0;
     if(g_current_task<0||g_current_task>=TASK_MAX)return;
     cur=&g_tasks[g_current_task];
     if(!cur->used||cur->state!=TASK_RUNNING||cur->ctx.cs!=0x28)return;
-    if(!cur->no_timer_preempt||!task_is_browser_runtime(cur))return;
-    /* clone/exit/futex waits already have delicate ordering or their own
-     * blocking schedule path. Yielding after ordinary syscalls is enough to
-     * give GTK/X11/IPC workers airtime without async timer preemption in
-     * the middle of mozjemalloc/libxul code. */
-    if(!task_browser_syscall_can_yield(nr))return;
-    if(!task_has_runnable_browser_peer(cur))return;
-    ++coop_count;
-    if(trace_count<64){
-        ++trace_count;
-        __boot_serial_puts("[browser-coop-yield] pid=");
+    is_browser=task_is_browser_runtime(cur);
+    is_desktop=task_is_desktop_runtime(cur);
+    if(is_browser&&!task_browser_syscall_can_yield(nr))return;
+    if(cur->no_timer_preempt&&is_browser){
+        /* clone/exit/futex waits already have delicate ordering or their own
+         * blocking schedule path. Yielding after ordinary syscalls is enough to
+         * give GTK/X11/IPC workers airtime without async timer preemption in
+         * the middle of mozjemalloc/libxul code. */
+        if(!task_has_runnable_browser_peer(cur))return;
+        ++coop_count;
+        if(trace_count<64){
+            ++trace_count;
+            __boot_serial_puts("[browser-coop-yield] pid=");
+            __boot_serial_putu32((uint32_t)cur->pid);
+            __boot_serial_puts(" nr=");
+            __boot_serial_putu32((uint32_t)nr);
+            __boot_serial_puts(" count=");
+            __boot_serial_putu32(coop_count);
+            __boot_serial_puts("\n");
+        }
+        task_schedule();
+        return;
+    }
+    if(cur->no_timer_preempt&&is_desktop){
+        static uint32_t desktop_loader_skip_count=0;
+        if(task_desktop_debug_trace_enabled()&&desktop_loader_skip_count<64){
+            ++desktop_loader_skip_count;
+            __boot_serial_puts("[desktop-loader-coop-skip] pid=");
+            __boot_serial_putu32((uint32_t)cur->pid);
+            if(cur->name[0]){
+                __boot_serial_puts(" name=");
+                __boot_serial_puts(cur->name);
+            }
+            __boot_serial_puts(" nr=");
+            __boot_serial_putu32((uint32_t)nr);
+            __boot_serial_puts("\n");
+        }
+        return;
+    }
+    if(!is_desktop)return;
+    if(!task_desktop_syscall_should_coop_yield(nr))return;
+    if(!task_has_runnable_desktop_peer(cur))return;
+    ++desktop_coop_count;
+    if(task_desktop_debug_trace_enabled()&&desktop_trace_count<96){
+        ++desktop_trace_count;
+        __boot_serial_puts("[desktop-coop-yield] pid=");
         __boot_serial_putu32((uint32_t)cur->pid);
+        if(cur->name[0]){
+            __boot_serial_puts(" name=");
+            __boot_serial_puts(cur->name);
+        }
         __boot_serial_puts(" nr=");
         __boot_serial_putu32((uint32_t)nr);
         __boot_serial_puts(" count=");
-        __boot_serial_putu32(coop_count);
+        __boot_serial_putu32(desktop_coop_count);
         __boot_serial_puts("\n");
     }
     task_schedule();
@@ -1367,6 +2030,8 @@ int task_create(const char *name,uint64_t entry,bool is_user){
     t->fdt_group=t->pid;
     t->pgid=t->pid; t->sid=g_tasks[g_current_task].sid;
     t->state=TASK_RUNNABLE; t->nice=0;
+    t->uid=g_tasks[g_current_task].uid; t->euid=g_tasks[g_current_task].euid; t->suid=g_tasks[g_current_task].suid;
+    t->gid=g_tasks[g_current_task].gid; t->egid=g_tasks[g_current_task].egid; t->sgid=g_tasks[g_current_task].sgid;
     t->no_timer_preempt=g_tasks[g_current_task].no_timer_preempt;
     c2_strlcpy(t->name,name,TASK_NAME_LEN);
     c2_strlcpy(t->cwd,g_tasks[g_current_task].cwd,128);
@@ -1409,12 +2074,44 @@ int task_create_user_shell(const char *name,uint64_t entry){
     t->fdt_group=t->pid;
     t->pgid=t->pid; t->sid=g_tasks[g_current_task].sid;
     t->state=TASK_RUNNABLE; t->nice=0;
+    t->uid=g_tasks[g_current_task].uid; t->euid=g_tasks[g_current_task].euid; t->suid=g_tasks[g_current_task].suid;
+    t->gid=g_tasks[g_current_task].gid; t->egid=g_tasks[g_current_task].egid; t->sgid=g_tasks[g_current_task].sgid;
     t->no_timer_preempt=g_tasks[g_current_task].no_timer_preempt;
     c2_strlcpy(t->name,name,TASK_NAME_LEN);
     c2_strlcpy(t->cwd,g_tasks[g_current_task].cwd,128);
     t->kernel_stack=g_kstacks[i];
     t->kernel_stack_top=(uint64_t)(uintptr_t)(g_kstacks[i]+TASK_KERNEL_STACK);
     t->addr_space=paging_create_address_space();
+    t->ctx.cs=0x28; t->ctx.ss=0x30;
+    t->ctx.rflags=0x200;
+    t->ctx.rsp=0;
+    t->ctx.rip=entry;
+    fpu_init_state(t->fpu_state); t->fpu_used=false;
+    t->brk_start=0x800000ULL; t->brk_current=0x800000ULL; t->mmap_base=0x40000000ULL;
+    c2_memcpy(&t->fdt,&g_tasks[g_current_task].fdt,sizeof(fd_table_t));
+    {int f;for(f=0;f<TASK_FD_MAX;++f)if(t->fdt.fds[f].kind!=FDKIND_NONE)t->fdt.fds[f].refcount++;}
+    {int s;for(s=0;s<NSIG;++s)t->sigactions[s].handler=SIG_DFL;}
+    return t->pid;
+}
+
+int task_create_user_thread(const char *name,uint64_t entry,address_space_t *shared_as){
+    int i; task_t *t=0;
+    if(!shared_as||shared_as==paging_get_kernel_space())return -EINVAL;
+    for(i=1;i<TASK_MAX;++i)if(!g_tasks[i].used){t=&g_tasks[i];break;}
+    if(!t)return -EAGAIN;
+    c2_memset(t,0,sizeof(*t));
+    t->used=true; t->pid=g_task_next_pid++; t->tgid=t->pid; t->ppid=g_tasks[g_current_task].pid;
+    t->fdt_group=t->pid;
+    t->pgid=t->pid; t->sid=g_tasks[g_current_task].sid;
+    t->state=TASK_RUNNABLE; t->nice=0;
+    t->uid=g_tasks[g_current_task].uid; t->euid=g_tasks[g_current_task].euid; t->suid=g_tasks[g_current_task].suid;
+    t->gid=g_tasks[g_current_task].gid; t->egid=g_tasks[g_current_task].egid; t->sgid=g_tasks[g_current_task].sgid;
+    t->no_timer_preempt=g_tasks[g_current_task].no_timer_preempt;
+    c2_strlcpy(t->name,name,TASK_NAME_LEN);
+    c2_strlcpy(t->cwd,g_tasks[g_current_task].cwd,128);
+    t->kernel_stack=g_kstacks[i];
+    t->kernel_stack_top=(uint64_t)(uintptr_t)(g_kstacks[i]+TASK_KERNEL_STACK);
+    t->addr_space=shared_as;
     t->ctx.cs=0x28; t->ctx.ss=0x30;
     t->ctx.rflags=0x200;
     t->ctx.rsp=0;
@@ -1470,6 +2167,48 @@ int task_fork(int parent_pid){
     return c->pid;
 }
 
+extern void clone3_entry_trampoline(void);
+
+static bool task_kernel_text_ret(uint64_t ret){
+    return ret>=0x100000ULL&&ret<0x4000000ULL;
+}
+
+static bool task_kernel_rsp_frame_valid(const task_t *t,uint64_t *ret_out){
+    uint64_t rsp,base,top,ret;
+    if(ret_out)*ret_out=0;
+    if(!t||!t->used||!t->kernel_stack)return false;
+    rsp=t->kernel_rsp_saved;
+    base=(uint64_t)(uintptr_t)t->kernel_stack;
+    top=t->kernel_stack_top;
+    if(rsp<base||rsp+64ULL>top)return false;
+    ret=((uint64_t*)(uintptr_t)rsp)[7];
+    if(ret_out)*ret_out=ret;
+    if(t->needs_first_launch)return ret==(uint64_t)(uintptr_t)clone3_entry_trampoline;
+    return task_kernel_text_ret(ret);
+}
+
+static bool task_schedulable_user_frame(int idx){
+    uint64_t ret=0;
+    if(idx<0||idx>=TASK_MAX)return false;
+    if(!g_tasks[idx].used||g_tasks[idx].ctx.cs!=0x28)return false;
+    return task_kernel_rsp_frame_valid(&g_tasks[idx],&ret);
+}
+
+static int task_index_from_ptr(const task_t *t){
+    if(!t||t<g_tasks||t>=g_tasks+TASK_MAX)return -1;
+    return (int)(t-g_tasks);
+}
+
+bool task_make_runnable(int task_index){
+    if(task_index<0||task_index>=TASK_MAX)return false;
+    if(!g_tasks[task_index].used)return false;
+    if(g_tasks[task_index].state==TASK_ZOMBIE||g_tasks[task_index].state==TASK_FREE)return false;
+    if(g_tasks[task_index].ctx.cs==0x28&&!task_schedulable_user_frame(task_index))return false;
+    g_tasks[task_index].sleep_until=0;
+    g_tasks[task_index].state=TASK_RUNNABLE;
+    return true;
+}
+
 void task_exit(int pid,int code){
     int i;
     static uint32_t force_task_exit_trace_count;
@@ -1496,20 +2235,21 @@ void task_exit(int pid,int code){
                              * the exiting thread owns the CPU. Treat it as a
                              * stale runnable survivor so thread teardown can
                              * return to the process reliably. */
-                            g_tasks[si].state=TASK_RUNNABLE;
+                            if(task_schedulable_user_frame(si)){
+                                g_tasks[si].state=TASK_RUNNABLE;
+                                runnable_user_survivor=true;
+                            }
+                        }else if(g_tasks[si].state==TASK_RUNNABLE&&task_schedulable_user_frame(si)){
                             runnable_user_survivor=true;
-                        }else if(g_tasks[si].state==TASK_RUNNABLE){
-                            runnable_user_survivor=true;
-                        }else if(g_tasks[si].state==TASK_SLEEPING&&first_sleeping_survivor<0){
+                        }else if(g_tasks[si].state==TASK_SLEEPING&&first_sleeping_survivor<0&&task_schedulable_user_frame(si)){
                             first_sleeping_survivor=si;
                         }
                     }
                 }
                 if(shared_user_survivor&&!runnable_user_survivor&&first_sleeping_survivor>=0){
-                    g_tasks[first_sleeping_survivor].state=TASK_RUNNABLE;
-                    g_tasks[first_sleeping_survivor].sleep_until=0;
+                    task_make_runnable(first_sleeping_survivor);
                 }
-                if(g_task_exit_sibling_trace<16){
+                if((code!=0||task_desktop_debug_trace_enabled())&&g_task_exit_sibling_trace<16){
                     ++g_task_exit_sibling_trace;
                     __boot_serial_puts("[exit-sibs] cur=");
                     __boot_serial_putu32((uint32_t)g_tasks[i].pid);
@@ -1533,7 +2273,7 @@ void task_exit(int pid,int code){
                 }
                 if(!shared_user_survivor)g_user_foreground_active=false;
             }
-            if(force_task_exit_trace_count<128u||code!=0){
+            if(code!=0||(task_desktop_debug_trace_enabled()&&force_task_exit_trace_count<128u)){
                 ++force_task_exit_trace_count;
                 __boot_serial_force_puts("[task-exit!] pid=");
                 __boot_serial_force_putu32((uint32_t)g_tasks[i].pid);
@@ -1556,8 +2296,7 @@ void task_exit(int pid,int code){
                     if(g_tasks[j].state==TASK_SLEEPING){
                         int want=g_tasks[j].wait_pid;
                         if(want==-1||want==0||want==pid||(want<-1&&g_tasks[i].pgid==-want)){
-                            g_tasks[j].state=TASK_RUNNABLE;
-                            g_tasks[j].wait_pid=0;
+                            if(task_make_runnable(j))g_tasks[j].wait_pid=0;
                         }
                     }
                     break;
@@ -1628,34 +2367,67 @@ int task_waitpid(int pid,int *status,int options){
 
 extern void context_switch_kstack(uint64_t *old_rsp_save, uint64_t new_rsp);
 
+static void task_reject_bad_kstack(int idx,uint64_t ret){
+    static uint32_t trace_count;
+    task_t *t;
+    if(idx<0||idx>=TASK_MAX)return;
+    t=&g_tasks[idx];
+    if(trace_count<64){
+        ++trace_count;
+        __boot_serial_force_puts("[sched-bad-ksp!] pid=");
+        __boot_serial_force_putu32((uint32_t)t->pid);
+        __boot_serial_force_puts(" st=");
+        __boot_serial_force_putu32((uint32_t)t->state);
+        __boot_serial_force_puts(" ksp=");
+        __boot_serial_force_puthex64(t->kernel_rsp_saved);
+        __boot_serial_force_puts(" ret=");
+        __boot_serial_force_puthex64(ret);
+        __boot_serial_force_puts(" kb=");
+        __boot_serial_force_puthex64((uint64_t)(uintptr_t)t->kernel_stack);
+        __boot_serial_force_puts(" kt=");
+        __boot_serial_force_puthex64(t->kernel_stack_top);
+        if(t->name[0]){
+            __boot_serial_force_puts(" name=");
+            __boot_serial_force_puts(t->name);
+        }
+        __boot_serial_force_puts("\n");
+    }
+    t->state=TASK_ZOMBIE;
+    t->exit_code=0x7f;
+}
+
 static void task_wake_due_sleepers(void){
     uint64_t now=rdtsc();
     int i;
     for(i=0;i<TASK_MAX;++i){
         if(g_tasks[i].used&&g_tasks[i].state==TASK_SLEEPING&&g_tasks[i].sleep_until&&now>=g_tasks[i].sleep_until){
-            g_tasks[i].state=TASK_RUNNABLE;
-            g_tasks[i].sleep_until=0;
+            task_make_runnable(i);
         }
     }
 }
 
 void task_schedule(void){
-    int i,next=-1,start=(g_current_task+1)%TASK_MAX;
+    int i,next=-1,start;
     int prev;
     uint64_t irq_flags=0;
     static uint32_t sched_trace_count=0;
+    static uint32_t sched_pick_trace_count=0;
     __asm__ volatile("pushfq; popq %0; cli":"=r"(irq_flags)::"memory");
 #define TASK_SCHEDULE_RESTORE_IRQ() do{if(irq_flags&0x200ULL)__asm__ volatile("sti":::"memory");}while(0)
+    task_recover_current_index("schedule-entry");
+    start=(g_current_task+1)%TASK_MAX;
     task_wake_due_sleepers();
+select_next:
+    next=-1;
     /* Simple round-robin */
     for(i=0;i<TASK_MAX;++i){
         int idx=(start+i)%TASK_MAX;
-        if(g_tasks[idx].used&&g_tasks[idx].state==TASK_RUNNABLE&&g_tasks[idx].needs_first_launch){next=idx;break;}
+        if(g_tasks[idx].used&&g_tasks[idx].ctx.cs==0x28&&g_tasks[idx].state==TASK_RUNNABLE&&g_tasks[idx].needs_first_launch){next=idx;break;}
     }
     for(i=0;i<TASK_MAX;++i){
         int idx=(start+i)%TASK_MAX;
         if(next>=0)break;
-        if(g_tasks[idx].used&&g_tasks[idx].state==TASK_RUNNABLE){next=idx;break;}
+        if(g_tasks[idx].used&&g_tasks[idx].ctx.cs==0x28&&g_tasks[idx].state==TASK_RUNNABLE){next=idx;break;}
     }
     if(next<0&&(g_current_task<0||g_current_task>=TASK_MAX||g_tasks[g_current_task].state!=TASK_RUNNING)){
         for(i=0;i<TASK_MAX;++i){
@@ -1663,9 +2435,10 @@ void task_schedule(void){
             if(idx==g_current_task)continue;
             if(g_tasks[idx].ctx.cs!=0x28)continue;
             if(g_tasks[idx].used&&g_tasks[idx].state==TASK_RUNNING){
-                g_tasks[idx].state=TASK_RUNNABLE;
-                next=idx;
-                break;
+                if(task_make_runnable(idx)){
+                    next=idx;
+                    break;
+                }
             }
         }
     }
@@ -1679,13 +2452,39 @@ void task_schedule(void){
         TASK_SCHEDULE_RESTORE_IRQ();
         return;
     }
+    {
+        uint64_t next_ret=0;
+        if(!task_kernel_rsp_frame_valid(&g_tasks[next],&next_ret)){
+            task_reject_bad_kstack(next,next_ret);
+            goto select_next;
+        }
+        if(task_desktop_debug_trace_enabled()&&sched_pick_trace_count<24&&
+           task_is_desktop_runtime(&g_tasks[next])){
+            ++sched_pick_trace_count;
+            __boot_serial_force_puts("[sched-pick!] prev=");
+            __boot_serial_force_putu32((uint32_t)g_tasks[g_current_task].pid);
+            __boot_serial_force_puts(" next=");
+            __boot_serial_force_putu32((uint32_t)g_tasks[next].pid);
+            __boot_serial_force_puts(" st=");
+            __boot_serial_force_putu32((uint32_t)g_tasks[next].state);
+            __boot_serial_force_puts(" first=");
+            __boot_serial_force_putu32(g_tasks[next].needs_first_launch?1u:0u);
+            __boot_serial_force_puts(" ksp=");
+            __boot_serial_force_puthex64(g_tasks[next].kernel_rsp_saved);
+            __boot_serial_force_puts(" ret=");
+            __boot_serial_force_puthex64(next_ret);
+            if(g_tasks[next].name[0]){
+                __boot_serial_force_puts(" name=");
+                __boot_serial_force_puts(g_tasks[next].name);
+            }
+            __boot_serial_force_puts("\n");
+        }
+    }
     prev=g_current_task;
     {
         uint64_t msr_fs=c2_rdmsr(0xC0000100u);
-        bool trace=(sched_trace_count<64)&&
-                   (g_tasks[prev].pid==2||g_tasks[next].pid==2||
-                    g_tasks[prev].pid==10||g_tasks[next].pid==10||
-                    (g_tasks[prev].ctx.cs==0x28&&msr_fs!=g_tasks[prev].ctx.fs_base));
+        bool trace=(sched_trace_count<12)&&
+                   (g_tasks[prev].ctx.cs==0x28&&msr_fs!=g_tasks[prev].ctx.fs_base);
         if(trace){
             ++sched_trace_count;
             __boot_serial_puts("[sched-out] prev=");
@@ -1713,7 +2512,9 @@ void task_schedule(void){
      * these bases through arch_prctl() or CLONE_SETTLS, which update ctx. */
     /* Save FPU of outgoing task */
     fpu_save(&g_tasks[prev]);
-    g_tasks[prev].state=(g_tasks[prev].state==TASK_RUNNING)?TASK_RUNNABLE:g_tasks[prev].state;
+    if(g_tasks[prev].state==TASK_RUNNING){
+        g_tasks[prev].state=(g_tasks[prev].ctx.cs==0x28)?TASK_RUNNABLE:TASK_SLEEPING;
+    }
     g_current_task=next;
     g_tasks[next].state=TASK_RUNNING;
     g_kernel_preempt_disable=g_tasks[next].syscall_preempt_disable;
@@ -1723,8 +2524,8 @@ void task_schedule(void){
     c2_wrfsbase(g_tasks[next].ctx.fs_base);
     c2_wrmsr(0xC0000102u,g_tasks[next].ctx.gs_base); /* IA32_KERNEL_GS_BASE */
     c2_wrmsr(0xC0000101u,(uint64_t)(uintptr_t)&g_per_cpu); /* IA32_GS_BASE */
-    if(sched_trace_count<64&&(g_tasks[prev].pid==2||g_tasks[next].pid==2||
-                               g_tasks[prev].pid==10||g_tasks[next].pid==10)){
+    if(sched_trace_count<12&&g_tasks[next].ctx.cs==0x28&&
+       c2_rdmsr(0xC0000100u)!=g_tasks[next].ctx.fs_base){
         ++sched_trace_count;
         __boot_serial_puts("[sched-in] cur=");
         __boot_serial_putu32((uint32_t)g_tasks[next].pid);
@@ -1748,10 +2549,11 @@ void task_schedule(void){
      * the user TLS MSRs for the task that was just resumed; Chromium's
      * thread-heavy startup can otherwise continue a sleeping syscall with
      * the FS base left by the last fresh clone trampoline. */
-    if(g_current_task>=0&&g_current_task<TASK_MAX&&sched_trace_count<64){
+    task_recover_current_index("schedule-ret");
+    if(g_current_task>=0&&g_current_task<TASK_MAX&&sched_trace_count<12){
         uint64_t msr_fs=c2_rdmsr(0xC0000100u);
         task_t *cur=&g_tasks[g_current_task];
-        if(cur->used&&(cur->pid==2||cur->pid==10||msr_fs!=cur->ctx.fs_base)){
+        if(cur->used&&msr_fs!=cur->ctx.fs_base){
             ++sched_trace_count;
             __boot_serial_puts("[sched-ret] cur=");
             __boot_serial_putu32((uint32_t)cur->pid);
@@ -1763,13 +2565,14 @@ void task_schedule(void){
         }
     }
     task_restore_current_user_msrs();
+    task_recover_current_index("schedule-ret2");
     tss_set_rsp0(g_tasks[g_current_task].kernel_stack_top);
     g_per_cpu.user_rsp=g_tasks[g_current_task].ctx.rsp;
     if(g_tasks[g_current_task].addr_space)paging_switch(g_tasks[g_current_task].addr_space);
-    if(g_current_task>=0&&g_current_task<TASK_MAX&&sched_trace_count<64){
+    if(g_current_task>=0&&g_current_task<TASK_MAX&&sched_trace_count<12){
         uint64_t msr_fs=c2_rdmsr(0xC0000100u);
         task_t *cur=&g_tasks[g_current_task];
-        if(cur->used&&(cur->pid==2||cur->pid==10||msr_fs!=cur->ctx.fs_base)){
+        if(cur->used&&msr_fs!=cur->ctx.fs_base){
             ++sched_trace_count;
             __boot_serial_puts("[sched-ret2] cur=");
             __boot_serial_putu32((uint32_t)cur->pid);
@@ -1800,15 +2603,21 @@ extern void clone3_iretq_ctx(cpu_context_t *ctx);
 void clone3_enter_user(task_t *t) {
     if (!t || !t->used) { for(;;) __asm__ volatile("hlt"); }
     t->needs_first_launch = false;
-    __boot_serial_puts("[clone3] enter ring3 pid=");
-    __boot_serial_putu32((uint32_t)t->pid);
-    __boot_serial_puts(" rip=");
-    __boot_serial_puthex64(t->ctx.rip);
-    __boot_serial_puts(" rsp=");
-    __boot_serial_puthex64(t->ctx.rsp);
-    __boot_serial_puts(" rdi=");
-    __boot_serial_puthex64(t->ctx.rdi);
-    __boot_serial_puts("\n");
+    {
+        static uint32_t clone3_trace_count;
+        if(task_desktop_debug_trace_enabled()&&clone3_trace_count<64){
+            ++clone3_trace_count;
+            __boot_serial_puts("[clone3] enter ring3 pid=");
+            __boot_serial_putu32((uint32_t)t->pid);
+            __boot_serial_puts(" rip=");
+            __boot_serial_puthex64(t->ctx.rip);
+            __boot_serial_puts(" rsp=");
+            __boot_serial_puthex64(t->ctx.rsp);
+            __boot_serial_puts(" rdi=");
+            __boot_serial_puthex64(t->ctx.rdi);
+            __boot_serial_puts("\n");
+        }
+    }
     paging_switch(t->addr_space);
     tss_set_rsp0(t->kernel_stack_top);
     g_per_cpu.kernel_rsp = t->kernel_stack_top;
@@ -1893,47 +2702,61 @@ static void dump_gdt_to_serial(void) {
 
 void task_launch_to_user(task_t *t) {
     int idx;
+    bool trace_launch;
     if (!t || !t->used) {
         __boot_serial_puts("[launch] invalid task, aborting\n");
         return;
     }
     idx = (int)(t - g_tasks);
-    dump_gdt_to_serial();
-    __boot_serial_puts("[launch] -> pid=");
-    __boot_serial_putu32((uint32_t)t->pid);
-    __boot_serial_puts(" rip=");
-    __boot_serial_puthex64(t->ctx.rip);
-    __boot_serial_puts(" rsp=");
-    __boot_serial_puthex64(t->ctx.rsp);
-    __boot_serial_puts("\n");
+    trace_launch=task_desktop_debug_trace_enabled();
+    if(trace_launch){
+        dump_gdt_to_serial();
+        __boot_serial_puts("[launch] -> pid=");
+        __boot_serial_putu32((uint32_t)t->pid);
+        __boot_serial_puts(" rip=");
+        __boot_serial_puthex64(t->ctx.rip);
+        __boot_serial_puts(" rsp=");
+        __boot_serial_puthex64(t->ctx.rsp);
+        __boot_serial_puts("\n");
+    }
 
     /* Switch to the task's address space BEFORE dumping, so the bytes
      * we read reflect what the user will see (low identity may differ
      * if paging_map promoted huge pages). */
     paging_switch(t->addr_space);
-    {
-        const uint8_t *code = (const uint8_t *)(uintptr_t)t->ctx.rip;
-        int i;
-        __boot_serial_puts("[launch] bytes @ rip: ");
-        for (i = 0; i < 32; ++i) {
-            static const char *hex = "0123456789abcdef";
-            __boot_serial_putc(hex[(code[i] >> 4) & 0xF]);
-            __boot_serial_putc(hex[code[i] & 0xF]);
-            __boot_serial_putc(' ');
+    if(trace_launch){
+        {
+            const uint8_t *code = (const uint8_t *)(uintptr_t)t->ctx.rip;
+            int i;
+            __boot_serial_puts("[launch] bytes @ rip: ");
+            if (c2_user_bytes_present(t->addr_space, t->ctx.rip, 32)) {
+                for (i = 0; i < 32; ++i) {
+                    static const char *hex = "0123456789abcdef";
+                    __boot_serial_putc(hex[(code[i] >> 4) & 0xF]);
+                    __boot_serial_putc(hex[code[i] & 0xF]);
+                    __boot_serial_putc(' ');
+                }
+            } else {
+                __boot_serial_puts("unmapped");
+            }
+            __boot_serial_puts("\n");
         }
-        __boot_serial_puts("\n");
-    }
-    {
-        const uint8_t *sp = (const uint8_t *)(uintptr_t)t->ctx.rsp;
-        int i;
-        __boot_serial_puts("[launch] bytes @ rsp: ");
-        for (i = 0; i < 16; ++i) {
-            static const char *hex = "0123456789abcdef";
-            __boot_serial_putc(hex[(sp[i] >> 4) & 0xF]);
-            __boot_serial_putc(hex[sp[i] & 0xF]);
-            __boot_serial_putc(' ');
+        {
+            const uint8_t *sp = (const uint8_t *)(uintptr_t)t->ctx.rsp;
+            int i;
+            __boot_serial_puts("[launch] bytes @ rsp: ");
+            if (c2_user_bytes_present(t->addr_space, t->ctx.rsp, 16)) {
+                for (i = 0; i < 16; ++i) {
+                    static const char *hex = "0123456789abcdef";
+                    __boot_serial_putc(hex[(sp[i] >> 4) & 0xF]);
+                    __boot_serial_putc(hex[sp[i] & 0xF]);
+                    __boot_serial_putc(' ');
+                }
+            } else {
+                __boot_serial_puts("unmapped");
+            }
+            __boot_serial_puts("\n");
         }
-        __boot_serial_puts("\n");
     }
 
     /* Commit the target task as "current" so syscall handlers and
@@ -1966,7 +2789,7 @@ void task_launch_to_user(task_t *t) {
     fpu_restore(t);
 
     g_user_foreground_active=true;
-    __boot_serial_puts("[launch] iretq to ring 3 now\n");
+    if(trace_launch)__boot_serial_puts("[launch] iretq to ring 3 now\n");
     /* Does not return. */
     task_launch_to_user_asm(t->ctx.rip, t->ctx.rsp,
                             t->ctx.rflags ? t->ctx.rflags : 0x202ULL);
@@ -2013,7 +2836,7 @@ static void sig_default_action(task_t *t,int sig){
         case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU:
             t->state=TASK_STOPPED; break;
         case SIGCONT:
-            if(t->state==TASK_STOPPED)t->state=TASK_RUNNABLE;
+            if(t->state==TASK_STOPPED)task_make_runnable(task_index_from_ptr(t));
             break;
         case SIGCHLD: case SIGURG: case SIGWINCH: break; /* ignored */
         default: task_exit(t->pid,128+sig); break;
@@ -2046,8 +2869,8 @@ static void sig_enqueue(task_t *t,int sig){
     if(!t||sig<=0||sig>=NSIG)return;
     if(sig==SIGKILL||sig==SIGSTOP)sigset_del(&t->sig_blocked,sig);
     sigset_add(&t->sig_pending,sig);
-    if(sig==SIGCONT&&t->state==TASK_STOPPED)t->state=TASK_RUNNABLE;
-    if(t->state==TASK_SLEEPING)t->state=TASK_RUNNABLE;
+    if(sig==SIGCONT&&t->state==TASK_STOPPED)task_make_runnable(task_index_from_ptr(t));
+    if(t->state==TASK_SLEEPING)task_make_runnable(task_index_from_ptr(t));
 }
 
 static bool sig_target_match(task_t *t,int pid,int caller_pgid){
@@ -2133,23 +2956,36 @@ void sig_check_pending(task_t *t){
 
         /* Copy signal frame to user stack */
         user_frame = (sig_frame_t*)(uintptr_t)new_rsp;
-        /* We're in kernel context; the user stack pages are mapped
-         * in the task's address space. Since we're still using the
-         * kernel's identity map (low-half), we can write directly. */
-        c2_memcpy(user_frame, &frame, sizeof(sig_frame_t));
+        if(!c2_user_copy_out_task(t,new_rsp,&frame,sizeof(sig_frame_t),"sig-frame")){
+            __boot_serial_puts("[sig-deliver-fail] frame pid=");
+            __boot_serial_putu32((uint32_t)t->pid);
+            __boot_serial_puts(" sig=");
+            __boot_serial_putu32((uint32_t)s);
+            __boot_serial_puts("\n");
+            sig_default_action(t,SIGSEGV);
+            return;
+        }
 
         /* Write sigreturn trampoline at user_frame + sizeof(sig_frame_t).
          * Machine code: mov $15, %rax (2 bytes: 48 c7 c0 0f 00 00 00)
          *               syscall     (2 bytes: 0f 05)
          * Total: 7 bytes, padded to 8. */
         {
-            uint8_t *tramp = (uint8_t*)(uintptr_t)(new_rsp + sizeof(sig_frame_t));
-            /* mov eax, 15  ->  b8 0f 00 00 00 */
-            tramp[0] = 0xB8; tramp[1] = 0x0F; tramp[2] = 0x00;
-            tramp[3] = 0x00; tramp[4] = 0x00;
-            /* syscall -> 0F 05 */
-            tramp[5] = 0x0F; tramp[6] = 0x05;
-            tramp[7] = 0xC3; /* nop/ret safety */
+            static const uint8_t tramp[SIGRETURN_TRAMP_SIZE] = {
+                0xB8, 0x0F, 0x00, 0x00, 0x00, /* mov eax, 15 */
+                0x0F, 0x05,                   /* syscall */
+                0xC3                          /* ret safety */
+            };
+            if(!c2_user_copy_out_task(t,new_rsp+sizeof(sig_frame_t),
+                                      tramp,sizeof(tramp),"sig-tramp")){
+                __boot_serial_puts("[sig-deliver-fail] tramp pid=");
+                __boot_serial_putu32((uint32_t)t->pid);
+                __boot_serial_puts(" sig=");
+                __boot_serial_putu32((uint32_t)s);
+                __boot_serial_puts("\n");
+                sig_default_action(t,SIGSEGV);
+                return;
+            }
         }
 
         /* Update task state to jump to signal handler on next return */
@@ -2168,9 +3004,18 @@ void sig_check_pending(task_t *t){
          * We push it manually: */
         {
             uint64_t ret_addr = new_rsp + sizeof(sig_frame_t);
+            uint64_t ret_slot = new_rsp - 8;
             /* Push return address onto the user stack */
-            t->ctx.rsp -= 8;
-            *(uint64_t*)(uintptr_t)t->ctx.rsp = ret_addr;
+            if(!c2_user_copy_out_task(t,ret_slot,&ret_addr,sizeof(ret_addr),"sig-ret")){
+                __boot_serial_puts("[sig-deliver-fail] ret pid=");
+                __boot_serial_putu32((uint32_t)t->pid);
+                __boot_serial_puts(" sig=");
+                __boot_serial_putu32((uint32_t)s);
+                __boot_serial_puts("\n");
+                sig_default_action(t,SIGSEGV);
+                return;
+            }
+            t->ctx.rsp = ret_slot;
         }
 
         /* Update signal mask state */
@@ -2183,6 +3028,53 @@ void sig_check_pending(task_t *t){
         if(sa_flags & SA_RESETHAND) t->sigactions[s].handler = SIG_DFL;
         break;
     }
+}
+
+int64_t sig_restore_context(task_t *t){
+    sig_frame_t frame;
+    uint64_t frame_addr;
+    uint64_t flags;
+    uint64_t *sf;
+    if(!t||!t->used)return -ESRCH;
+    frame_addr=t->ctx.rsp;
+    if(!c2_user_copy_in_task(t,&frame,frame_addr,sizeof(frame),"sigreturn-frame")){
+        __boot_serial_puts("[sigreturn-fail] pid=");
+        __boot_serial_putu32((uint32_t)t->pid);
+        __boot_serial_puts(" rsp=");
+        __boot_serial_puthex64(frame_addr);
+        __boot_serial_puts("\n");
+        sig_default_action(t,SIGSEGV);
+        return -EFAULT;
+    }
+
+    flags=frame.eflags|0x202ULL;
+    t->ctx.rax=frame.rax;  t->ctx.rbx=frame.rbx;
+    t->ctx.rcx=frame.rcx;  t->ctx.rdx=frame.rdx;
+    t->ctx.rsi=frame.rsi;  t->ctx.rdi=frame.rdi;
+    t->ctx.rbp=frame.rbp;
+    t->ctx.r8 =frame.r8;   t->ctx.r9 =frame.r9;
+    t->ctx.r10=frame.r10;  t->ctx.r11=frame.r11;
+    t->ctx.r12=frame.r12;  t->ctx.r13=frame.r13;
+    t->ctx.r14=frame.r14;  t->ctx.r15=frame.r15;
+    t->ctx.rip=frame.rip;
+    t->ctx.rsp=frame.rsp;
+    t->ctx.rflags=flags;
+    t->sig_blocked.sig[0]=frame.sigmask_sig[0];
+    t->sig_blocked.sig[1]=frame.sigmask_sig[1];
+    t->sig_in_handler=false;
+    t->last_signal=0;
+
+    sf=t->syscall_user_frame_copy;
+    sf[0]=frame.r15; sf[1]=frame.r14; sf[2]=frame.r13; sf[3]=frame.r12;
+    sf[4]=flags;     sf[5]=frame.r10; sf[6]=frame.r9;  sf[7]=frame.r8;
+    sf[8]=frame.rbp; sf[9]=frame.rdi; sf[10]=frame.rsi; sf[11]=frame.rdx;
+    sf[12]=frame.rip; sf[13]=frame.rbx; sf[14]=frame.rax;
+    sf[15]=0; sf[16]=0;
+    sf[17]=frame.rip; sf[18]=0x2B; sf[19]=flags; sf[20]=frame.rsp; sf[21]=0x33;
+    t->syscall_user_frame=sf;
+    t->syscall_user_frame_valid=true;
+
+    return (int64_t)frame.rax;
 }
 
 /* Process groups / sessions */
@@ -2314,6 +3206,28 @@ int tty_write(tty_device_t *tty,const void *buf,size_t count){
 #define TIOCSPGRP  0x5410
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
+#define TIOCSCTTY  0x540E
+#define TIOCNOTTY  0x5422
+
+#define KDSETMODE  0x4B3A
+#define KDGETMODE  0x4B3B
+#define KDGKBMODE  0x4B44
+#define KDSKBMODE  0x4B45
+
+#define KD_TEXT     0
+#define KD_GRAPHICS 1
+#define K_XLATE     0
+
+#define VT_OPENQRY    0x5600
+#define VT_GETMODE    0x5601
+#define VT_SETMODE    0x5602
+#define VT_GETSTATE   0x5603
+#define VT_RELDISP    0x5605
+#define VT_ACTIVATE   0x5606
+#define VT_WAITACTIVE 0x5607
+
+#define VT_AUTO    0
+#define VT_PROCESS 1
 
 typedef struct{uint16_t ws_row,ws_col,ws_xpixel,ws_ypixel;} winsize_t;
 typedef struct{
@@ -2325,7 +3239,26 @@ typedef struct{
     uint8_t  c_cc[19];
 } linux_termios_abi_t;
 
+typedef struct{
+    uint8_t  mode;
+    uint8_t  waitv;
+    int16_t  relsig;
+    int16_t  acqsig;
+    int16_t  frsig;
+} linux_vt_mode_abi_t;
+
+typedef struct{
+    uint16_t v_active;
+    uint16_t v_signal;
+    uint16_t v_state;
+} linux_vt_stat_abi_t;
+
 #define LINUX_B38400 0000017u
+
+static int g_tty_kd_mode=KD_TEXT;
+static int g_tty_kbd_mode=K_XLATE;
+static uint16_t g_tty_active_vt=1;
+static linux_vt_mode_abi_t g_tty_vt_mode={VT_AUTO,0,0,0,0};
 
 static void tty_export_linux_termios(tty_device_t *tty,linux_termios_abi_t *lt){
     size_t i;
@@ -2351,10 +3284,52 @@ int tty_ioctl(tty_device_t *tty,uint64_t req,void *arg){
     switch((uint32_t)req){
         case TCGETS: if(arg){linux_termios_abi_t lt;tty_export_linux_termios(tty,&lt);c2_memcpy(arg,&lt,sizeof(lt));}return 0;
         case TCSETS:case TCSETSW:case TCSETSF: if(arg){linux_termios_abi_t lt;c2_memcpy(&lt,arg,sizeof(lt));tty_import_linux_termios(tty,&lt);}return 0;
+        case TIOCSCTTY: return 0;
+        case TIOCNOTTY: return 0;
         case TIOCGPGRP: if(arg)*(int*)arg=tty->fg_pgid;return 0;
         case TIOCSPGRP: if(arg)tty->fg_pgid=*(int*)arg;return 0;
         case TIOCGWINSZ: if(arg){winsize_t *ws=(winsize_t*)arg;ws->ws_row=tty->rows;ws->ws_col=tty->cols;ws->ws_xpixel=0;ws->ws_ypixel=0;}return 0;
         case TIOCSWINSZ: if(arg){winsize_t *ws=(winsize_t*)arg;tty->rows=ws->ws_row;tty->cols=ws->ws_col;}return 0;
+        case KDGETMODE:
+            if(arg)*(int*)arg=g_tty_kd_mode;
+            return 0;
+        case KDSETMODE:
+            g_tty_kd_mode=(int)(uintptr_t)arg;
+            if(g_tty_kd_mode!=KD_TEXT&&g_tty_kd_mode!=KD_GRAPHICS)g_tty_kd_mode=KD_TEXT;
+            return 0;
+        case KDGKBMODE:
+            if(arg)*(int*)arg=g_tty_kbd_mode;
+            return 0;
+        case KDSKBMODE:
+            g_tty_kbd_mode=(int)(uintptr_t)arg;
+            return 0;
+        case VT_OPENQRY:
+            if(arg)*(int*)arg=1;
+            return 0;
+        case VT_GETMODE:
+            if(arg)c2_memcpy(arg,&g_tty_vt_mode,sizeof(g_tty_vt_mode));
+            return 0;
+        case VT_SETMODE:
+            if(arg){
+                c2_memcpy(&g_tty_vt_mode,arg,sizeof(g_tty_vt_mode));
+                if(g_tty_vt_mode.mode!=VT_AUTO&&g_tty_vt_mode.mode!=VT_PROCESS)g_tty_vt_mode.mode=VT_AUTO;
+            }
+            return 0;
+        case VT_GETSTATE:
+            if(arg){
+                linux_vt_stat_abi_t st;
+                c2_memset(&st,0,sizeof(st));
+                st.v_active=g_tty_active_vt;
+                st.v_state=(uint16_t)(1u<<g_tty_active_vt);
+                c2_memcpy(arg,&st,sizeof(st));
+            }
+            return 0;
+        case VT_ACTIVATE:
+            if((uintptr_t)arg>0&&(uintptr_t)arg<16)g_tty_active_vt=(uint16_t)(uintptr_t)arg;
+            return 0;
+        case VT_WAITACTIVE:
+        case VT_RELDISP:
+            return 0;
     }
     return -ENOTTY;
 }
@@ -2552,9 +3527,9 @@ static uint16_t htons16(uint16_t v){return(uint16_t)((v>>8)|(v<<8));}
 static uint32_t htonl32(uint32_t v){return((v&0xFF)<<24)|((v&0xFF00)<<8)|((v&0xFF0000)>>8)|((v>>24)&0xFF);}
 
 uint16_t net_checksum(const void *data,size_t len){
-    const uint16_t *p=(const uint16_t*)data;uint32_t sum=0;
-    while(len>1){sum+=*p++;len-=2;}
-    if(len)sum+=*(const uint8_t*)p;
+    const uint8_t *p=(const uint8_t*)data;uint32_t sum=0;
+    while(len>1){sum+=((uint16_t)p[0]<<8)|p[1];p+=2;len-=2;}
+    if(len)sum+=((uint16_t)p[0]<<8);
     while(sum>>16)sum=(sum&0xFFFF)+(sum>>16);
     return(uint16_t)(~sum);
 }
@@ -2869,10 +3844,11 @@ void compat2_register_shell_cmds(void){
 void compat2_init_all(void){
     __boot_serial_puts("[c2init] pmm_init...\n");
     /* Physical memory */
-    pmm_init((uint64_t)PMM_MAX_PAGES*PAGE_SIZE); /* up to 1GB bitmap window */
+    pmm_init((uint64_t)PMM_MAX_PAGES*PAGE_SIZE); /* bitmap window currently covers 8 GiB */
     __boot_serial_puts("[c2init] paging_init...\n");
     /* Paging */
     paging_init();
+    paging_map_dmap_usable_ranges();
     __boot_serial_puts("[c2init] tss_init...\n");
     /* TSS (must come before gdt64_setup so &g_tss is populated) */
     tss_init();

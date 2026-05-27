@@ -9,6 +9,7 @@
 #include "linux_syscalls.h"
 #include "user_libc.h"
 #include "bsd_libc.h"
+#include "linux_app_profiles.h"
 extern void*ulibc_malloc(size_t);extern void ulibc_free(void*);
 extern void*ulibc_memcpy(void*,const void*,size_t);extern void*ulibc_memset(void*,int,size_t);
 extern size_t ulibc_strlen(const char*);extern char*ulibc_strcpy(char*,const char*);
@@ -16,9 +17,32 @@ extern int ulibc_strcmp(const char*,const char*);extern char*ulibc_strchr(const 
 extern int ulibc_isdigit(int);extern int ulibc_toupper(int);extern int ulibc_tolower(int);extern int ulibc_isspace(int);
 extern int ulibc_snprintf(char*,size_t,const char*,...);
 extern bool kvfs_read(const char *p, const uint8_t **data, uint32_t *size);
+extern bool kvfs_exists(const char *path);
 extern int64_t real_sys_userfaultfd(int flags);
 extern int64_t real_sys_process_vm_readv(int pid,const iovec_t *local_iov,unsigned long liovcnt,const iovec_t *remote_iov,unsigned long riovcnt,unsigned long flags);
 extern int64_t real_sys_process_vm_writev(int pid,const iovec_t *local_iov,unsigned long liovcnt,const iovec_t *remote_iov,unsigned long riovcnt,unsigned long flags);
+
+static void c5_seed_stdio(task_t *t){
+    if(!t)return;
+    if(t->fdt.fds[0].kind==FDKIND_NONE){
+        t->fdt.fds[0].kind=FDKIND_DEVTTY;
+        t->fdt.fds[0].flags=FDFL_READABLE;
+        t->fdt.fds[0].ref=0;
+        t->fdt.fds[0].refcount=1;
+    }
+    if(t->fdt.fds[1].kind==FDKIND_NONE){
+        t->fdt.fds[1].kind=FDKIND_DEVTTY;
+        t->fdt.fds[1].flags=FDFL_WRITABLE;
+        t->fdt.fds[1].ref=0;
+        t->fdt.fds[1].refcount=1;
+    }
+    if(t->fdt.fds[2].kind==FDKIND_NONE){
+        t->fdt.fds[2].kind=FDKIND_DEVTTY;
+        t->fdt.fds[2].flags=FDFL_WRITABLE;
+        t->fdt.fds[2].ref=0;
+        t->fdt.fds[2].refcount=1;
+    }
+}
 
 /* fnmatch (FreeBSD adapted, no wchar) */
 int ulibc_fnmatch(const char*P,const char*S,int F){
@@ -489,13 +513,13 @@ static bool c5ai_resolve_host(const char *node,uint32_t *addr){
 uint32_t ulibc_inet_addr(const char*cp){
     uint8_t p[4];
     if(!c5_parse_ipv4(cp,p))return 0;
-    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+    return ((uint32_t)p[3]<<24)|((uint32_t)p[2]<<16)|((uint32_t)p[1]<<8)|p[0];
 }
 int ulibc_inet_pton(int af,const char*src,void*dst){if(af==2){uint32_t a=ulibc_inet_addr(src);if(a==0&&ulibc_strcmp(src,"0.0.0.0")!=0)return 0;*(uint32_t*)dst=a;return 1;}return-1;}
 const char*ulibc_inet_ntop(int af,const void*src,char*dst,size_t sz){
     if(af==2){
-        uint32_t a=*(const uint32_t*)src;
-        ulibc_snprintf(dst,sz,"%u.%u.%u.%u",(unsigned)((a>>24)&0xFF),(unsigned)((a>>16)&0xFF),(unsigned)((a>>8)&0xFF),(unsigned)(a&0xFF));
+        const uint8_t *p=(const uint8_t*)src;
+        ulibc_snprintf(dst,sz,"%u.%u.%u.%u",(unsigned)p[0],(unsigned)p[1],(unsigned)p[2],(unsigned)p[3]);
         return dst;
     }
     return 0;
@@ -506,6 +530,7 @@ int ulibc_getaddrinfo(const char*node,const char*svc,const ulibc_addrinfo_t*hint
     int protocol=6;
     uint16_t port=0;
     uint32_t addr=0;
+    bool addr_is_network_order=false;
     if(!res)return EAI_SYSTEM;
     *res=0;
     if(hints&&hints->ai_flags&(uint32_t)~(AI_PASSIVE|AI_CANONNAME|AI_NUMERICHOST|AI_ADDRCONFIG|AI_V4MAPPED))return EAI_BADFLAGS;
@@ -524,6 +549,7 @@ int ulibc_getaddrinfo(const char*node,const char*svc,const ulibc_addrinfo_t*hint
         addr=(hints&&(hints->ai_flags&AI_PASSIVE))?0:0x7F000001u;
     }else if(hints&&(hints->ai_flags&AI_NUMERICHOST)){
         addr=ulibc_inet_addr(node);
+        addr_is_network_order=true;
         if(addr==0&&ulibc_strcmp(node,"0.0.0.0")!=0)return EAI_NONAME;
     }else{
         if(!c5ai_resolve_host(node,&addr))return EAI_NONAME;
@@ -532,7 +558,7 @@ int ulibc_getaddrinfo(const char*node,const char*svc,const ulibc_addrinfo_t*hint
     ulibc_sockaddr_in_t*sa=(ulibc_sockaddr_in_t*)ulibc_malloc(sizeof(ulibc_sockaddr_in_t));
     if(!ai||!sa){ulibc_free(ai);ulibc_free(sa);return EAI_MEMORY;}
     ulibc_memset(ai,0,sizeof(*ai));ulibc_memset(sa,0,sizeof(*sa));sa->sin_family=2;
-    sa->sin_addr=addr;
+    sa->sin_addr=addr_is_network_order?addr:ulibc_htonl(addr);
     sa->sin_port=ulibc_htons(port);
     ai->ai_flags=hints?hints->ai_flags:0;
     ai->ai_family=2;ai->ai_socktype=socktype;ai->ai_protocol=protocol;
@@ -730,10 +756,28 @@ static bool c5_path_is_elf64(const char *path){
     if(!kvfs_read(path,&data,&sz))return false;
     return elf64_validate(data,sz);
 }
+static bool c5_path_exists(const char *path){
+    const uint8_t *data=0;
+    uint32_t sz=0;
+    if(!path||!*path)return false;
+    return kvfs_read(path,&data,&sz);
+}
+static bool c5_any_path_exists(const char *const *cand){
+    size_t i;
+    if(!cand)return false;
+    for(i=0;cand[i];++i)if(c5_path_exists(cand[i]))return true;
+    return false;
+}
+static bool c5_any_path_elf64(const char *const *cand){
+    size_t i;
+    if(!cand)return false;
+    for(i=0;cand[i];++i)if(c5_path_is_elf64(cand[i]))return true;
+    return false;
+}
 static bool c5_resolve_browser_alias_binary(const char *hint,char *resolved,size_t cap){
     static const char *const firefox_cand[]={
-        "/opt/firefox/firefox-bin",
         "/opt/firefox/firefox",
+        "/opt/firefox/firefox-bin",
         "/bin/firefox.elf",
         "/usr/lib/firefox/firefox",
         "/usr/lib64/firefox/firefox",
@@ -769,17 +813,102 @@ static bool c5_resolve_browser_alias_binary(const char *hint,char *resolved,size
 }
 static const char *c5_default_browser_target(bool force_real){
     if(force_real){
-        if(c5_path_is_elf64("/opt/firefox/firefox-bin"))return "/opt/firefox/firefox-bin";
         if(c5_path_is_elf64("/opt/firefox/firefox"))return "/opt/firefox/firefox";
+        if(c5_path_is_elf64("/opt/firefox/firefox-bin"))return "/opt/firefox/firefox-bin";
         if(c5_path_is_elf64("/opt/chromium/chrome"))return "/opt/chromium/chrome";
         if(c5_path_is_elf64("/usr/bin/firefox"))return "/usr/bin/firefox";
         return "/opt/chromium/chrome";
     }
-    if(c5_path_is_elf64("/opt/firefox/firefox-bin"))return "/opt/firefox/firefox-bin";
     if(c5_path_is_elf64("/opt/firefox/firefox"))return "/opt/firefox/firefox";
+    if(c5_path_is_elf64("/opt/firefox/firefox-bin"))return "/opt/firefox/firefox-bin";
     if(c5_path_is_elf64("/bin/firefox.elf"))return "/bin/firefox.elf";
     if(c5_path_is_elf64("/bin/chrome.elf"))return "/bin/chrome.elf";
     return "/bin/chrome.elf";
+}
+static void c5_append_text(char *o,int mx,const char *s){
+    size_t used,n,avail;
+    if(!o||mx<=0||!s)return;
+    used=ulibc_strlen(o);
+    if(used+1>=(size_t)mx)return;
+    avail=(size_t)mx-used-1;
+    n=ulibc_strlen(s);
+    if(n>avail)n=avail;
+    if(n)ulibc_memcpy(o+used,s,n);
+    o[used+n]=0;
+}
+static bool c5_resolve_plasma_binary(const char *hint,char *resolved,size_t cap){
+    static const char *const session_cand[]={
+        "/opt/kde-plasma/bin/kwin_wayland",
+        "/opt/kde-plasma/usr/bin/kwin_wayland",
+        "/usr/bin/kwin_wayland",
+        "/usr/bin/plasmashell",
+        "/usr/bin/kded6",
+        "/usr/bin/kded5",
+        "/opt/kde-plasma/bin/plasmashell",
+        "/opt/kde-plasma/bin/kded6",
+        "/opt/kde-plasma/bin/kded5",
+        "/opt/kde-plasma/usr/bin/plasmashell",
+        "/opt/kde-plasma/usr/bin/kded6",
+        "/opt/kde-plasma/usr/bin/kded5",
+        "/usr/bin/kwin_x11",
+        "/opt/kde-plasma/bin/kwin_x11",
+        "/opt/kde-plasma/usr/bin/kwin_x11",
+        0
+    };
+    static const char *const shell_cand[]={
+        "/usr/bin/plasmashell",
+        "/opt/kde-plasma/bin/plasmashell",
+        "/opt/kde-plasma/usr/bin/plasmashell",
+        0
+    };
+    static const char *const kwin_x11_cand[]={
+        "/usr/bin/kwin_x11",
+        "/opt/kde-plasma/bin/kwin_x11",
+        "/opt/kde-plasma/usr/bin/kwin_x11",
+        0
+    };
+    static const char *const kwin_wayland_cand[]={
+        "/usr/bin/kwin_wayland",
+        "/opt/kde-plasma/bin/kwin_wayland",
+        "/opt/kde-plasma/usr/bin/kwin_wayland",
+        0
+    };
+    static const char *const kded_cand[]={
+        "/usr/bin/kded6",
+        "/usr/bin/kded5",
+        "/opt/kde-plasma/bin/kded6",
+        "/opt/kde-plasma/bin/kded5",
+        "/opt/kde-plasma/usr/bin/kded6",
+        "/opt/kde-plasma/usr/bin/kded5",
+        0
+    };
+    const char *const *cand=session_cand;
+    size_t i;
+    if(!resolved||cap==0)return false;
+    resolved[0]=0;
+    if(hint&&*hint&&hint[0]=='/'&&c5_path_is_elf64(hint)){
+        ulibc_snprintf(resolved,cap,"%s",hint);
+        return true;
+    }
+    if(!hint||!*hint||c5_streq_ci(hint,"session")||c5_streq_ci(hint,"plasma")){
+        cand=session_cand;
+    }else if(c5_streq_ci(hint,"shell")||c5_streq_ci(hint,"plasmashell")){
+        cand=shell_cand;
+    }else if(c5_streq_ci(hint,"kwin")||c5_streq_ci(hint,"wayland")||
+             c5_streq_ci(hint,"kwin_wayland")){
+        cand=kwin_wayland_cand;
+    }else if(c5_streq_ci(hint,"x11")||c5_streq_ci(hint,"kwin_x11")){
+        cand=kwin_x11_cand;
+    }else if(c5_streq_ci(hint,"kded")||c5_streq_ci(hint,"kded6")){
+        cand=kded_cand;
+    }
+    for(i=0;cand[i];++i){
+        if(c5_path_is_elf64(cand[i])){
+            ulibc_snprintf(resolved,cap,"%s",cand[i]);
+            return true;
+        }
+    }
+    return false;
 }
 static const char *c5_basename(const char *path){const char *b=path;while(*path){if(*path=='/')b=path+1;++path;}return b;}
 static void c5_dirname_copy(const char *path,char *out,size_t cap){
@@ -912,7 +1041,7 @@ static bool c5_probe_http_virtual(void){
     ulibc_memset(&sa,0,sizeof(sa));
     sa.sin_family=2;
     sa.sin_port=ulibc_htons(80);
-    sa.sin_addr=((uint32_t)203u<<24)|((uint32_t)0u<<16)|((uint32_t)113u<<8)|1u;
+    sa.sin_addr=ulibc_htonl(((uint32_t)203u<<24)|((uint32_t)0u<<16)|((uint32_t)113u<<8)|1u);
     if(real_sys_connect(fd,&sa,(uint32_t)sizeof(sa))<0){real_sys_close(fd);return false;}
     wr=real_sys_sendto(fd,req,sizeof(req)-1,0,0,0);
     rd=real_sys_recvfrom(fd,rx,sizeof(rx),0,0,0);
@@ -974,13 +1103,26 @@ static bool c5_probe_dbus_ipc(void){
     return c5_has_token_ci(rx,"OK")||c5_has_token_ci(rx,"AGREE")||c5_has_token_ci(rx,"REJECTED");
 }
 
+static bool c5_spawn_trace_enabled(void){
+    static int cached=-1;
+    if(cached<0){
+        cached=(kvfs_exists("/etc/ridux-spawn-debug.enable")||
+                kvfs_exists("/etc/ridux-loader-debug.enable")||
+                kvfs_exists("/etc/ridux-wayfire-debug.enable")||
+                kvfs_exists("/etc/ridux-hyprland-debug.enable"))?1:0;
+    }
+    return cached!=0;
+}
+
 static void c5_spawn_force_stage(const char *stage){
+    if(!c5_spawn_trace_enabled())return;
     __boot_serial_force_puts("[spawn!] ");
     __boot_serial_force_puts(stage);
     __boot_serial_force_puts("\n");
 }
 
 static void c5_spawn_force_path(const char *stage,const char *path){
+    if(!c5_spawn_trace_enabled())return;
     __boot_serial_force_puts("[spawn!] ");
     __boot_serial_force_puts(stage);
     __boot_serial_force_puts(" ");
@@ -989,6 +1131,7 @@ static void c5_spawn_force_path(const char *stage,const char *path){
 }
 
 static void c5_spawn_force_rc(const char *stage,int rc){
+    if(!c5_spawn_trace_enabled())return;
     __boot_serial_force_puts("[spawn!] ");
     __boot_serial_force_puts(stage);
     __boot_serial_force_puts(" rc=");
@@ -1001,7 +1144,7 @@ static void c5_spawn_force_rc(const char *stage,int rc){
     __boot_serial_force_puts("\n");
 }
 
-static int c5_spawn_elf_task(const char *path,bool launch_now,char *detail,size_t cap){
+static int c5_spawn_elf_task(const char *path,bool launch_now,const char *extra_args,char *detail,size_t cap){
     const uint8_t *data=0,*interp_data=0;
     uint32_t sz=0,interp_sz=0;
     const elf64_ehdr_t *eh=0;
@@ -1018,28 +1161,31 @@ static int c5_spawn_elf_task(const char *path,bool launch_now,char *detail,size_
     auxv_t auxv[24];
     char *argv_exec[80];
     char *env_exec[128];
+    char extra_arg_store[12][192];
+    char *extra_arg_ptrs[12];
+    int extra_argc=0;
     int argc_exec=0;
     int envc=0;
-    bool is_chrome=false;
-    bool is_firefox=false;
+    ridux_linux_app_kind_t app_kind=RIDUX_LINUX_APP_GENERIC;
+    bool spawn_trace=c5_spawn_trace_enabled();
     c5_spawn_force_path("entry",path);
-    __boot_serial_puts("[spawn] entry path="); __boot_serial_puts(path?path:"(null)"); __boot_serial_puts("\n");
+    if(spawn_trace){__boot_serial_puts("[spawn] entry path="); __boot_serial_puts(path?path:"(null)"); __boot_serial_puts("\n");}
     if(!path||!*path){ulibc_snprintf(detail,cap,"browser run: falta ruta ELF64.\n");return -EINVAL;}
     if(!kvfs_read(path,&data,&sz)){ulibc_snprintf(detail,cap,"browser run: '%s' no existe en RiduxFS.\n",path);return -ENOENT;}
     c5_spawn_force_rc("vfs_read",(int)sz);
-    __boot_serial_puts("[spawn] vfs_read ok sz="); __boot_serial_putu32(sz); __boot_serial_puts("\n");
+    if(spawn_trace){__boot_serial_puts("[spawn] vfs_read ok sz="); __boot_serial_putu32(sz); __boot_serial_puts("\n");}
     if(!elf64_validate(data,sz)){ulibc_snprintf(detail,cap,"browser run: '%s' no es ELF64 valido.\n",path);return -ENOEXEC;}
     c5_spawn_force_stage("elf_validate ok");
-    __boot_serial_puts("[spawn] elf_validate ok\n");
+    if(spawn_trace)__boot_serial_puts("[spawn] elf_validate ok\n");
     eh=(const elf64_ehdr_t*)data;
     c5_extract_interp(data,sz,&is_dyn,interp,sizeof(interp));
-    __boot_serial_puts("[spawn] extract_interp is_dyn="); __boot_serial_puts(is_dyn?"true":"false"); __boot_serial_puts(" interp="); __boot_serial_puts(interp[0]?interp:"(none)"); __boot_serial_puts("\n");
+    if(spawn_trace){__boot_serial_puts("[spawn] extract_interp is_dyn="); __boot_serial_puts(is_dyn?"true":"false"); __boot_serial_puts(" interp="); __boot_serial_puts(interp[0]?interp:"(none)"); __boot_serial_puts("\n");}
     resolved_interp[0]=0;
     if(is_dyn){
-        __boot_serial_puts("[spawn] calling c5_find_loader...\n");
+        if(spawn_trace)__boot_serial_puts("[spawn] calling c5_find_loader...\n");
         if(!c5_find_loader(interp,&interp_data,&interp_sz,resolved_interp,sizeof(resolved_interp))){
             c5_spawn_force_stage("find_loader fail");
-            __boot_serial_puts("[spawn] find_loader FAIL\n");
+            if(spawn_trace)__boot_serial_puts("[spawn] find_loader FAIL\n");
             ulibc_snprintf(detail,cap,
                 "browser run: ELF dinamico sin loader disponible.\n"
                 "interp=%s\n"
@@ -1048,60 +1194,72 @@ static int c5_spawn_elf_task(const char *path,bool launch_now,char *detail,size_
             return -ENOENT;
         }
         c5_spawn_force_path("find_loader ok",resolved_interp);
-        __boot_serial_puts("[spawn] find_loader OK resolved="); __boot_serial_puts(resolved_interp); __boot_serial_puts(" sz="); __boot_serial_putu32(interp_sz); __boot_serial_puts("\n");
+        if(spawn_trace){__boot_serial_puts("[spawn] find_loader OK resolved="); __boot_serial_puts(resolved_interp); __boot_serial_puts(" sz="); __boot_serial_putu32(interp_sz); __boot_serial_puts("\n");}
         if(!elf64_validate(interp_data,interp_sz)){
-            __boot_serial_puts("[spawn] loader elf_validate FAIL\n");
+            if(spawn_trace)__boot_serial_puts("[spawn] loader elf_validate FAIL\n");
             ulibc_snprintf(detail,cap,"browser run: loader '%s' invalido.\n",resolved_interp);
             return -ENOEXEC;
         }
-        __boot_serial_puts("[spawn] loader validated\n");
+        if(spawn_trace)__boot_serial_puts("[spawn] loader validated\n");
     }
-    __boot_serial_puts("[spawn] task_create...\n");
+    app_kind=ridux_linux_app_kind_from_path(path);
+    if(spawn_trace)__boot_serial_puts("[spawn] task_create...\n");
     pid=task_create(c5_basename(path),eh->e_entry,true);
     c5_spawn_force_rc("task_create",pid);
-    __boot_serial_puts("[spawn] task_create returned pid="); __boot_serial_putu32((uint32_t)pid); __boot_serial_puts("\n");
+    if(spawn_trace){__boot_serial_puts("[spawn] task_create returned pid="); __boot_serial_putu32((uint32_t)pid); __boot_serial_puts("\n");}
     if(pid<0){ulibc_snprintf(detail,cap,"browser run: task_create fallo (%d).\n",pid);return pid;}
-    __boot_serial_puts("[spawn] c5_find_task...\n");
+    if(spawn_trace)__boot_serial_puts("[spawn] c5_find_task...\n");
     t=c5_find_task(pid);
-    __boot_serial_puts("[spawn] c5_find_task returned t=");
-    __boot_serial_puthex64((uint64_t)(uintptr_t)t);
-    __boot_serial_puts("\n");
+    if(spawn_trace){
+        __boot_serial_puts("[spawn] c5_find_task returned t=");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)t);
+        __boot_serial_puts("\n");
+    }
     if(!t){c5_abort_task(pid);ulibc_snprintf(detail,cap,"browser run: no se encontro task pid=%d.\n",pid);return -EAGAIN;}
-    __boot_serial_puts("[spawn] t->addr_space=");
-    __boot_serial_puthex64((uint64_t)(uintptr_t)t->addr_space);
-    __boot_serial_puts("\n");
+    t->uid=1000; t->euid=1000; t->suid=1000;
+    t->gid=1000; t->egid=1000; t->sgid=1000;
+    if(spawn_trace){
+        __boot_serial_puts("[spawn] t->addr_space=");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)t->addr_space);
+        __boot_serial_puts("\n");
+    }
+    c5_seed_stdio(t);
     if(!t->addr_space)t->addr_space=paging_create_address_space();
     if(!t->addr_space){c5_abort_task(pid);ulibc_snprintf(detail,cap,"browser run: no hay address space.\n");return -ENOMEM;}
-    __boot_serial_puts("[spawn] task_current...\n");
+    if(spawn_trace)__boot_serial_puts("[spawn] task_current...\n");
     cur=task_current();
-    __boot_serial_puts("[spawn] task_current returned cur=");
-    __boot_serial_puthex64((uint64_t)(uintptr_t)cur);
-    __boot_serial_puts("\n");
+    if(spawn_trace){
+        __boot_serial_puts("[spawn] task_current returned cur=");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)cur);
+        __boot_serial_puts("\n");
+    }
     old_as=(cur&&cur->addr_space)?cur->addr_space:paging_get_kernel_space();
-    __boot_serial_puts("[spawn] old_as=");
-    __boot_serial_puthex64((uint64_t)(uintptr_t)old_as);
-    __boot_serial_puts(" new_cr3=");
-    __boot_serial_puthex64(t->addr_space ? t->addr_space->cr3_phys : 0);
-    __boot_serial_puts("\n");
-    __boot_serial_puts("[spawn] paging_switch to task AS...\n");
+    if(spawn_trace){
+        __boot_serial_puts("[spawn] old_as=");
+        __boot_serial_puthex64((uint64_t)(uintptr_t)old_as);
+        __boot_serial_puts(" new_cr3=");
+        __boot_serial_puthex64(t->addr_space ? t->addr_space->cr3_phys : 0);
+        __boot_serial_puts("\n");
+    }
+    if(spawn_trace)__boot_serial_puts("[spawn] paging_switch to task AS...\n");
     paging_switch(t->addr_space);
-    __boot_serial_puts("[spawn] paging_switch OK\n");
-    __boot_serial_puts("[spawn] c5_collect_elf_info(main)...\n");
+    if(spawn_trace)__boot_serial_puts("[spawn] paging_switch OK\n");
+    if(spawn_trace)__boot_serial_puts("[spawn] c5_collect_elf_info(main)...\n");
     map_rc=c5_collect_elf_info(data,sz,t->mmap_base,&main_lb,&main_entry,&main_phdr,&main_phent,&main_phnum);
-    __boot_serial_puts("[spawn] c5_collect_elf_info(main) rc="); __boot_serial_putu32((uint32_t)map_rc); __boot_serial_puts("\n");
+    if(spawn_trace){__boot_serial_puts("[spawn] c5_collect_elf_info(main) rc="); __boot_serial_putu32((uint32_t)map_rc); __boot_serial_puts("\n");}
     if(map_rc<0){
         paging_switch(old_as);
         c5_abort_task(pid);
         ulibc_snprintf(detail,cap,"browser run: metadata ELF invalida (rc=%d).\n",map_rc);
         return -ENOEXEC;
     }
-    __boot_serial_puts("[spawn] compat3_set_next_image_name(main)...\n");
+    if(spawn_trace)__boot_serial_puts("[spawn] compat3_set_next_image_name(main)...\n");
     compat3_set_next_image_name(path);
-    __boot_serial_puts("[spawn] elf64_map_into_task(main)...\n");
+    if(spawn_trace)__boot_serial_puts("[spawn] elf64_map_into_task(main)...\n");
     c5_spawn_force_stage("map main begin");
     map_rc=elf64_map_into_task(t,data,sz);
     c5_spawn_force_rc("map main",map_rc);
-    __boot_serial_puts("[spawn] elf64_map_into_task(main) rc="); __boot_serial_putu32((uint32_t)map_rc); __boot_serial_puts("\n");
+    if(spawn_trace){__boot_serial_puts("[spawn] elf64_map_into_task(main) rc="); __boot_serial_putu32((uint32_t)map_rc); __boot_serial_puts("\n");}
     if(map_rc<0){
         paging_switch(old_as);
         c5_abort_task(pid);
@@ -1182,201 +1340,93 @@ static int c5_spawn_elf_task(const char *path,bool launch_now,char *detail,size_
         C5_AUX_PUSH(AT_EXECFN,(uint64_t)(uintptr_t)t->exec_path);
         C5_AUX_PUSH(AT_SYSINFO_EHDR,0);
         #undef C5_AUX_PUSH
-        is_chrome=c5_has_token_ci(path,"chrome")||c5_has_token_ci(path,"chromium");
-        is_firefox=c5_has_token_ci(path,"firefox");
-        if(is_chrome||is_firefox){
+        if(ridux_linux_app_should_chdir_to_app_dir(app_kind)){
             char app_dir[VFS_PATH_MAX];
             /*
-             * Firefox still needs the conservative syscall-boundary scheduler
-             * while its malloc/thread interaction is being tightened. Chromium
-             * is left preemptible so the desktop, cursor and compositor keep
-             * running during browser startup.
+             * Antes Firefox necesitaba esto para pasar el arranque, pero con
+             * muchos hilos vivos terminaba dejando la ventana principal sin
+             * tiempo real de CPU. Mejor dejarlo respirar como Chromium.
              */
-            t->no_timer_preempt=is_firefox;
+            t->no_timer_preempt=false;
             c5_dirname_copy(path,app_dir,sizeof(app_dir));
             if(app_dir[0])ulibc_snprintf(t->cwd,sizeof(t->cwd),"%s",app_dir);
         }
-        argv_exec[argc_exec++]=(char*)path;
-        if(is_chrome){
-            argv_exec[argc_exec++]="--no-sandbox";
-            argv_exec[argc_exec++]="--user-data-dir=/tmp/chromium";
-            argv_exec[argc_exec++]="--disk-cache-dir=/tmp/chromium-cache";
-            argv_exec[argc_exec++]="--no-first-run";
-            argv_exec[argc_exec++]="--no-default-browser-check";
-            argv_exec[argc_exec++]="--test-type";
-            argv_exec[argc_exec++]="--disable-session-crashed-bubble";
-            argv_exec[argc_exec++]="--disable-infobars";
-            argv_exec[argc_exec++]="--disable-component-update";
-            argv_exec[argc_exec++]="--disable-default-apps";
-            argv_exec[argc_exec++]="--disable-gpu";
-            argv_exec[argc_exec++]="--disable-gpu-compositing";
-            argv_exec[argc_exec++]="--use-gl=disabled";
-            argv_exec[argc_exec++]="--disable-accelerated-2d-canvas";
-            argv_exec[argc_exec++]="--disable-accelerated-video-decode";
-            argv_exec[argc_exec++]="--disable-oop-rasterization";
-            argv_exec[argc_exec++]="--disable-zero-copy";
-            argv_exec[argc_exec++]="--run-all-compositor-stages-before-draw";
-            argv_exec[argc_exec++]="--disable-dev-shm-usage";
-            argv_exec[argc_exec++]="--no-zygote";
-            argv_exec[argc_exec++]="--in-process-gpu";
-            argv_exec[argc_exec++]="--winhttp-proxy-resolver";
-            argv_exec[argc_exec++]="--renderer-process-limit=1";
-            argv_exec[argc_exec++]="--disable-local-storage";
-            argv_exec[argc_exec++]="--disable-site-isolation-trials";
-            argv_exec[argc_exec++]="--no-proxy-server";
-            argv_exec[argc_exec++]="--proxy-server=direct://";
-            argv_exec[argc_exec++]="--proxy-bypass-list=*";
-            argv_exec[argc_exec++]="--password-store=basic";
-            argv_exec[argc_exec++]="--disable-metrics";
-            argv_exec[argc_exec++]="--disable-metrics-reporting";
-            argv_exec[argc_exec++]="--disable-background-tracing";
-            argv_exec[argc_exec++]="--disable-chrome-tracing-computation";
-            argv_exec[argc_exec++]="--no-slow-histograms";
-            argv_exec[argc_exec++]="--disable-field-trial-config";
-            argv_exec[argc_exec++]="--disable-perfetto-system-tracing";
-            argv_exec[argc_exec++]="--disable-features=MojoUseEventFd,CalculateNativeWinOcclusion,CanvasOopRasterization,MediaRouter,DialMediaRouteProvider,OptimizationHints,AutofillServerCommunication,CertificateTransparencyComponentUpdater,FirstRunDesktopRevamp,FirstRunDesktopRefresh,SitePerProcess,IsolateOrigins,StrictOriginIsolation,ProcessPerSiteUpToMainFrameThreshold,EnablePerfettoSystemTracing,EnablePerfettoSystemBackgroundTracing,StorageServiceOutOfProcess,AudioServiceOutOfProcess";
-            argv_exec[argc_exec++]="--disable-background-networking";
-            argv_exec[argc_exec++]="--disable-extensions";
-            argv_exec[argc_exec++]="--disable-sync";
-            argv_exec[argc_exec++]="--disable-breakpad";
-            argv_exec[argc_exec++]="--disable-crash-reporter";
-            argv_exec[argc_exec++]="--disable-crashpad";
-            argv_exec[argc_exec++]="--disable-crashpad-for-testing";
-            argv_exec[argc_exec++]="--disable-hang-monitor";
-            argv_exec[argc_exec++]="--noerrdialogs";
-            argv_exec[argc_exec++]="--enable-features=UseOzonePlatform,NetworkServiceInProcess2";
-            argv_exec[argc_exec++]="--ozone-platform=x11";
-            argv_exec[argc_exec++]="file:///home/ridux-firefox-test.html";
-        }else if(is_firefox){
-            argv_exec[argc_exec++]="--no-remote";
-            argv_exec[argc_exec++]="--new-instance";
-            argv_exec[argc_exec++]="--profile";
-            argv_exec[argc_exec++]="/tmp/firefox-profile";
-            argv_exec[argc_exec++]="--new-window";
-            argv_exec[argc_exec++]="http://example.com/";
-        }
-        argv_exec[argc_exec]=0;
-        if(is_firefox){
-            int ai;
-            __boot_serial_puts("[spawn-firefox-argv] argc=");
-            __boot_serial_putu32((uint32_t)argc_exec);
-            __boot_serial_puts("\n");
-            for(ai=0;ai<argc_exec;++ai){
-                __boot_serial_puts("[spawn-firefox-argv]   ");
-                __boot_serial_putu32((uint32_t)ai);
-                __boot_serial_puts(": ");
-                __boot_serial_puts(argv_exec[ai]?argv_exec[ai]:"(null)");
-                __boot_serial_puts("\n");
+        {
+            const char *ep=extra_args?extra_args:"";
+            char tok[192];
+            while(extra_argc<(int)(sizeof(extra_arg_store)/sizeof(extra_arg_store[0]))&&
+                  c5_next_tok(&ep,tok,sizeof(tok))){
+                ridux_linux_app_prepare_arg(tok,extra_arg_store[extra_argc],sizeof(extra_arg_store[0]));
+                extra_arg_ptrs[extra_argc]=extra_arg_store[extra_argc];
+                ++extra_argc;
             }
         }
-        env_exec[envc++]="PATH=/usr/bin:/bin:/opt/chromium:/opt/firefox";
-        env_exec[envc++]="HOME=/home";
-        env_exec[envc++]="LANG=C";
-        env_exec[envc++]="TERM=xterm-256color";
-        env_exec[envc++]="DISPLAY=:0";
-        env_exec[envc++]="XDG_RUNTIME_DIR=/run/user/0";
-        env_exec[envc++]="WAYLAND_DISPLAY=wayland-0";
-        if(is_chrome){
-            env_exec[envc++]="XDG_SESSION_TYPE=x11";
-            env_exec[envc++]="XDG_CURRENT_DESKTOP=Ridux";
-            env_exec[envc++]="DESKTOP_SESSION=ridux";
-            env_exec[envc++]="XDG_CONFIG_HOME=/tmp";
-            env_exec[envc++]="XDG_CACHE_HOME=/tmp";
-            env_exec[envc++]="LD_PRELOAD=/opt/ridux/stackchk_trace.so";
-            env_exec[envc++]="DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/ridux-no-dbus";
-            env_exec[envc++]="DBUS_SYSTEM_BUS_ADDRESS=unix:path=/tmp/ridux-no-system-dbus";
-            env_exec[envc++]="GTK_USE_PORTAL=0";
-            env_exec[envc++]="GSETTINGS_BACKEND=memory";
-            env_exec[envc++]="GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas";
-            env_exec[envc++]="GTK_MODULES=";
-            env_exec[envc++]="GTK_A11Y=none";
-            env_exec[envc++]="GDK_BACKEND=x11";
-            env_exec[envc++]="GIO_USE_VFS=local";
-            env_exec[envc++]="GIO_USE_VOLUME_MONITOR=unix";
-            env_exec[envc++]="NO_AT_BRIDGE=1";
-            env_exec[envc++]="AT_SPI_BUS_ADDRESS=unix:path=/tmp/ridux-no-at-spi";
-        }else if(is_firefox){
-            /* Firefox ya dibujaba, pero la interaccion quedaba floja por X11.
-             * Lo empujo primero por Wayland y dejo X11 como red de seguridad. */
-            env_exec[envc++]="XDG_SESSION_TYPE=wayland";
-            env_exec[envc++]="XDG_CONFIG_HOME=/tmp";
-            env_exec[envc++]="XDG_CACHE_HOME=/tmp";
-            env_exec[envc++]="MOZILLA_FIVE_HOME=/opt/firefox";
-            env_exec[envc++]="MOZ_GRE_HOME=/opt/firefox";
-            env_exec[envc++]="MOZ_XRE_DIR=/opt/firefox";
-            env_exec[envc++]="MOZ_APP_LAUNCHER=/opt/firefox/firefox";
-            env_exec[envc++]="MOZ_LEGACY_PROFILES=1";
-            env_exec[envc++]="MOZ_ALLOW_DOWNGRADE=1";
-            env_exec[envc++]="MOZ_FORCE_DISABLE_E10S=1";
-            env_exec[envc++]="DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/ridux-no-dbus";
-            env_exec[envc++]="DBUS_SYSTEM_BUS_ADDRESS=unix:path=/tmp/ridux-no-system-dbus";
-            env_exec[envc++]="GTK_USE_PORTAL=0";
-            env_exec[envc++]="GSETTINGS_BACKEND=memory";
-            env_exec[envc++]="GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas";
-            env_exec[envc++]="GTK_MODULES=";
-            env_exec[envc++]="GTK_A11Y=none";
-            env_exec[envc++]="GIO_USE_VFS=local";
-            env_exec[envc++]="GIO_USE_VOLUME_MONITOR=unix";
-            env_exec[envc++]="XDG_CURRENT_DESKTOP=Ridux";
-            env_exec[envc++]="DESKTOP_SESSION=ridux";
-            env_exec[envc++]="AT_SPI_BUS_ADDRESS=unix:path=/tmp/ridux-no-at-spi";
-        }else{
-            env_exec[envc++]="XDG_SESSION_TYPE=x11";
-            env_exec[envc++]="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus";
+        ridux_linux_app_build_launch(app_kind,
+                                     path,
+                                     argv_exec, &argc_exec,
+                                     (int)(sizeof(argv_exec) / sizeof(argv_exec[0])),
+                                     extra_arg_ptrs, extra_argc,
+                                     env_exec, &envc,
+                                     (int)(sizeof(env_exec) / sizeof(env_exec[0])));
+        if(app_kind==RIDUX_LINUX_APP_WAYFIRE||
+           app_kind==RIDUX_LINUX_APP_HYPRLAND||
+           app_kind==RIDUX_LINUX_APP_GL_COMPOSITOR||
+           app_kind==RIDUX_LINUX_APP_KDE){
+            t->no_timer_preempt=false;
+            if(app_kind==RIDUX_LINUX_APP_HYPRLAND){
+                __boot_serial_force_puts("[spawn-desktop-preempt] pid=");
+                __boot_serial_force_putu32((uint32_t)t->pid);
+                __boot_serial_force_puts(" kind=");
+                __boot_serial_force_puts(ridux_linux_app_trace_name(app_kind));
+                __boot_serial_force_puts("\n");
+            }
         }
-        if(is_chrome){
-            env_exec[envc++]="LD_LIBRARY_PATH=/opt/chromium:/opt/google/chrome:/lib64:/lib:/usr/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu";
-        }else if(is_firefox){
-            env_exec[envc++]="LD_LIBRARY_PATH=/opt/firefox:/opt/chromium:/opt/google/chrome:/lib64:/lib:/usr/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu";
-        }else{
-            env_exec[envc++]="LD_LIBRARY_PATH=/opt/chromium:/opt/google/chrome:/opt/firefox:/lib64:/lib:/usr/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu";
+        if((app_kind==RIDUX_LINUX_APP_WAYFIRE||app_kind==RIDUX_LINUX_APP_HYPRLAND)&&
+           kvfs_exists("/etc/ridux-hyprland-debug.enable")){
+            int ei;
+            __boot_serial_force_puts("[spawn-wayland-env] envc=");
+            __boot_serial_force_putu32((uint32_t)envc);
+            __boot_serial_force_puts("\n");
+            for(ei=0;ei<envc;++ei){
+                const char *e=env_exec[ei];
+                if(!e)continue;
+                if(c5_has_token_ci(e,"MESA_")||
+                   c5_has_token_ci(e,"GALLIUM_")||
+                   c5_has_token_ci(e,"LIBGL_")||
+                   c5_has_token_ci(e,"WLR_")||
+                   c5_has_token_ci(e,"AQ_")||
+                   c5_has_token_ci(e,"WAYLAND_DISPLAY")||
+                   c5_has_token_ci(e,"XDG_RUNTIME_DIR")||
+                   c5_has_token_ci(e,"HYPRLAND_")||
+                   c5_has_token_ci(e,"LIBINPUT_")||
+                   c5_has_token_ci(e,"EGL_PLATFORM")||
+                   c5_has_token_ci(e,"GBM_BACKEND")||
+                   c5_has_token_ci(e,"LD_PRELOAD")||
+                   c5_has_token_ci(e,"LD_LIBRARY_PATH")){
+                    __boot_serial_force_puts("[spawn-wayfire-env]   ");
+                    __boot_serial_force_putu32((uint32_t)ei);
+                    __boot_serial_force_puts(": ");
+                    __boot_serial_force_puts(e);
+                    __boot_serial_force_puts("\n");
+                }
+            }
         }
-        if(is_chrome||is_firefox){
-            env_exec[envc++]="FONTCONFIG_FILE=/etc/fonts/fonts-ridux.conf";
-            env_exec[envc++]="FONTCONFIG_PATH=/etc/fonts";
-            env_exec[envc++]="FONTCONFIG_USE_MMAP=0";
-            env_exec[envc++]="FC_DEBUG=0";
-            env_exec[envc++]="XDG_DATA_HOME=/tmp";
-            env_exec[envc++]="PANGOCAIRO_BACKEND=fontconfig";
-            env_exec[envc++]="LIBGL_ALWAYS_SOFTWARE=1";
-            env_exec[envc++]="MESA_LOADER_DRIVER_OVERRIDE=llvmpipe";
+        if(ridux_linux_app_is_browser(app_kind)){
+            int ai;
+            const char *trace=ridux_linux_app_trace_name(app_kind);
+            __boot_serial_force_puts("[spawn-linux-app-argv] kind=");
+            __boot_serial_force_puts(trace?trace:"linux");
+            __boot_serial_force_puts(" argc=");
+            __boot_serial_force_putu32((uint32_t)argc_exec);
+            __boot_serial_force_puts("\n");
+            for(ai=0;ai<argc_exec;++ai){
+                __boot_serial_force_puts("[spawn-linux-app-argv]   ");
+                __boot_serial_force_putu32((uint32_t)ai);
+                __boot_serial_force_puts(": ");
+                __boot_serial_force_puts(argv_exec[ai]?argv_exec[ai]:"(null)");
+                __boot_serial_force_puts("\n");
+            }
         }
-        if(is_firefox){
-            env_exec[envc++]="MOZ_WEBRENDER=0";
-            env_exec[envc++]="MOZ_ACCELERATED=0";
-            env_exec[envc++]="MOZ_AVOID_OPENGL_ALTOGETHER=1";
-            env_exec[envc++]="MOZ_DISABLE_GFX_SANITY_TEST=1";
-            env_exec[envc++]="MOZ_DISABLE_GLX_TEST=1";
-            env_exec[envc++]="MOZ_X11_EGL=0";
-            env_exec[envc++]="MOZ_ENABLE_WAYLAND=1";
-            env_exec[envc++]="MOZ_USE_XINPUT2=1";
-            env_exec[envc++]="GDK_BACKEND=wayland,x11";
-            env_exec[envc++]="GDK_GL=disable";
-            env_exec[envc++]="MESA_GLSL_CACHE_DISABLE=1";
-            env_exec[envc++]="MESA_SHADER_CACHE_DISABLE=1";
-            env_exec[envc++]="MOZ_DISABLE_CONTENT_SANDBOX=1";
-            env_exec[envc++]="MOZ_DISABLE_RDD_SANDBOX=1";
-            env_exec[envc++]="MOZ_DISABLE_GMP_SANDBOX=1";
-            env_exec[envc++]="MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1";
-            env_exec[envc++]="MOZ_DISABLE_UTILITY_SANDBOX=1";
-            env_exec[envc++]="MOZ_DBUS_REMOTE=0";
-            env_exec[envc++]="MOZ_ENABLE_DBUS=0";
-            env_exec[envc++]="MOZ_DISABLE_DBUS=1";
-            env_exec[envc++]="NO_AT_BRIDGE=1";
-            env_exec[envc++]="MOZ_DISABLE_GPU_SANDBOX=1";
-            env_exec[envc++]="MOZ_DISABLE_SOCKET_PROCESS=1";
-            env_exec[envc++]="MOZ_DISABLE_GPU_PROCESS=1";
-            env_exec[envc++]="MOZ_DISABLE_RDD_PROCESS=1";
-            env_exec[envc++]="MOZ_DISABLE_UTILITY_PROCESS=1";
-            env_exec[envc++]="MOZ_DISABLE_FORKSERVER=1";
-            env_exec[envc++]="MOZ_GMP_DISABLE=1";
-            env_exec[envc++]="MOZ_NO_REMOTE=1";
-            env_exec[envc++]="GTK_CSD=0";
-            env_exec[envc++]="MOZ_CRASHREPORTER_DISABLE=1";
-            env_exec[envc++]="MOZ_CRASHREPORTER_NO_REPORT=1";
-            env_exec[envc++]="MOZ_DISABLE_CRASHREPORTER=1";
-        }
-        env_exec[envc]=0;
         c5_spawn_force_stage("setup stack begin");
         stack_rc=elf64_setup_stack(t,argc_exec,argv_exec,env_exec,auxv,auxc);
         c5_spawn_force_rc("setup stack",stack_rc);
@@ -1425,13 +1475,15 @@ static int c5_spawn_elf_task(const char *path,bool launch_now,char *detail,size_
             "entry=%u rsp=%u loader=%s\n",
             pid,path,(unsigned)t->entry_point,(unsigned)t->ctx.rsp,
             interp_data?resolved_interp:"(none)");
-        __boot_serial_puts("[spawn] launching pid=");
-        __boot_serial_putu32((uint32_t)pid);
-        __boot_serial_puts(" rip=");
-        __boot_serial_puthex64(t->ctx.rip);
-        __boot_serial_puts(" rsp=");
-        __boot_serial_puthex64(t->ctx.rsp);
-        __boot_serial_puts(" (immediate launch)\n");
+        if(spawn_trace){
+            __boot_serial_puts("[spawn] launching pid=");
+            __boot_serial_putu32((uint32_t)pid);
+            __boot_serial_puts(" rip=");
+            __boot_serial_puthex64(t->ctx.rip);
+            __boot_serial_puts(" rsp=");
+            __boot_serial_puthex64(t->ctx.rsp);
+            __boot_serial_puts(" (immediate launch)\n");
+        }
         c5_spawn_force_stage("launch immediate");
         task_launch_to_user(t);
         return pid;
@@ -1441,13 +1493,15 @@ static int c5_spawn_elf_task(const char *path,bool launch_now,char *detail,size_
         "entry=%u rsp=%u loader=%s\n",
         pid,path,(unsigned)t->entry_point,(unsigned)t->ctx.rsp,
         interp_data?resolved_interp:"(none)");
-    __boot_serial_puts("[spawn] staged pid=");
-    __boot_serial_putu32((uint32_t)pid);
-    __boot_serial_puts(" rip=");
-    __boot_serial_puthex64(t->ctx.rip);
-    __boot_serial_puts(" rsp=");
-    __boot_serial_puthex64(t->ctx.rsp);
-    __boot_serial_puts(" (deferred launch)\n");
+    if(spawn_trace){
+        __boot_serial_puts("[spawn] staged pid=");
+        __boot_serial_putu32((uint32_t)pid);
+        __boot_serial_puts(" rip=");
+        __boot_serial_puthex64(t->ctx.rip);
+        __boot_serial_puts(" rsp=");
+        __boot_serial_puthex64(t->ctx.rsp);
+        __boot_serial_puts(" (deferred launch)\n");
+    }
     /* IMPORTANT: enable preemptive scheduling. The timer IRQ in
      * kernel.c only calls task_schedule() while g_user_foreground_active
      * is true, and the flag is otherwise only set by task_launch_to_user
@@ -1517,9 +1571,18 @@ static void cmd5_browser(const char*a,char*o,int mx){
         if(ulibc_strcmp(sub,"help")==0){c5_browser_usage(o,mx);return;}
         if(ulibc_strcmp(sub,"run")==0||ulibc_strcmp(sub,"realrun")==0){
             bool force_real=(ulibc_strcmp(sub,"realrun")==0);
-            const char *run_path=*rest?rest:c5_default_browser_target(force_real);
-            const char *exec_path=run_path;
+            char run_tok[VFS_PATH_MAX];
+            const char *extra_run_args="";
+            const char *run_path;
+            const char *exec_path;
             char resolved_path[VFS_PATH_MAX];
+            if(*rest&&c5_next_tok(&rest,run_tok,sizeof(run_tok))){
+                run_path=run_tok;
+                extra_run_args=c5_skip_ws(rest);
+            }else{
+                run_path=c5_default_browser_target(force_real);
+            }
+            exec_path=run_path;
             if(!force_real&&c5_browser_path_alias(run_path)){
                 if(c5_resolve_browser_alias_binary(run_path,resolved_path,sizeof(resolved_path))){
                     exec_path=resolved_path;
@@ -1535,22 +1598,22 @@ static void cmd5_browser(const char*a,char*o,int mx){
                 }
             }
             bool launch_now=force_real;
-            int rr=c5_spawn_elf_task(exec_path,launch_now,run_detail,sizeof(run_detail));
+            int rr=c5_spawn_elf_task(exec_path,launch_now,extra_run_args,run_detail,sizeof(run_detail));
             if(rr<0){ulibc_snprintf(o,(size_t)mx,"%s",run_detail);return;}
             if(launch_now){
                 ulibc_snprintf(o,(size_t)mx,"%s",run_detail);
                 return;
             }
             if(c5_has_token_ci(exec_path,"firefox")||c5_has_token_ci(run_path,"firefox")){
-                /* Firefox real crea su propia superficie Wayland. Abrir aqui
-                 * el tile falso lanzaba una segunda instancia y parecia cuelgue. */
+                /* Firefox pinta su propia ventana; no abrimos un tile falso. */
             }else{
-                compat_ui_open_app("Browser");
+                /* Lo mismo para Chromium real: si abrimos el Browser nativo
+                 * despues queda tapando la ventana X11 y parece que no arranco. */
             }
             ulibc_snprintf(o,(size_t)mx,
                 "%s"
                 "estado: task staged (launch diferido; kernel/UI siguen activos).\n"
-                "ui nativa abierta para render estable.\n",
+                "ventana real: X11/Wayland la maneja el binario.\n",
                 run_detail);
             return;
         }
@@ -1666,6 +1729,520 @@ static void cmd5_browser(const char*a,char*o,int mx){
     }
 }
 
+static void c5_plasma_usage(char *o,int mx){
+    ulibc_snprintf(o,(size_t)mx,
+        "plasma help\n"
+        "plasma check [ruta_elf64]\n"
+        "plasma run [session|shell|kwin|x11|wayland|kded|/ruta/bin] [args]\n"
+        "default: plasma run session -> kded6 + kwin_wayland + plasmashell si existen.\n"
+        "payload: make plasma-rootfs copia Plasma/Qt/KF y marca GPU obligatoria.\n");
+}
+
+static void c5_plasma_probe_binary(const char *path,char *probe,size_t cap){
+    const uint8_t *data=0;
+    uint32_t sz=0;
+    bool is_dyn=false;
+    char interp[VFS_PATH_MAX];
+    const uint8_t *idata=0;
+    uint32_t isz=0;
+    char resolved[VFS_PATH_MAX];
+    if(!probe||cap==0)return;
+    probe[0]=0;
+    if(!path||!*path)return;
+    if(!kvfs_read(path,&data,&sz)){
+        ulibc_snprintf(probe,cap,"binary probe: '%s' no existe en RiduxFS.\n",path);
+        return;
+    }
+    if(!elf64_validate(data,sz)){
+        ulibc_snprintf(probe,cap,
+            "binary probe: '%s' existe, pero no es ELF64 ejecutable (probable script/wrapper).\n",
+            path);
+        return;
+    }
+    interp[0]=0;
+    resolved[0]=0;
+    c5_extract_interp(data,sz,&is_dyn,interp,sizeof(interp));
+    if(is_dyn&&interp[0]&&
+       !kvfs_read(interp,&idata,&isz)&&
+       !c5_find_loader(interp,&idata,&isz,resolved,sizeof(resolved))){
+        ulibc_snprintf(probe,cap,
+            "binary probe: '%s' ELF64 con PT_INTERP=%s (loader missing).\n",
+            path,interp);
+        return;
+    }
+    ulibc_snprintf(probe,cap,
+        "binary probe: '%s' ELF64 ok interp=%s (%s).\n",
+        path,interp[0]?interp:"(none)",is_dyn?"loader visible":"static/no interp");
+}
+
+static void c5_plasma_check(const char *target,char *o,int mx){
+    static const char *const shell_cand[]={
+        "/usr/bin/plasmashell",
+        "/opt/kde-plasma/bin/plasmashell",
+        "/opt/kde-plasma/usr/bin/plasmashell",
+        0
+    };
+    static const char *const kwin_x11_cand[]={
+        "/usr/bin/kwin_x11",
+        "/opt/kde-plasma/bin/kwin_x11",
+        "/opt/kde-plasma/usr/bin/kwin_x11",
+        0
+    };
+    static const char *const kwin_wayland_cand[]={
+        "/usr/bin/kwin_wayland",
+        "/opt/kde-plasma/bin/kwin_wayland",
+        "/opt/kde-plasma/usr/bin/kwin_wayland",
+        0
+    };
+    static const char *const kded_cand[]={
+        "/usr/bin/kded6",
+        "/usr/bin/kded5",
+        "/opt/kde-plasma/bin/kded6",
+        "/opt/kde-plasma/bin/kded5",
+        "/opt/kde-plasma/usr/bin/kded6",
+        "/opt/kde-plasma/usr/bin/kded5",
+        0
+    };
+    static const char *const qt6_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libQt6Core.so.6",
+        "/usr/lib64/libQt6Core.so.6",
+        "/opt/kde-plasma/lib/libQt6Core.so.6",
+        "/opt/kde-plasma/lib64/libQt6Core.so.6",
+        "/opt/kde-plasma/lib/x86_64-linux-gnu/libQt6Core.so.6",
+        "/opt/kde-plasma/usr/lib/x86_64-linux-gnu/libQt6Core.so.6",
+        0
+    };
+    static const char *const kf6_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libKF6CoreAddons.so.6",
+        "/usr/lib64/libKF6CoreAddons.so.6",
+        "/opt/kde-plasma/lib/libKF6CoreAddons.so.6",
+        "/opt/kde-plasma/lib64/libKF6CoreAddons.so.6",
+        "/opt/kde-plasma/lib/x86_64-linux-gnu/libKF6CoreAddons.so.6",
+        "/opt/kde-plasma/usr/lib/x86_64-linux-gnu/libKF6CoreAddons.so.6",
+        0
+    };
+    static const char *const qml_cand[]={
+        "/usr/lib/x86_64-linux-gnu/qt6/qml/QtQuick/libqtquick2plugin.so",
+        "/usr/lib/qt6/qml/QtQuick/libqtquick2plugin.so",
+        "/opt/kde-plasma/lib/qt6/qml/QtQuick/libqtquick2plugin.so",
+        "/opt/kde-plasma/lib64/qt6/qml/QtQuick/libqtquick2plugin.so",
+        "/opt/kde-plasma/lib/x86_64-linux-gnu/qt6/qml/QtQuick/libqtquick2plugin.so",
+        "/opt/kde-plasma/usr/lib/x86_64-linux-gnu/qt6/qml/QtQuick/libqtquick2plugin.so",
+        0
+    };
+    static const char *const qt_plugin_cand[]={
+        "/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqwayland-egl.so",
+        "/usr/lib/qt6/plugins/platforms/libqwayland-egl.so",
+        "/opt/kde-plasma/lib/qt6/plugins/platforms/libqwayland-egl.so",
+        "/opt/kde-plasma/lib64/qt6/plugins/platforms/libqwayland-egl.so",
+        "/opt/kde-plasma/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqwayland-egl.so",
+        "/opt/kde-plasma/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqwayland-egl.so",
+        "/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqxcb.so",
+        "/usr/lib/qt6/plugins/platforms/libqxcb.so",
+        "/opt/kde-plasma/lib/qt6/plugins/platforms/libqxcb.so",
+        "/opt/kde-plasma/lib64/qt6/plugins/platforms/libqxcb.so",
+        "/opt/kde-plasma/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqxcb.so",
+        "/opt/kde-plasma/usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqxcb.so",
+        0
+    };
+    static const char *const dbus_lib_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libdbus-1.so.3",
+        "/usr/lib64/libdbus-1.so.3",
+        "/opt/kde-plasma/lib/libdbus-1.so.3",
+        "/opt/kde-plasma/lib64/libdbus-1.so.3",
+        "/opt/kde-plasma/lib/x86_64-linux-gnu/libdbus-1.so.3",
+        "/opt/kde-plasma/usr/lib/x86_64-linux-gnu/libdbus-1.so.3",
+        0
+    };
+    static const char *const mesa_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgbm.so.1",
+        "/usr/lib/x86_64-linux-gnu/dri/virtio_gpu_dri.so",
+        "/usr/lib/x86_64-linux-gnu/dri/vmwgfx_dri.so",
+        "/lib64/libEGL_mesa.so.0",
+        "/lib64/libgbm.so.1",
+        0
+    };
+    const char *ok="ok";
+    const char *part="partial";
+    const char *miss="missing";
+    const char *stub="stub";
+    bool has_execve=(g_syscall_table[59]!=0);
+    bool has_mmap=(g_syscall_table[9]!=0&&g_syscall_table[10]!=0&&g_syscall_table[11]!=0);
+    bool has_threads=(g_syscall_table[56]!=0&&g_syscall_table[202]!=0);
+    bool has_epoll=(g_syscall_table[232]!=0&&g_syscall_table[233]!=0&&g_syscall_table[291]!=0);
+    bool has_timerfd=(g_syscall_table[286]!=0&&g_syscall_table[290]!=0);
+    bool has_dyn_loader=c5_path_exists("/lib64/ld-linux-x86-64.so.2")||
+                        c5_path_exists("/lib/ld-linux-x86-64.so.2");
+    bool has_dyn_reloc=compat3_has_dynamic_relocator();
+    bool has_graphics=(g_drm_mode.width>0&&g_drm_mode.height>0);
+    bool probe_x11=c5_probe_x11_ipc();
+    bool probe_wayland=c5_probe_wayland_ipc();
+    bool probe_dbus=c5_probe_dbus_ipc();
+    bool has_shell=c5_any_path_elf64(shell_cand);
+    bool has_kwin_x11=c5_any_path_elf64(kwin_x11_cand);
+    bool has_kwin_wayland=c5_any_path_elf64(kwin_wayland_cand);
+    bool has_kded=c5_any_path_elf64(kded_cand);
+    bool has_qt6=c5_any_path_exists(qt6_cand);
+    bool has_kf6=c5_any_path_exists(kf6_cand);
+    bool has_qml=c5_any_path_exists(qml_cand);
+    bool has_plugins=c5_any_path_exists(qt_plugin_cand);
+    bool has_dbus_lib=c5_any_path_exists(dbus_lib_cand);
+    bool has_mesa=c5_any_path_exists(mesa_cand);
+    bool gpu_required=kvfs_exists("/etc/ridux-plasma-gpu.required");
+    char probe[384];
+    probe[0]=0;
+    if(target&&*target)c5_plasma_probe_binary(target,probe,sizeof(probe));
+    ulibc_snprintf(o,(size_t)mx,
+        "=== KDE Plasma readiness ===\n"
+        "payload plasmashell: %s\n"
+        "payload kwin_x11: %s  kwin_wayland: %s  kded: %s\n"
+        "Qt6 libs: %s  KF6 libs: %s  QML: %s  Qt plugins: %s  libdbus: %s\n"
+        "Linux ABI execve: %s  mmap/mprotect: %s  clone+futex: %s\n"
+        "epoll: %s  eventfd/timerfd: %s  dynamic loader: %s  relocator: %s\n"
+        "DRM framebuffer: %s (%ux%u)  Mesa/GBM: %s  GPU required marker: %s\n"
+        "Wayland IPC: %s  DBus IPC: %s  X11 IPC fallback: %s\n"
+        "%s"
+        "VEREDICTO: payload Plasma %s; sesion completa KDE %s.\n"
+        "Nota: Ridux ya puede intentar ELF64 Qt/KDE por Wayland, pero Plasma real sigue dependiendo de Wayland/DBus no-stub, Qt/KF completos, Mesa/DRM y mas ABI POSIX.\n"
+        "Siguiente paso practico: ejecutar `make plasma-rootfs` y luego `plasma run`.\n",
+        has_shell?ok:miss,
+        has_kwin_x11?part:miss,has_kwin_wayland?part:miss,has_kded?part:miss,
+        has_qt6?ok:miss,has_kf6?ok:miss,has_qml?part:miss,has_plugins?part:miss,has_dbus_lib?ok:miss,
+        has_execve?part:miss,has_mmap?part:miss,has_threads?part:miss,
+        has_epoll?part:miss,has_timerfd?stub:miss,has_dyn_loader?part:miss,has_dyn_reloc?part:miss,
+        has_graphics?ok:miss,(unsigned)g_drm_mode.width,(unsigned)g_drm_mode.height,has_mesa?ok:miss,gpu_required?ok:miss,
+        probe_wayland?part:stub,probe_dbus?part:stub,probe_x11?part:stub,
+        probe,
+        (has_shell&&has_qt6&&has_kf6)?part:miss,
+        (has_shell&&has_kwin_wayland&&has_qt6&&has_kf6&&has_execve&&has_mmap&&has_threads&&probe_wayland&&probe_dbus&&has_mesa&&gpu_required)?part:miss);
+}
+
+static bool c5_plasma_spawn_first(const char *role,const char *const *cand,
+                                  const char *args,char *o,int mx){
+    size_t i;
+    char detail[768];
+    for(i=0;cand[i];++i){
+        int rc;
+        if(!c5_path_is_elf64(cand[i]))continue;
+        detail[0]=0;
+        rc=c5_spawn_elf_task(cand[i],false,args?args:"",detail,sizeof(detail));
+        c5_append_text(o,mx,"plasma run: ");
+        c5_append_text(o,mx,role);
+        c5_append_text(o,mx," -> ");
+        c5_append_text(o,mx,cand[i]);
+        c5_append_text(o,mx,rc>=0?" staged\n":" failed\n");
+        c5_append_text(o,mx,detail);
+        return rc>=0;
+    }
+    return false;
+}
+
+static void cmd5_plasma(const char*a,char*o,int mx){
+    static const char *const shell_cand[]={
+        "/usr/bin/plasmashell",
+        "/opt/kde-plasma/bin/plasmashell",
+        "/opt/kde-plasma/usr/bin/plasmashell",
+        0
+    };
+    static const char *const kwin_wayland_cand[]={
+        "/usr/bin/kwin_wayland",
+        "/opt/kde-plasma/bin/kwin_wayland",
+        "/opt/kde-plasma/usr/bin/kwin_wayland",
+        0
+    };
+    static const char *const kded_cand[]={
+        "/usr/bin/kded6",
+        "/usr/bin/kded5",
+        "/opt/kde-plasma/bin/kded6",
+        "/opt/kde-plasma/bin/kded5",
+        "/opt/kde-plasma/usr/bin/kded6",
+        "/opt/kde-plasma/usr/bin/kded5",
+        0
+    };
+    const char *argp=a?a:"";
+    const char *rest;
+    char sub[32];
+    o[0]=0;
+    if(!c5_next_tok(&argp,sub,sizeof(sub))){
+        ulibc_snprintf(sub,sizeof(sub),"run");
+    }
+    rest=c5_skip_ws(argp);
+    if(ulibc_strcmp(sub,"help")==0){
+        c5_plasma_usage(o,mx);
+        return;
+    }
+    if(ulibc_strcmp(sub,"check")==0){
+        c5_plasma_check(rest,o,mx);
+        return;
+    }
+    if(ulibc_strcmp(sub,"run")==0){
+        char target[96];
+        const char *extra="";
+        if(c5_next_tok(&rest,target,sizeof(target))){
+            extra=c5_skip_ws(rest);
+        }else{
+            ulibc_snprintf(target,sizeof(target),"session");
+        }
+        if(c5_streq_ci(target,"session")||c5_streq_ci(target,"plasma")){
+            int started=0;
+            c5_append_text(o,mx,"plasma run: staging KDE session via Linux ABI/Wayland/GPU.\n");
+            if(c5_plasma_spawn_first("kded",kded_cand,"",o,mx))++started;
+            if(c5_plasma_spawn_first("kwin_wayland",kwin_wayland_cand,"--drm --no-lockscreen --xwayland --exit-with-session=/opt/kde-plasma/usr/bin/plasmashell",o,mx))++started;
+            if(c5_plasma_spawn_first("plasmashell",shell_cand,"--replace",o,mx))++started;
+            if(started<=0){
+                ulibc_snprintf(o,(size_t)mx,
+                    "plasma run: no encontre binarios ELF64 de KDE Plasma en RiduxFS.\n"
+                    "Ejecuta `make plasma-rootfs` para copiar Plasma/Qt/KF desde WSL/Linux.\n");
+                return;
+            }
+            c5_append_text(o,mx,
+                "estado: Plasma staged. Si la pantalla no cambia, revisa `plasma check` y el serial log: Wayland/DBus/GPU todavia pueden estar en modo parcial.\n");
+            return;
+        }else{
+            char resolved[VFS_PATH_MAX];
+            char detail[768];
+            int rc;
+            if(!c5_resolve_plasma_binary(target,resolved,sizeof(resolved))){
+                ulibc_snprintf(o,(size_t)mx,
+                    "plasma run: no encontre ELF64 para '%s'.\n"
+                    "Prueba: plasma run shell | plasma run kwin | plasma check\n",
+                    target);
+                return;
+            }
+            detail[0]=0;
+            rc=c5_spawn_elf_task(resolved,false,extra,detail,sizeof(detail));
+            ulibc_snprintf(o,(size_t)mx,
+                "plasma run: %s -> %s\n"
+                "%s"
+                "estado: %s\n",
+                target,resolved,detail,rc>=0?"task staged":"fallo");
+            return;
+        }
+    }
+    c5_plasma_usage(o,mx);
+}
+
+static bool c5_resolve_wayfire_binary(const char *hint,char *resolved,size_t cap){
+    static const char *const session_cand[]={
+        "/opt/wayfire/bin/wayfire",
+        "/opt/wayfire/usr/bin/wayfire",
+        "/usr/local/bin/wayfire",
+        "/usr/bin/wayfire",
+        0
+    };
+    static const char *const shell_cand[]={
+        "/opt/wayfire/bin/wf-shell",
+        "/opt/wayfire/usr/bin/wf-shell",
+        "/usr/local/bin/wf-shell",
+        "/usr/bin/wf-shell",
+        0
+    };
+    static const char *const config_cand[]={
+        "/opt/wayfire/bin/wcm",
+        "/opt/wayfire/usr/bin/wcm",
+        "/usr/local/bin/wcm",
+        "/usr/bin/wcm",
+        0
+    };
+    const char *const *cand=session_cand;
+    size_t i;
+    if(!resolved||cap==0)return false;
+    resolved[0]=0;
+    if(hint&&*hint&&hint[0]=='/'&&c5_path_is_elf64(hint)){
+        ulibc_snprintf(resolved,cap,"%s",hint);
+        return true;
+    }
+    if(!hint||!*hint||c5_streq_ci(hint,"session")||c5_streq_ci(hint,"wayfire")){
+        cand=session_cand;
+    }else if(c5_streq_ci(hint,"shell")||c5_streq_ci(hint,"wf-shell")){
+        cand=shell_cand;
+    }else if(c5_streq_ci(hint,"config")||c5_streq_ci(hint,"wcm")){
+        cand=config_cand;
+    }
+    for(i=0;cand[i];++i){
+        if(c5_path_is_elf64(cand[i])){
+            ulibc_snprintf(resolved,cap,"%s",cand[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void c5_wayfire_usage(char *o,int mx){
+    ulibc_snprintf(o,(size_t)mx,
+        "wayfire help\n"
+        "wayfire check [ruta_elf64]\n"
+        "wayfire run [session|shell|config|/ruta/bin] [args]\n"
+        "default: wayfire run session -> wayfire.\n"
+        "payload: make wayfire-desktop compila y copia Wayfire/wlroots a /opt/wayfire.\n");
+}
+
+static void c5_wayfire_check(const char *target,char *o,int mx){
+    static const char *const wayfire_cand[]={
+        "/opt/wayfire/bin/wayfire",
+        "/opt/wayfire/usr/bin/wayfire",
+        "/usr/local/bin/wayfire",
+        "/usr/bin/wayfire",
+        0
+    };
+    static const char *const shell_cand[]={
+        "/opt/wayfire/bin/wf-shell",
+        "/opt/wayfire/usr/bin/wf-shell",
+        "/usr/local/bin/wf-shell",
+        "/usr/bin/wf-shell",
+        0
+    };
+    static const char *const wlroots_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libwlroots.so.13",
+        "/usr/lib/x86_64-linux-gnu/libwlroots.so.12",
+        "/usr/lib/x86_64-linux-gnu/libwlroots.so.11",
+        "/usr/lib/x86_64-linux-gnu/libwlroots-0.17.so",
+        "/usr/lib/x86_64-linux-gnu/libwlroots-0.16.so",
+        "/opt/wayfire/lib/libwlroots.so.13",
+        "/opt/wayfire/lib/libwlroots.so.12",
+        "/opt/wayfire/lib/x86_64-linux-gnu/libwlroots.so.13",
+        "/opt/wayfire/usr/lib/x86_64-linux-gnu/libwlroots.so.13",
+        0
+    };
+    static const char *const wayland_server_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libwayland-server.so.0",
+        "/usr/lib64/libwayland-server.so.0",
+        "/opt/wayfire/lib/libwayland-server.so.0",
+        "/opt/wayfire/lib/x86_64-linux-gnu/libwayland-server.so.0",
+        0
+    };
+    static const char *const libinput_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libinput.so.10",
+        "/usr/lib64/libinput.so.10",
+        "/opt/wayfire/lib/libinput.so.10",
+        "/opt/wayfire/lib/x86_64-linux-gnu/libinput.so.10",
+        0
+    };
+    static const char *const libseat_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libseat.so.1",
+        "/usr/lib64/libseat.so.1",
+        "/opt/wayfire/lib/libseat.so.1",
+        "/opt/wayfire/lib/x86_64-linux-gnu/libseat.so.1",
+        0
+    };
+    static const char *const render_cand[]={
+        "/usr/lib/x86_64-linux-gnu/libgbm.so.1",
+        "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
+        "/usr/lib/x86_64-linux-gnu/libGLESv2.so.2",
+        "/usr/lib/x86_64-linux-gnu/libpixman-1.so.0",
+        "/opt/wayfire/lib/libgbm.so.1",
+        "/opt/wayfire/lib/libEGL.so.1",
+        "/opt/wayfire/lib/libpixman-1.so.0",
+        0
+    };
+    static const char *const plugin_cand[]={
+        "/opt/wayfire/lib/wayfire",
+        "/opt/wayfire/lib64/wayfire",
+        "/opt/wayfire/lib/x86_64-linux-gnu/wayfire",
+        "/usr/lib/x86_64-linux-gnu/wayfire",
+        0
+    };
+    static const char *const config_cand[]={
+        "/etc/wayfire/wayfire.ini",
+        "/tmp/wayfire-home/config/wayfire.ini",
+        0
+    };
+    const char *ok="ok";
+    const char *part="partial";
+    const char *miss="missing";
+    const char *stub="stub";
+    bool has_execve=(g_syscall_table[59]!=0);
+    bool has_mmap=(g_syscall_table[9]!=0&&g_syscall_table[10]!=0&&g_syscall_table[11]!=0);
+    bool has_threads=(g_syscall_table[56]!=0&&g_syscall_table[202]!=0);
+    bool has_epoll=(g_syscall_table[232]!=0&&g_syscall_table[233]!=0&&g_syscall_table[291]!=0);
+    bool has_timerfd=(g_syscall_table[286]!=0&&g_syscall_table[290]!=0);
+    bool has_dyn_loader=c5_path_exists("/lib64/ld-linux-x86-64.so.2")||
+                        c5_path_exists("/lib/ld-linux-x86-64.so.2");
+    bool has_dyn_reloc=compat3_has_dynamic_relocator();
+    bool has_graphics=(g_drm_mode.width>0&&g_drm_mode.height>0);
+    bool probe_wayland=c5_probe_wayland_ipc();
+    bool has_wayfire=c5_any_path_elf64(wayfire_cand);
+    bool has_shell=c5_any_path_elf64(shell_cand);
+    bool has_wlroots=c5_any_path_exists(wlroots_cand);
+    bool has_wayland_server=c5_any_path_exists(wayland_server_cand);
+    bool has_libinput=c5_any_path_exists(libinput_cand);
+    bool has_libseat=c5_any_path_exists(libseat_cand);
+    bool has_render=c5_any_path_exists(render_cand);
+    bool has_plugins=c5_any_path_exists(plugin_cand);
+    bool has_config=c5_any_path_exists(config_cand);
+    char probe[384];
+    probe[0]=0;
+    if(target&&*target)c5_plasma_probe_binary(target,probe,sizeof(probe));
+    ulibc_snprintf(o,(size_t)mx,
+        "=== Wayfire readiness ===\n"
+        "payload wayfire: %s  wf-shell: %s  plugins: %s  config: %s\n"
+        "wlroots: %s  wayland-server: %s  libinput: %s  libseat: %s  renderer libs: %s\n"
+        "Linux ABI execve: %s  mmap/mprotect: %s  clone+futex: %s\n"
+        "epoll: %s  eventfd/timerfd: %s  dynamic loader: %s  relocator: %s\n"
+        "DRM framebuffer: %s (%ux%u)  Wayland IPC bridge: %s\n"
+        "%s"
+        "VEREDICTO: payload Wayfire %s; compositor wlroots sobre ABI Ridux %s.\n"
+        "Arranque: si el payload existe, el kernel lanza Wayfire directo; /etc/autoboot.cmd no debe duplicarlo.\n"
+        "Nota: la ruta actual usa DRM/libinput/libseat + Pixman primero; GBM/EGL/GPU queda como siguiente salto.\n"
+        "Siguiente paso si falta payload: `make wayfire-desktop`.\n",
+        has_wayfire?ok:miss,has_shell?part:miss,has_plugins?part:miss,has_config?ok:miss,
+        has_wlroots?ok:miss,has_wayland_server?ok:miss,has_libinput?part:miss,has_libseat?part:miss,has_render?part:miss,
+        has_execve?part:miss,has_mmap?part:miss,has_threads?part:miss,
+        has_epoll?part:miss,has_timerfd?stub:miss,has_dyn_loader?part:miss,has_dyn_reloc?part:miss,
+        has_graphics?ok:miss,(unsigned)g_drm_mode.width,(unsigned)g_drm_mode.height,probe_wayland?part:stub,
+        probe,
+        (has_wayfire&&has_wlroots&&has_wayland_server)?part:miss,
+        (has_wayfire&&has_wlroots&&has_wayland_server&&has_libinput&&has_execve&&has_mmap&&has_threads)?part:miss);
+}
+
+static void cmd5_wayfire(const char*a,char*o,int mx){
+    const char *argp=a?a:"";
+    const char *rest;
+    char sub[32];
+    o[0]=0;
+    if(!c5_next_tok(&argp,sub,sizeof(sub))){
+        ulibc_snprintf(sub,sizeof(sub),"run");
+    }
+    rest=c5_skip_ws(argp);
+    if(ulibc_strcmp(sub,"help")==0){
+        c5_wayfire_usage(o,mx);
+        return;
+    }
+    if(ulibc_strcmp(sub,"check")==0){
+        c5_wayfire_check(rest,o,mx);
+        return;
+    }
+    if(ulibc_strcmp(sub,"run")==0){
+        char target[96];
+        const char *extra="";
+        char resolved[VFS_PATH_MAX];
+        char detail[768];
+        int rc;
+        if(c5_next_tok(&rest,target,sizeof(target))){
+            extra=c5_skip_ws(rest);
+        }else{
+            ulibc_snprintf(target,sizeof(target),"session");
+        }
+        if(!c5_resolve_wayfire_binary(target,resolved,sizeof(resolved))){
+            ulibc_snprintf(o,(size_t)mx,
+                "wayfire run: no encontre ELF64 para '%s'.\n"
+                "Ejecuta `make wayfire-rootfs` o prueba `wayfire check`.\n",
+                target);
+            return;
+        }
+        detail[0]=0;
+        rc=c5_spawn_elf_task(resolved,false,extra,detail,sizeof(detail));
+        ulibc_snprintf(o,(size_t)mx,
+            "wayfire run: %s -> %s\n"
+            "%s"
+            "estado: %s\n",
+            target,resolved,detail,rc>=0?"Wayfire staged":"fallo");
+        return;
+    }
+    c5_wayfire_usage(o,mx);
+}
+
 int compat5_spawn_user_elf_background(const char *path, char *detail, size_t detail_cap){
     char scratch[512];
     char *out = detail;
@@ -1673,7 +2250,19 @@ int compat5_spawn_user_elf_background(const char *path, char *detail, size_t det
     int rc;
     if(!out || cap == 0){ out = scratch; cap = sizeof(scratch); }
     out[0] = 0;
-    rc = c5_spawn_elf_task(path, false, out, cap);
+    rc = c5_spawn_elf_task(path, false, "", out, cap);
+    return rc;
+}
+
+int compat5_spawn_user_elf_background_args(const char *path, const char *extra_args,
+                                           char *detail, size_t detail_cap){
+    char scratch[512];
+    char *out = detail;
+    size_t cap = detail_cap;
+    int rc;
+    if(!out || cap == 0){ out = scratch; cap = sizeof(scratch); }
+    out[0] = 0;
+    rc = c5_spawn_elf_task(path, false, extra_args?extra_args:"", out, cap);
     return rc;
 }
 
@@ -1685,6 +2274,8 @@ void compat5_register_shell_cmds(void){
     REG5("b64","Base64 encode/decode demo",cmd5_b64)
     REG5("rng","arc4random demo",cmd5_rng)
     REG5("browser","browser help | check [elf] | run [elf]",cmd5_browser)
+    REG5("wayfire","wayfire check | run [session|shell]",cmd5_wayfire)
+    REG5("plasma","plasma check | run [session|shell|kwin]",cmd5_plasma)
     #undef REG5
 }
 

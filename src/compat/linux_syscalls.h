@@ -23,7 +23,9 @@
 #define O_APPEND    0x0400
 #define O_NONBLOCK  0x0800
 #define O_DIRECTORY 0x10000
+#define O_NOFOLLOW  0x20000
 #define O_CLOEXEC   0x80000
+#define O_PATH      0x200000
 #define O_NOCTTY    0x100
 #define O_TMPFILE   0x410000
 
@@ -58,6 +60,7 @@ int64_t real_sys_pipe(int pipefd[2]);
 int64_t real_sys_pipe2(int pipefd[2], int flags);
 int64_t real_sys_ioctl(int fd, uint64_t request, uint64_t arg);
 int64_t real_sys_fcntl(int fd, int cmd, uint64_t arg);
+void compat3_fd_flags_changed(int fd);
 int64_t real_sys_fstat(int fd, kstat_t *st);
 int64_t real_sys_stat(const char *path, kstat_t *st);
 int64_t real_sys_lstat(const char *path, kstat_t *st);
@@ -92,10 +95,21 @@ int64_t real_sys_geteuid(void);
 int64_t real_sys_getegid(void);
 int64_t real_sys_setuid(int uid);
 int64_t real_sys_setgid(int gid);
+int64_t real_sys_setreuid(int ruid, int euid);
+int64_t real_sys_setregid(int rgid, int egid);
+int64_t real_sys_getresuid(uint32_t *ruid, uint32_t *euid, uint32_t *suid);
+int64_t real_sys_getresgid(uint32_t *rgid, uint32_t *egid, uint32_t *sgid);
+int64_t real_sys_setresuid(uint32_t ruid, uint32_t euid, uint32_t suid);
+int64_t real_sys_setresgid(uint32_t rgid, uint32_t egid, uint32_t sgid);
 int64_t real_sys_setpgid(int pid, int pgid);
 int64_t real_sys_getpgid(int pid);
 int64_t real_sys_setsid(void);
 int64_t real_sys_getsid(int pid);
+
+/* Time / clock common structs */
+typedef struct { int64_t tv_sec; int64_t tv_nsec; } timespec_t;
+typedef struct { int64_t tv_sec; int64_t tv_usec; } timeval_t;
+typedef struct { int tz_minuteswest; int tz_dsttime; } timezone_t;
 
 /* Signal syscalls */
 int64_t real_sys_kill(int pid, int sig);
@@ -104,16 +118,28 @@ int64_t real_sys_tgkill(int tgid, int tid, int sig);
 int64_t real_sys_rt_sigaction(int sig, const void *act, void *oldact, size_t sigsetsize);
 int64_t real_sys_rt_sigprocmask(int how, const void *set, void *oldset, size_t sigsetsize);
 int64_t real_sys_rt_sigreturn(void);
+int64_t real_sys_rt_sigpending(void *set, size_t sigsetsize);
+int64_t real_sys_rt_sigtimedwait(const void *set, void *info, const timespec_t *timeout, size_t sigsetsize);
+int64_t real_sys_rt_sigsuspend(const void *mask, size_t sigsetsize);
 int64_t real_sys_sigaltstack(const void *ss, void *oss);
 
 /* Memory syscalls (real paging) */
 int64_t real_sys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off);
 int64_t real_sys_munmap(uint64_t addr, uint64_t len);
+int compat3_take_scm_right(int token, int *out_fd);
+int compat3_send_scm_right_from_current(int sock_fd, int pass_fd);
+int compat3_send_scm_right_to_socket_ref_from_current(int sock_ref, int pass_fd);
+int compat3_send_devnull_right_to_socket_ref_from_current(int sock_ref);
 int64_t real_sys_mprotect(uint64_t addr, uint64_t len, int prot);
 int64_t real_sys_brk(uint64_t addr);
 int64_t real_sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, int flags, uint64_t new_addr);
 int64_t real_sys_madvise(uint64_t addr, uint64_t len, int advice);
 int64_t real_sys_msync(uint64_t addr, uint64_t len, int flags);
+void compat3_debug_wayfire_addr_mapping(const task_t *cur, uint64_t addr, const char *tag);
+void compat3_debug_wayfire_stack_mapping(const task_t *cur, uint64_t sp, const char *tag);
+bool compat3_recover_null_plt_call(uint32_t vec, uint64_t err_code,
+                                   uint64_t cr2, uint64_t fault_rip,
+                                   uint64_t frame_base);
 
 /* ELF64 real mapper + dynamic linker */
 #define AT_NULL    0
@@ -165,10 +191,6 @@ int64_t real_sys_sendmsg(int fd, const void *msg, int flags);
 int64_t real_sys_recvmsg(int fd, void *msg, int flags);
 
 /* Time / clock syscalls */
-typedef struct { int64_t tv_sec; int64_t tv_nsec; } timespec_t;
-typedef struct { int64_t tv_sec; int64_t tv_usec; } timeval_t;
-typedef struct { int tz_minuteswest; int tz_dsttime; } timezone_t;
-
 int64_t real_sys_sendmmsg(int fd, void *vmessages, unsigned int vlen, unsigned int flags);
 int64_t real_sys_recvmmsg(int fd, void *vmessages, unsigned int vlen, unsigned int flags, const timespec_t *timeout);
 
@@ -239,8 +261,15 @@ int64_t real_sys_umask(int mask);
 int64_t real_sys_getrusage(int who, void *usage);
 int64_t real_sys_times(void *buf);
 int64_t real_sys_sched_yield(void);
+int64_t real_sys_sched_setparam(int pid, const void *param);
+int64_t real_sys_sched_getparam(int pid, void *param);
+int64_t real_sys_sched_setscheduler(int pid, int policy, const void *param);
+int64_t real_sys_sched_getscheduler(int pid);
 int64_t real_sys_sched_getaffinity(int pid, size_t len, void *mask);
 int64_t real_sys_sched_setaffinity(int pid, size_t len, const void *mask);
+int64_t real_sys_sched_get_priority_max(int policy);
+int64_t real_sys_sched_get_priority_min(int policy);
+int64_t real_sys_sched_rr_get_interval(int pid, void *tp);
 int64_t real_sys_memfd_create(const char *name, unsigned int flags);
 int64_t real_sys_mlock(uint64_t addr, size_t len);
 int64_t real_sys_munlock(uint64_t addr, size_t len);

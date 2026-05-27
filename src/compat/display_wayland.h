@@ -99,8 +99,9 @@ int  tcp7_accept(int listen_fd, uint32_t *src_ip, uint16_t *src_port);
 int  tcp7_send(int sock_fd, const void *buf, size_t len);
 int  tcp7_recv(int sock_fd, void *buf, size_t len);
 int  tcp7_close(int sock_fd);
+void tcp7_drop_socket(int sock_fd);
 void tcp7_tick(void);  /* called periodically to handle timers */
-void tcp7_incoming_segment(int sock_fd, const uint8_t *ip_pkt, size_t len);
+int  tcp7_incoming_segment(int sock_fd, const uint8_t *tcp_seg, size_t len);
 int  tcp7_get_state(int sock_fd);
 uint32_t tcp7_get_rtt(int sock_fd);
 
@@ -332,8 +333,16 @@ bool ca7_verify_cert_chain(const x509_cert_t *chain, int count);
 #define X11_MapSubwindows           9
 #define X11_ReparentWindow          7
 #define X11_ConfigureWindow         12
-#define X11_GrabKeyboard            33
 #define X11_GrabPointer             26
+#define X11_UngrabPointer           27
+#define X11_GrabButton              28
+#define X11_UngrabButton            29
+#define X11_ChangeActivePointerGrab 30
+#define X11_GrabKeyboard            31
+#define X11_UngrabKeyboard          32
+#define X11_GrabKey                 33
+#define X11_UngrabKey               34
+#define X11_AllowEvents             35
 #define X11_QueryPointer            38
 #define X11_TranslateCoordinates    40
 #define X11_InternAtom              16
@@ -351,6 +360,7 @@ bool ca7_verify_cert_chain(const x509_cert_t *chain, int count);
 #define X11_WarpPointer             41
 #define X11_GrabServer              36
 #define X11_UngrabServer            37
+#define X11_QueryKeymap             44
 #define X11_QueryExtension          98
 #define X11_ListExtensions          99
 #define X11_GetKeyboardMapping      101
@@ -488,6 +498,8 @@ typedef struct {
     uint16_t screen_width;
     uint16_t screen_height;
     uint16_t sequence;
+    uint32_t wm_check_window;
+    uint32_t xsettings_window;
     uint8_t  ext_opcode_shm;
     uint8_t  ext_opcode_render;
     uint8_t  ext_opcode_xfixes;
@@ -559,6 +571,8 @@ int  x11_dispatch_key_event(uint8_t keycode, bool press);
 void x11_push_expose(int conn_idx, uint32_t wid, int x, int y, int w, int h);
 void x11_push_client_message(int conn_idx, uint32_t wid, uint32_t atom, uint32_t data);
 void x11_render_now(void);
+void x11_render_scene_overlay_to_backbuffer_now(void);
+void x11_render_scene_overlay_now(void);
 void x11_tick(void);
 int  x11_get_conn_for_window(uint32_t wid);
 
@@ -580,6 +594,7 @@ int  x11_get_conn_for_window(uint32_t wid);
 #define WL7_VIEWPORTER_ID   9
 #define WL7_DMABUF_ID      10
 #define WL7_PRESENTATION_ID 11
+#define WL7_LAYER_SHELL_ID 12
 
 /* Wayland interface names */
 #define WL7_IFACE_DISPLAY    "wl_display"
@@ -593,6 +608,7 @@ int  x11_get_conn_for_window(uint32_t wid);
 #define WL7_IFACE_VIEWPORTER "wp_viewporter"
 #define WL7_IFACE_DMABUF "zwp_linux_dmabuf_v1"
 #define WL7_IFACE_PRESENTATION "wp_presentation"
+#define WL7_IFACE_LAYER_SHELL "zwlr_layer_shell_v1"
 
 /* Wayland buffer (shared memory) */
 typedef struct {
@@ -649,6 +665,7 @@ int  wl7_detach_socket(int sock_fd);      /* detach and cleanup protocol state f
 int  wl7_process_message(int client_idx);
 int  wl7_process_socket(int sock_fd);     /* process one message from socket-bound client */
 void wl7_render_surfaces(void);  /* composite all mapped surfaces to fb */
+void wl7_render_surfaces_to_backbuffer_now(void);
 void wl7_push_keyboard_event(int client_idx, uint32_t key, uint32_t state);
 void wl7_push_pointer_event(int client_idx, int x, int y, uint32_t button, uint32_t state);
 int  wl7_dispatch_pointer_event(int screen_x, int screen_y, uint32_t button, uint32_t state);

@@ -21,6 +21,11 @@ $lc = @{
   '`'='29';'\'='2b';','='33';'.'='34';'/'='35';
 }
 
+$shift = @{
+  ':'='27';'?'='35';'_'='0c';'+'='0d';'!'='02';'@'='03';'#'='04';'$'='05';
+  '%'='06';'^'='07';'&'='08';'*'='09';'('='0a';')'='0b'
+}
+
 function Press([string]$code) {
   $break = [Convert]::ToString([Convert]::ToInt32($code,16) -bor 0x80, 16)
   if ($break.Length -lt 2) { $break = '0' + $break }
@@ -36,6 +41,12 @@ foreach ($ch in $Text.ToCharArray()) {
     } else {
       Press $lc[$key]
     }
+    Start-Sleep -Milliseconds 25
+  } elseif ($shift.ContainsKey($ch.ToString())) {
+    $code = $shift[$ch.ToString()]
+    $break = [Convert]::ToString([Convert]::ToInt32($code,16) -bor 0x80, 16)
+    if ($break.Length -lt 2) { $break = '0' + $break }
+    & $vbm controlvm $VmName keyboardputscancode 2a $code $break aa | Out-Null
     Start-Sleep -Milliseconds 25
   } else {
     Write-Warning "skip unmapped char '$ch'"

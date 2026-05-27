@@ -4,6 +4,7 @@
 
 #include "font8x16.h"
 #include "assets.h"
+#include "compat/memory_tasks.h"
 
 #define FB_MAX_WIDTH  1920
 #define FB_MAX_HEIGHT 1080
@@ -88,6 +89,34 @@ extern framebuffer_t g_fb;
 extern bool g_use_backbuffer;
 extern bool g_fb_fast_bgra;
 extern uint32_t g_backbuffer[FB_MAX_WIDTH * FB_MAX_HEIGHT];
+extern bool ridux_gpu_present_backbuffer(const uint32_t *pixels, uint32_t width,
+                                         uint32_t height, uint32_t stride_pixels);
+
+bool ridux_fb_ensure_current_mapping(void) {
+    uint64_t fb_phys, fb_size, start, end, va;
+    uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | 0x008ULL | 0x010ULL;
+    address_space_t *kas;
+    task_t *cur;
+    if (!g_fb.ready || !g_fb.address) return false;
+    fb_phys = (uint64_t)(uintptr_t)g_fb.address;
+    fb_size = (uint64_t)g_fb.pitch * (uint64_t)g_fb.height;
+    if (!fb_size) fb_size = (uint64_t)g_fb.width * (uint64_t)g_fb.height * 4ULL;
+    if (!fb_size) return false;
+    start = fb_phys & ~(uint64_t)(PAGE_SIZE - 1u);
+    end = (fb_phys + fb_size + (uint64_t)PAGE_SIZE - 1u) & ~(uint64_t)(PAGE_SIZE - 1u);
+    kas = paging_get_kernel_space();
+    cur = task_current();
+    for (va = start; va < end; va += PAGE_SIZE) {
+        if (kas && kas->pml4 && !(paging_get_entry(kas, va) & PAGE_PRESENT)) {
+            if (!paging_map(kas, va, va, flags)) return false;
+        }
+        if (cur && cur->addr_space && cur->addr_space != kas &&
+            !(paging_get_entry(cur->addr_space, va) & PAGE_PRESENT)) {
+            if (!paging_map(cur->addr_space, va, va, flags)) return false;
+        }
+    }
+    return true;
+}
 
 static flush_cmd_t g_flush_queue[FLUSH_MAX_COMMANDS];
 static size_t      g_flush_count;
@@ -331,6 +360,17 @@ void flush_cursor_under_invalidate(void) {
 void fb_present(void) {
     uint32_t y;
     if (!g_fb.ready || !g_use_backbuffer) return;
+    if (!ridux_fb_ensure_current_mapping()) return;
+
+    if (ridux_gpu_present_backbuffer(g_backbuffer, g_fb.width, g_fb.height, FB_MAX_WIDTH)) {
+        for (y = 0; y < g_fb.height; ++y) {
+            uint32_t *src = g_backbuffer + (size_t)y * FB_MAX_WIDTH;
+            uint32_t *snap = g_last_presented + (size_t)y * FB_MAX_WIDTH;
+            k_memcpy(snap, src, (size_t)g_fb.width * 4u);
+        }
+        g_last_presented_valid = true;
+        return;
+    }
 
     if (!g_last_presented_valid) {
         for (y = 0; y < g_fb.height; ++y) {

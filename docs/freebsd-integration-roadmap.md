@@ -1,14 +1,15 @@
 # Ridux + FreeBSD Roadmap
 
-Objective: move Ridux to a FreeBSD kernel base without discarding existing work
-from `compat2..compat8`, shell tooling, and diagnostics.
+Objective: move Ridux to a FreeBSD kernel base by building RiduxBSD directly
+from `third_party/upstream/freebsd-src`, without discarding existing work from
+`compat2..compat8`, shell tooling, and diagnostics.
 
 ## Technical reality
 
 `kernel.c` cannot be pasted directly into FreeBSD kernel internals. The practical
 path is layered integration:
 
-- FreeBSD base: scheduler, VM, VFS, networking, drivers, security.
+- FreeBSD source base: scheduler, VM, VFS, networking, drivers, security.
 - Ridux layer: compat runtime, syscall bridge, shell tooling, UX.
 
 ## Target architecture
@@ -28,36 +29,37 @@ path is layered integration:
 ## Current status in this repo
 
 - `make freebsd-bootstrap`: fetches `freebsd-src`.
-- `make freebsd-prepare`: installs `ridux_kmod` scaffold.
+- `make freebsd-prepare`: installs `ridux_kmod`, `KERNCONF=RIDUX`, and
+  RiduxBSD kernel branding (`TYPE=RiduxBSD`, `BRANCH=RIDUX`).
+- `make riduxbsd-world`: builds `buildworld` + `buildkernel KERNCONF=RIDUX`
+  from the modified FreeBSD source tree.
+- `make riduxbsd-iso`: builds the source-based RiduxBSD release ISO at
+  `build/RiduxOS-RIDUXBSD-amd64.iso`.
+- `make riduxbsd-clean-live-artifacts`: removes old patched live ISO/cache
+  artifacts that are no longer the main path.
 - `make freebsd-compat-snapshot`: snapshots `kernel.c` + `compat*` into `freebsd/ridux-runtime/compat_snapshot`.
-- `make freebsd-browser-iso`: builds a customized FreeBSD installer ISO with
-  unattended install + first boot provisioning for desktop and browsers.
-- `make freebsd-browser-iso-fast`: same installer ISO but fast profile
-  (no linux-chrome and no extra apps on first boot).
-- `make freebsd-browser-vm`: creates/boots VirtualBox VM for that ISO.
-- `make freebsd-browser-vm-quick`: boots existing installed disk directly.
-- `make freebsd-live-iso`: builds a no-install live ISO (boots directly from media).
-- `make freebsd-ridux-kernel`: builds `KERNCONF=RIDUX` and exports kernel artifact.
-- `make freebsd-live-iso-kernel`: live ISO + injected custom RIDUX kernel.
-- `make freebsd-live-vm`: boots that live ISO in VirtualBox.
+- Legacy patched live ISO targets are disabled in the Makefile. Use
+  `make riduxbsd-iso` instead.
 - Runtime bridge inside the ISO:
   - `ridux-browser` (launcher)
   - `ridux-app` (native + linuxulator app manager)
   - `ridux-compat` + aliases (`abi6`, `dynlink`, `mmaps`, `browser run`, etc.)
 
-## Browser-ready path (fast track)
+## Source-built RiduxBSD path
 
-1. Build installer ISO:
-- `make freebsd-browser-iso`
+1. Prepare the source tree:
+- `make freebsd-bootstrap`
+- `make freebsd-prepare`
 
-2. Boot/install VM:
-- `make freebsd-browser-vm`
-- for daily reopen after install: `make freebsd-browser-vm-quick`
+2. Build world/kernel from source:
+- `make riduxbsd-world`
 
-3. First boot provisioning installs:
-- `xorg`, `xinit`, `sdl2`, `firefox`, `chromium`
-- optional: `linux_base-rl9`, `linux-chrome`
-- plus `ttyv0` autologin (no DM login), direct `Ridux UI`, and helper `ridux-browser`.
+3. Build release ISO:
+- `make riduxbsd-iso`
+
+The full release ISO step is FreeBSD-native. On Windows/WSL, use a FreeBSD
+builder VM or host mounted on this repo; experimental Linux cross-build is
+guarded behind `RIDUX_ALLOW_LINUX_CROSS=yes`.
 
 ## Kernel/compat ownership rule
 

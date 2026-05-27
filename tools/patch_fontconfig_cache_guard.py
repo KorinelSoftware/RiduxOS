@@ -2,7 +2,11 @@
 from pathlib import Path
 
 
-LIBFONTCONFIG = Path("rootfs/usr/lib/x86_64-linux-gnu/libfontconfig.so.1")
+LIBFONTCONFIG_PATHS = (
+    Path("rootfs/usr/lib/x86_64-linux-gnu/libfontconfig.so.1"),
+    Path("rootfs/lib/x86_64-linux-gnu/libfontconfig.so.1"),
+    Path("rootfs/lib64/libfontconfig.so.1"),
+)
 
 # Ridux still has rough edges around Linux file-backed mmap/cache lifetime.
 # fontconfig's frozen charset cache can then contain string bytes where a
@@ -52,16 +56,18 @@ def patch_unique(data: bytearray, name: str, signature: bytes, patch: bytes) -> 
 
 
 def main() -> int:
-    if not LIBFONTCONFIG.exists():
-        print(f"[fontconfig-cache-guard] missing {LIBFONTCONFIG}, skipping")
-        return 0
-
-    data = bytearray(LIBFONTCONFIG.read_bytes())
-    changed = patch_unique(data, "FcCharSet leaf bucket walk", LEAF_BUCKET_SIGNATURE, LEAF_BUCKET_PATCH)
-    changed |= patch_unique(data, "FcCharSet charset bucket walk", CHARSET_BUCKET_SIGNATURE, CHARSET_BUCKET_PATCH)
-    if changed:
-        LIBFONTCONFIG.write_bytes(data)
-    return 0
+    patched_any = False
+    for libfontconfig in LIBFONTCONFIG_PATHS:
+        if not libfontconfig.exists():
+            print(f"[fontconfig-cache-guard] missing {libfontconfig}, skipping")
+            continue
+        data = bytearray(libfontconfig.read_bytes())
+        changed = patch_unique(data, f"{libfontconfig}: FcCharSet leaf bucket walk", LEAF_BUCKET_SIGNATURE, LEAF_BUCKET_PATCH)
+        changed |= patch_unique(data, f"{libfontconfig}: FcCharSet charset bucket walk", CHARSET_BUCKET_SIGNATURE, CHARSET_BUCKET_PATCH)
+        if changed:
+            libfontconfig.write_bytes(data)
+            patched_any = True
+    return 0 if patched_any or any(path.exists() for path in LIBFONTCONFIG_PATHS) else 0
 
 
 if __name__ == "__main__":
