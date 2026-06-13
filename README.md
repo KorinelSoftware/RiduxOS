@@ -258,4 +258,4 @@ MIT License
 
 Copyright (c) Korinel Software
 
-<p align="center"> Built with caffeine, curiosity and an unreasonable amount of C++. </p> ```
+Built with caffeine, curiosity and an unreasonable amount of C++.
