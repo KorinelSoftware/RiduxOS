@@ -1,102 +1,261 @@
-# RiduxOS
+<p align="center">
+  <img src="assets/ridux-banner.png" alt="RiduxOS Banner" width="100%">
+</p>
 
-![RiduxOS Header](./assets/RiduxOSheader.png)
+<h1 align="center">RiduxOS</h1>
 
-RiduxOS is an attempt to build a full operating system from scratch — not just another Linux distro with a custom skin. The goal is to have the kernel, compositor, runtime, apps, and desktop environment all developed within a single cohesive project.
+<p align="center">
+  <b>A modern operating system built from scratch.</b>
+  <br>
+  Independent kernel • Native desktop • Linux compatibility • Vulkan-first design
+</p>
 
-Everything is designed to be understandable, hackable, and self-contained.
-
----
-
-## Current State
-
-![RiduxOS Desktop](./assets/ridux-desktop.png)
-
-- x86_64 kernel with Multiboot2 boot
-- Custom framebuffer + 2D renderer (Flush)
-- Windowing system and desktop environment
-- Native Ring 3 applications (terminal, files, settings, etc.)
-- Linux compatibility layer (in progress)
-- X11 / Wayland bridge (work-in-progress)
-- Initrd-based rootfs with overlay system
+<p align="center">
+  <img src="https://img.shields.io/badge/status-active-red">
+  <img src="https://img.shields.io/badge/arch-x86__64-blue">
+  <img src="https://img.shields.io/badge/kernel-monolithic%20modular-green">
+  <img src="https://img.shields.io/badge/license-MIT-orange">
+</p>
 
 ---
 
-## Project Structure
+# What is RiduxOS?
+
+RiduxOS is a modern operating system developed from scratch by **Korinel Software**.
+
+The project aims to provide a complete desktop operating system with its own kernel, desktop environment, graphical stack, compatibility layers, development tools, and cloud ecosystem.
+
+Unlike traditional Linux distributions, RiduxOS is designed as an independent platform where every major component is built specifically for the system.
+
+---
+
+# Vision
+
+RiduxOS is built around five principles:
+
+- 🚀 Performance First
+- 🎨 Modern User Experience
+- 🔒 Security by Design
+- ⚡ Vulkan Everywhere
+- 🧩 Compatibility Without Compromise
+
+The goal is to create a system capable of running modern applications while maintaining a clean and coherent architecture.
+
+---
+
+# Core Components
+
+| Component | Description |
+|------------|------------|
+| Ridux Kernel | Custom operating system kernel |
+| Injury | Desktop Environment |
+| RedGirl | Wayland compositor |
+| Maze | Linux compatibility layer |
+| Gate | Planned Windows compatibility layer |
+| Seage | Native web browser |
+| Warehouse | Cloud ecosystem |
+| Harvey | AI assistant |
+| Scarlet | Native UI toolkit |
+| Red Moon | Game engine |
+
+---
+
+# Features
+
+## Kernel
+
+- x86_64 architecture
+- Virtual memory manager
+- SMP support
+- Ring 3 user processes
+- System call interface
+- APIC / IOAPIC
+- Process scheduler
+- PCI subsystem
+- ATA storage drivers
+- Networking stack
+
+## Graphics
+
+- Vulkan-first architecture
+- Wayland support
+- GPU acceleration
+- HDR pipeline research
+- Atomic display management
+- Multi-monitor support
+
+## Compatibility
+
+### Maze (Linux Compatibility)
+
+- ELF64 support
+- Dynamic linking
+- pthreads
+- epoll
+- futex
+- signals
+- sockets
+- Wayland applications
+- X11 applications
+- XWayland
+
+Applications tested include:
+
+- Firefox
+- Chromium
+- KDE Applications
+- Qt Applications
+- Hyprland Components
+- Wayland Clients
+
+### Gate (Planned)
+
+Future compatibility subsystem designed for Windows applications.
+
+---
+
+# Desktop Environment
+
+## Injury
+
+Injury is the native desktop environment of RiduxOS.
+
+Features include:
+
+- Native panels
+- Notification system
+- Application launcher
+- Window management
+- Custom themes
+- Native widgets
+- Vulkan rendering
+
+---
+
+# RedGirl
+
+RedGirl is the native Wayland compositor.
+
+Features:
+
+- Window tiling
+- Floating windows
+- Layer-shell support
+- XDG-shell support
+- Snap layouts
+- Multi-monitor support
+- Custom scene graph
+
+---
+
+# Native Applications
+
+Current ecosystem includes:
+
+- Seage Browser
+- Terminal
+- File Manager
+- Settings
+- Calendar
+- Calculator
+- Notification Center
+- System Monitor
+
+More applications are under active development.
+
+---
+
+# Architecture
 
 ```text
-src/kernel.c                  kernel entry point
-src/kernel/                   kernel modules
-src/compat/                   Linux-like runtime / compatibility
-src/flush.c                   renderer
-src/ridux_r3wm.h              window protocol (Ring 3)
-tools/                        build tools and utilities
-scripts/                      boot and debug scripts
-grub/                         boot config
-rootfs/                       filesystem inside initrd
-```
+┌────────────────────────────┐
+│      User Applications     │
+└─────────────┬──────────────┘
+              │
+┌─────────────▼──────────────┐
+│          Injury            │
+│        RedGirl WM          │
+└─────────────┬──────────────┘
+              │
+┌─────────────▼──────────────┐
+│      Ridux Userland        │
+└─────────────┬──────────────┘
+              │
+┌─────────────▼──────────────┐
+│       Ridux Kernel         │
+└─────────────┬──────────────┘
+              │
+┌─────────────▼──────────────┐
+│         Hardware           │
+└────────────────────────────┘
+Current Status
 
----
+RiduxOS is currently under active development.
 
-## Build
+Implemented:
 
-Requirements: gcc, make, grub-mkrescue, xorriso
+Kernel boot
+Memory management
+SMP
+Process execution
+Networking
+Filesystems
+Wayland stack
+Linux compatibility layer
+Native desktop environment
 
-Build kernel only:
+In Progress:
 
-```bash
-make kernel
-```
+Hardware acceleration improvements
+Package management
+Installer
+Native SDK
+Additional desktop applications
 
-Build userspace / initrd:
+Research:
 
-```bash
-make initrd
-```
+Windows compatibility
+Advanced GPU stack
+Cloud integration
+AI integration
+Screenshots
+[ Screenshots coming soon ]
+Building
+git clone https://github.com/KorinelSoftware/RiduxOS.git
+cd RiduxOS
 
-Build full ISO:
+mkdir build
+cd build
 
-```bash
-make iso
-```
+cmake ..
+cmake --build . -j$(nproc)
+Roadmap
+Phase 1
+Kernel foundation
+Basic desktop
+Linux compatibility
+Phase 2
+GPU acceleration
+Native applications
+Installer
+Phase 3
+Public alpha release
+SDK
+Documentation
+Phase 4
+Full desktop experience
+Cloud ecosystem
+Advanced compatibility
+Contributing
 
-Clean build:
+RiduxOS is currently maintained primarily by its creator.
 
-```bash
-make clean
-```
+Contributions, testing, bug reports and discussions are welcome.
 
----
+License
 
-## Run (VirtualBox example)
+MIT License
 
-```bash
-VBoxManage createvm --name RiduxOS --register
-VBoxManage modifyvm RiduxOS --memory 2048 --cpus 2
-VBoxManage storagectl RiduxOS --name "IDE" --add ide
-VBoxManage storageattach RiduxOS --storagectl "IDE" --port 0 --device 0 --type dvddrive --medium build/RiduxOS.iso
-VBoxManage startvm RiduxOS
-```
+Copyright (c) Korinel Software
 
----
-
-## Notes
-
-- The UI is functional but still evolving
-- Running real-world applications (e.g. browsers) requires significant compatibility work
-- SMP and GPU drivers are still under development
-
----
-
-## Philosophy
-
-- Keep changes small and testable
-- Avoid unnecessary full rebuilds
-- Improve structure before optimizing
-- Keep the system understandable
-
----
-
-## Author
-
-Part of the Korinel project
+<p align="center"> Built with caffeine, curiosity and an unreasonable amount of C++. </p> ```
