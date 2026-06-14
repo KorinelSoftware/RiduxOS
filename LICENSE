@@ -1,53 +1,199 @@
-RiduxOS End User License Agreement (EULA)
+Korinel Public License (KPL)
+Version 1.0
 
 Copyright (c) 2026 Korinel
 
-This software and all associated source code, binaries, assets, and documentation
-("RiduxOS") are licensed, not sold.
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, MODIFICATION, AND DISTRIBUTION
 
-1. PERMITTED USE
+1. Definitions
 
-You are granted a limited, non-exclusive, non-transferable, revocable license to:
+"License" means the terms and conditions defined by this document.
 
-- View and study the source code strictly for personal, educational, and non-commercial purposes.
-- Compile and run the software for personal use only.
+"License Steward" means Korinel Software, or any legal successor authorized to
+publish revised versions of the Korinel Public License.
 
-2. RESTRICTIONS
+"Licensor" means the copyright owner or entity authorized by the copyright owner
+to grant this License.
 
-You may NOT:
+"You" or "Your" means an individual or legal entity exercising permissions
+granted by this License.
 
-- Use the software for any commercial purpose.
-- Distribute, sublicense, rent, lease, or sell the software.
-- Distribute modified or unmodified versions.
-- Use the software in production environments without explicit written permission.
-- Reverse engineer, decompile, or attempt to extract proprietary logic beyond what is visible in the provided source code.
-- Remove or alter any copyright or proprietary notices.
+"Software" means the software, source code, object code, documentation, assets,
+configuration files, build files, and other materials distributed under this
+License.
 
-3. MODIFICATIONS
+"Source" means the preferred form of the Software for making modifications.
 
-You may modify the source code for private use only.
-All modifications must remain strictly private and may not be shared or published.
+"Object" means any form resulting from mechanical transformation or translation
+of Source, including compiled object code, generated files, and packaged binaries.
 
-4. INTELLECTUAL PROPERTY
+"Derivative Work" means any work based upon, derived from, modified from, or
+adapted from the Software.
 
-All rights, title, and interest in RiduxOS remain the exclusive property of Korinel.
+"Contribution" means any work of authorship, including modifications, additions,
+patches, improvements, bug fixes, documentation, or other changes, intentionally
+submitted to the Licensor for inclusion in the Software.
 
-This license does not grant any rights to trademarks, branding, or logos.
+For the purposes of this definition, "submitted" means any form of electronic,
+verbal, or written communication sent to the Licensor or its representatives,
+including but not limited to pull requests, merge requests, patches, commits,
+source code control systems, issue trackers, mailing lists, forums, chat systems,
+or other communication channels managed by or on behalf of the Licensor for the
+purpose of discussing, improving, maintaining, or developing the Software.
 
-5. NO WARRANTY
+Communication clearly marked in writing as "Not a Contribution" shall not be
+considered a Contribution under this License.
 
-The software is provided "AS IS", without warranty of any kind, express or implied.
+"Contributor" means any person or legal entity that creates, owns, or submits a
+Contribution.
 
-6. LIMITATION OF LIABILITY
+"Korinel Marks" means the names, trademarks, service marks, logos, icons,
+branding, product names, and visual identities owned by Korinel Software or its
+affiliates, including but not limited to "Korinel", "Malibu", "RiduxOS",
+"Scarlet", "Likor", "RedGirl", "Injury", "Warehouse", "Harvey", "Maze",
+"Gate", and their associated logos or branding.
 
-In no event shall the author be liable for any damages arising from the use or inability to use this software.
+2. Grant of Copyright License
 
-7. TERMINATION
+Subject to the terms and conditions of this License, the Licensor grants You a
+perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+copyright license to use, reproduce, copy, modify, merge, publish, display,
+perform, distribute, sublicense, and sell copies of the Software, in Source or
+Object form, and to permit others to do the same.
 
-This license is automatically terminated if you fail to comply with any of its terms.
+3. Grant of Patent License
 
-8. GOVERNING LAW
+Subject to the terms and conditions of this License, each Contributor grants You
+a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable patent
+license to make, have made, use, offer to sell, sell, import, and otherwise
+transfer the Software, where such license applies only to patent claims that are
+necessarily infringed by that Contributor's Contribution alone or by combination
+of that Contribution with the Software to which the Contribution was submitted.
 
-This agreement shall be governed by the laws applicable in the author's jurisdiction.
+If You institute patent litigation against any person or entity alleging that the
+Software, or a Contribution incorporated within the Software, constitutes direct
+or contributory patent infringement, then any patent licenses granted to You
+under this License for the Software shall terminate as of the date such litigation
+is filed.
 
-By accessing or using this software, you agree to be bound by these terms.
+4. Redistribution
+
+You may distribute the Software or Derivative Works in Source or Object form,
+provided that You comply with all of the following conditions:
+
+(a) You must include a copy of this License with any distribution of the Software
+or Derivative Works.
+
+(b) You must retain all copyright, patent, trademark, and attribution notices
+present in the Source form of the Software, excluding notices that do not
+apply to any part of the Software or Derivative Work being distributed.
+
+(c) If You distribute modified Source files, You must include a reasonable notice
+stating that You changed those files.
+
+(d) You may add Your own copyright notices to Your modifications and may license
+Your modifications under additional or different terms, provided that Your
+use, reproduction, and distribution of the original Software remains compliant
+with this License.
+
+5. Contributions
+
+Unless explicitly stated otherwise in a written agreement, any Contribution
+intentionally submitted to the Licensor for inclusion in the Software shall be
+licensed under the terms of this License, without any additional terms or
+conditions.
+
+Nothing in this License supersedes or modifies the terms of any separate written
+agreement You may have executed with the Licensor regarding Contributions.
+
+6. No Copyleft Requirement
+
+This License does not require Derivative Works, larger works, applications,
+plugins, libraries, or other software that use, link to, embed, communicate with,
+or are distributed alongside the Software to be licensed under this License.
+
+You may combine the Software with open source, free software, proprietary, or
+commercial software, provided that Your use of the Software complies with this
+License.
+
+7. Trademark and Brand Protection
+
+This License does not grant permission to use any Korinel Marks, except as
+necessary for reasonable and customary statements describing the origin of the
+Software, such as "based on Malibu", "forked from RiduxOS", or "includes code
+from Korinel".
+
+You may not use Korinel Marks to imply endorsement, sponsorship, certification,
+approval, or official status by Korinel Software without prior written permission.
+
+You may not distribute a modified version of the Software using Korinel Marks in
+a way that makes the modified version appear to be an official Korinel release.
+
+Modified versions must be clearly identified as modified, unofficial, or
+independently maintained when there is a reasonable possibility of confusion.
+
+8. Future Versions of this License
+
+The License Steward may publish revised or new versions of the Korinel Public
+License from time to time. Each version shall be given a distinct version number.
+
+If the Software states that it is licensed under "KPL-1.0-only", "Korinel Public
+License Version 1.0 only", or equivalent wording, You may use the Software only
+under the terms of Version 1.0 of this License.
+
+If the Software states that it is licensed under "KPL-1.0-or-later", "Korinel
+Public License Version 1.0 or any later version", or equivalent wording, You may
+choose to use the Software under the terms of Version 1.0 of this License or any
+later version published by the License Steward.
+
+If the Software does not clearly specify whether later versions are allowed, the
+Software shall be licensed under Version 1.0 only.
+
+9. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+YOU ARE SOLELY RESPONSIBLE FOR DETERMINING THE APPROPRIATENESS OF USING,
+MODIFYING, OR DISTRIBUTING THE SOFTWARE AND ASSUME ALL RISKS ASSOCIATED WITH
+YOUR EXERCISE OF PERMISSIONS UNDER THIS LICENSE.
+
+10. Limitation of Liability
+
+IN NO EVENT SHALL THE AUTHORS, COPYRIGHT HOLDERS, LICENSORS, CONTRIBUTORS, OR
+DISTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE, MODIFICATION, DISTRIBUTION, OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+THIS LIMITATION APPLIES TO ALL DAMAGES, INCLUDING DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, PUNITIVE, OR CONSEQUENTIAL DAMAGES, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGES.
+
+11. Termination
+
+If You fail to comply with this License, the rights granted to You under this
+License terminate automatically.
+
+If You cure the violation within thirty (30) days after becoming aware of it,
+then Your rights under this License are reinstated, unless the Licensor has
+already initiated legal action regarding the violation.
+
+Termination of Your rights under this License does not terminate the rights of
+parties who received copies or rights from You under this License before
+termination, provided that such parties remain in compliance with this License.
+
+12. Severability
+
+If any provision of this License is held to be unenforceable, that provision
+shall be interpreted to the minimum extent necessary to make it enforceable. If
+such interpretation is not possible, the provision shall be severed, and the
+remaining provisions shall remain in effect.
+
+13. Entire License
+
+This License constitutes the entire permission granted for the Software. No other
+rights are granted except as expressly stated in this License.
+
+END OF TERMS AND CONDITIONS
